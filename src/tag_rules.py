@@ -54,7 +54,7 @@ FORM = {
     "日本动画", "美国动画", "中国动画", "国产动画", "欧美动画", "独立动画",
     # df 8–9 段补充
     "年番", "映画", "劇場版アニメ", "动态漫画", "特别篇", "番外篇", "第三季",
-    "原创动画", "长剧集", "TVA-02", "短篇", "歌番", "联动", "重制",
+    "原创动画", "长剧集", "TVA-02", "歌番", "联动",
 }
 
 # 地区：已有 meta_tags 结构化版本
@@ -90,7 +90,7 @@ STUDIO = {
     "BiburyAnimationStudios", "NUT", "TYOAnimations", "Ordet", "ProductionIMS",
     "Colorido", "StudioColorido", "Genostudio", "SHIN-EI", "シンエイ動画",
     "TelecomAnimationFilm", "PolygonPictures", "ILCA", "神风动画",
-    "横滨AnimationLABO", "YostarPictures", "Studio五组", "IM@S",
+    "横滨AnimationLABO", "YostarPictures",
     # 中国
     "玄机科技", "绘梦", "原创动力", "方特动漫", "中影年年", "视美", "若森",
     "有妖气", "腾讯", "大火鸟文化", "艺画开天", "分子互动", "上海美术电影制片厂",
@@ -125,7 +125,7 @@ STUDIO = {
     "lucasfilm", "GEMBA", "PRA", "Bibury", "Production+h.", "Lesprit",
     "Sublimation", "Eve", "BAKKENRECORD", "StudioKAFKA", "StapleEntertainment",
     "EastFishStudio", "studioHōKIBOSHI", "SEVEN・ARCS", "神風動画", "一迅社",
-    "ちちのや", "じゅうしぃまんご～", "ばにぃうぉ～か～", "Animation", "ppt",
+    "ちちのや", "じゅうしぃまんご～", "Animation", "ppt",
 }
 
 # 声优 / 监督 / 脚本 / 音乐 —— 走 AniList staff 结构化字段
@@ -137,7 +137,7 @@ STAFF = {
     "下野紘", "梶裕貴", "松岡禎丞", "喜多村英梨", "小野大辅", "沢城みゆき",
     "津田健次郎", "梅原裕一郎", "阿澄佳奈", "金元寿子", "入野自由", "小西克幸",
     "水树奈奈", "東山奈央", "佐倉綾音", "石川界人", "雨宮天", "逢坂良太",
-    "中村悠一", "水岛努",
+    "水岛努",
     # 监督 / 脚本 / 音乐 / 原作者
     "新房昭之", "虚渊玄", "大河内一楼", "岸诚二", "大沼心", "谷口悟朗",
     "神山健治", "汤浅政明", "岡田麿里", "冈田麿里", "吉田玲子", "花田十辉",
@@ -146,7 +146,7 @@ STAFF = {
     "士郎正宗", "荒川弘", "静野孔文", "今石洋之", "高松信司", "山本宽",
     "多田俊介", "黑田洋介", "大地丙太郎", "川井宪次", "泽野弘之", "横山克",
     "成田良悟", "福井晴敏", "西川贵史", "荒木英樹", "市川量也", "横手美智子",
-    "水岛精二", "たつき", "荒木英樹", "多田俊介",
+    "水岛精二", "たつき",
     # df 8–9 段补充（2026-08-10 人工审查）
     "佐伯昭志", "永井豪", "佐藤卓哉", "渡边信一郎", "柿原徹也", "柿原彻也",
     "菱田正和", "梶裕贵", "鸟山明", "东山奈央", "小野賢章", "前野智昭",
@@ -173,8 +173,7 @@ STAFF = {
     "贞本义行", "高桥良辅", "汤山邦彦", "吉原正行", "铃木达央", "鈴村健一",
     "饭田马之介", "押井守", "森川智之", "雨宮哲", "渡边步", "麻枝准",
     "晃晃监督", "牧原亮太郎", "茅野爱衣", "荒木英树", "虚淵玄", "釘宮理恵",
-    "钉宫理恵", "小西克幸", "铃木乃", "川口敬一郎", "今千秋", "石川界人",
-    "梶裕貴", "早見沙織", "沢城みゆき",
+    "钉宫理恵", "铃木乃",
 }
 
 # 作品名 / IP —— 会让同系列相似度虚高，不是口味特征
@@ -211,9 +210,9 @@ IP = {
     "闪电十一人", "闪电十一人GO", "阿卡林", "喵帕斯", "悠哉日常大王",
     "黑白小姐", "兽娘动物园", "灵域", "那年那兔那些事儿", "中国唱诗班",
     "噬血狂袭", "魁拔", "新选组", "邦邦", "Q娃", "王牌", "IM@S",
-    "数码宝贝", "digimon", "precure", "ONEPIECE", "LOL", "FGO", "PSYCHO-PASS",
+    "digimon", "precure", "ONEPIECE", "LOL", "FGO", "PSYCHO-PASS",
     "Free!", "My_Little_Pony", "SouthPark", "DC.Comics", "AdventureTime",
-    "WIXOSS", "Macross", "IDOLiSH7", "BanGDream", "MMD", "vtuber",
+    "WIXOSS", "Macross", "IDOLiSH7", "MMD", "vtuber",
 }
 
 # 元评价 / 使用行为 / 情绪吐槽 —— 不是内容特征
@@ -221,12 +220,12 @@ IP = {
 META = {
     "实用", "超高实用性", "有生之年", "垃圾", "下限", "厕纸", "补标", "糟糕",
     "节操", "装逼", "沙雕", "脑洞", "燃", "党争", "辱华", "讽刺", "萌豚",
-    "开大车", "有妖气", "补番", "神作", "经典", "好评", "力荐", "雷", "坑",
+    "开大车", "补番", "神作", "经典", "好评", "力荐", "雷", "坑",
     # df 8–9 段补充
     "声优", "奥斯卡", "无", "废萌", "惨遭动画化", "虐狗", "逆天", "作画崩坏",
-    "抄袭", "答辩", "好人设", "爽文", "无下限", "有生之年", "童年补完计划",
+    "抄袭", "答辩", "好人设", "爽文", "无下限", "童年补完计划",
     "无法预测的命运之舞台", "里番也放上来大丈夫？", "FANS向", "未确定", "其它",
-    "补标", "退队流", "伪",
+    "退队流", "伪",
 }
 
 DISCARD_SETS = {
@@ -259,7 +258,6 @@ SYNONYM = {
     "体育": "运动",
     "少女系": "少女向",
     "腐": "腐向",
-    "少年向": "少年向",
     # R18（保留，但统一写法）
     "無修正": "无码",
     "肉番": "卖肉",
@@ -304,3 +302,51 @@ def classify(tag: str) -> str:
 def normalize(tag: str) -> str:
     """同义合并。"""
     return SYNONYM.get(tag, tag)
+
+
+# ---------------------------------------------------------------- 自检
+# 规则表是手工维护的，补条目时很容易和已有的撞。这里在导入时就把
+# **有害**的那类冲突拦下来。
+#
+# 注意：集合内的字面量重复（同一个 set 里写了两遍）无法在运行时检出——
+# Python 的 set 字面量已经去重了。要查那类问题跑：
+#   uv run python -c "import ast,collections;
+#     [print(n.targets[0].id, [k for k,v in collections.Counter(
+#       [e.value for e in n.value.elts]).items() if v>1])
+#      for n in ast.walk(ast.parse(open('src/tag_rules.py',encoding='utf-8').read()))
+#      if isinstance(n, ast.Assign) and isinstance(n.value, ast.Set)]"
+
+
+def _selfcheck() -> None:
+    all_sets = {
+        "STUDIO": STUDIO, "STAFF": STAFF, "IP": IP,
+        "FORM": FORM, "REGION": REGION, "META": META,
+        "ASCII_GENRE": ASCII_GENRE,
+    }
+    # ① 跨集合重复：classify() 会按 DIVERT→DISCARD 顺序静默裁决，
+    #    结果取决于字典顺序而非本意 —— 必须唯一归属
+    owner: dict[str, list[str]] = {}
+    for label, s in all_sets.items():
+        for t in s:
+            owner.setdefault(t, []).append(label)
+    cross = {t: ls for t, ls in owner.items() if len(ls) > 1}
+    if cross:
+        raise AssertionError(f"tag 同时归属多个集合，归属必须唯一: {cross}")
+
+    # ② 同义词自指：无效条目，通常是复制粘贴的残留
+    selfref = {k for k, v in SYNONYM.items() if k == v}
+    if selfref:
+        raise AssertionError(f"SYNONYM 自指条目: {selfref}")
+
+    # ③ 同义词链：normalize() 只走一步，A→B→C 会停在 B，静默出错
+    chained = {k: v for k, v in SYNONYM.items() if v in SYNONYM}
+    if chained:
+        raise AssertionError(f"SYNONYM 存在链式归并（normalize 只走一步）: {chained}")
+
+    # ④ 归并目标本身被判为丢弃类 —— 说明合并方向反了
+    bad = {k: v for k, v in SYNONYM.items() if classify(v) != "KEEP"}
+    if bad:
+        raise AssertionError(f"SYNONYM 归并到了非 KEEP 的标准名: {bad}")
+
+
+_selfcheck()

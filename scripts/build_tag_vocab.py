@@ -77,7 +77,9 @@ for cat in ("KEEP", "STUDIO", "STAFF", "YEAR", "IP", "FORM", "REGION", "META"):
     print(f"  {cat:7} {len(items):>4} 个   {note}")
 
 keep = by_cat["KEEP"]
-print(f"\n=== 保留的 {len(keep)} 个题材 tag（目标区间 300–800）===")
+# 文档原定的「300–800」目标已实测作废：题材概念总量就是 200 个量级，
+# 想凑到 300+ 只能放噪声进来。详见 CLAUDE.md 第 13 节动作 5。
+print(f"\n=== 保留的 {len(keep)} 个题材 tag ===")
 for i in range(0, len(keep), 100):
     seg = keep[i : i + 100]
     print(f"\n[{i+1}-{i+len(seg)}] df {seg[0][1]}~{seg[-1][1]}")
