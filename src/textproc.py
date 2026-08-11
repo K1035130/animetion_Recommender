@@ -24,7 +24,7 @@ VOCAB_PATH = Path(__file__).resolve().parent.parent / "data" / "interim" / "tag_
 
 # 切词逻辑的版本号。改动 tokenize() 的行为时必须 +1 ——
 # 它进 dict_fingerprint()，这样查询端能发现「库是用旧规则建的」。
-TOKENIZER_VERSION = 3
+TOKENIZER_VERSION = 4
 
 
 @lru_cache(maxsize=1)
@@ -92,15 +92,29 @@ def norm_name(s: str) -> str:
 # 片假名与平假名要**分开**切段：日文标题几乎都是「片假名实词 + 平假名助词」，
 # 粘在一起会切出「ジョジョの」「ハルヒの」这种带尾巴的 token，
 # 而「ジョジョ」「ハルヒ」才是用户真正会输入的检索词。
+# ⚠️ 一律用 \uXXXX 转义写区间，不要直接贴字面汉字/假名 ——
+#    字面量在编辑器与终端间转手时会被改坏，且看不出来。
+_HAN = "々一-鿿㐀-䶿"   # 汉字 + 叠字符 々（美鳥の日々）
+_KATA = "ァ-ヺー-ヿ"       # 片假名，含长音符 ー，跳过中点 ・(U+30FB)
+_HIRA = "ぁ-ゟ"
+_HANGUL = "가-힯"
+# CJK 相关区段整体，供下面的兜底分支排除
+_CJK = "　-ヿ㐀-䶿一-鿿가-힯"
+
 _RUNS = re.compile(
-    r"[一-鿿㐀-䶿]+"      # 汉字（含扩展 A、繁体）
-    r"|[ァ-ヺー-ヿ]+"       # 片假名，含长音符 ー；跳过中点 ・(U+30FB)
-    r"|[ぁ-ゟ]+"                   # 平假名
-    r"|[가-힯]+"                  # 谚文
-    r"|[0-9a-z]+"                         # 拉丁字母与数字（此时已 casefold）
+    f"[{_HAN}]+"
+    f"|[{_KATA}]+"
+    f"|[{_HIRA}]+"
+    f"|[{_HANGUL}]+"
+    # 兜底：其余一切字母与数字整段保留 —— 拉丁（含带变音符号的罗马音
+    # Shōjo / Uchū）、西里尔、希腊、希伯来、阿拉伯……
+    # 早先写死 [0-9a-z] 会把它们切碎甚至整条丢空：实测 347 行别名受影响，
+    # 其中 25 行切完是空的（俄语/希伯来语标题），等于在 BM25 里搜不到。
+    # [^\W_] 是「unicode 字母或数字」的惯用写法，再排除上面已单独处理的区段。
+    f"|[^\\W_{_CJK}]+"
 )
 
-_HAN = re.compile(r"[一-鿿㐀-䶿]")
+_HAS_HAN = re.compile(f"[{_HAN}]")
 
 
 def tokenize(text: str) -> str:
@@ -119,8 +133,8 @@ def tokenize(text: str) -> str:
     text = unicodedata.normalize("NFKC", text).casefold()
     out: list[str] = []
     for run in _RUNS.findall(text):
-        if not _HAN.search(run):
-            out.append(run)          # 假名/谚文/拉丁：整段保留
+        if not _HAS_HAN.search(run):
+            out.append(run)          # 假名/谚文/拉丁/西里尔…：整段保留
             continue
         for tok in _tokenizer().cut(run):
             tok = tok.strip()
