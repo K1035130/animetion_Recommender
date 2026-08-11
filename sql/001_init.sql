@@ -43,6 +43,10 @@ CREATE TABLE IF NOT EXISTS anime_profile (
     staff           jsonb,
     popularity      integer,
 
+    -- Phase 2（海外 taste gap）的钩子：现在存，将来免得重跑全量 AniList 请求
+    -- {"anilist": 123, "mal": 456}。mal_id 是跨站实体对齐最强的锚点
+    external_ids    jsonb NOT NULL DEFAULT '{}'::jsonb,
+
     -- 向量：1024 维 float4。按设计不建 HNSW —— 7k 条暴力算余弦仅几毫秒且是精确检索
     vec             vector(1024),
 
