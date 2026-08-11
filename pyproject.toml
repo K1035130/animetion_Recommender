@@ -1,0 +1,47 @@
+[project]
+name = "anime-recommender"
+version = "0.1.0"
+description = "基于偏好问卷的当季新番推荐系统"
+readme = "README.md"
+# 锁 3.12 对齐 Render 运行时，避免本地/生产解释器漂移
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    # 数据处理：400 MB jsonlines 用 polars 比 pandas 快一个量级
+    "polars>=1.0",
+    "orjson>=3.10",
+    # Bangumi 官方 wiki 语法解析器（无向后兼容承诺，靠 uv.lock 锁死）
+    "bgm-tv-wiki>=0.0.6",
+    # AniList GraphQL
+    "httpx>=0.27",
+    # Neon Postgres
+    "psycopg[binary]>=3.2",
+    "python-dotenv>=1.0",
+    "tqdm>=4.66",
+    # 中文分词：Neon 装不了 zhparser/pgroonga，BM25 只能在 Python 侧预分词
+    # ⚠️ 建库与查询必须同版本同词典，锁死
+    "jieba>=0.42.1",
+]
+
+[dependency-groups]
+# 第 3 周才装：uv sync --group embed
+embed = [
+    "torch>=2.4",
+    "sentence-transformers>=3.0",
+    "scikit-learn>=1.5",
+]
+# 第 6 周才装：uv sync --group api
+api = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "argon2-cffi>=23.1",
+    "pyjwt>=2.9",
+]
+dev = [
+    "ruff>=0.6",
+    "ipykernel>=6.29",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
