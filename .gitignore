@@ -1,9 +1,17 @@
 # 数据（大文件，不入库）
 data/raw/
-data/interim/
 data/processed/
 *.zip
 *.jsonlines
+
+# 中间产物默认不入库，但 tag 词表例外 —— 它不是纯派生数据，而是**人工审查过的
+# 规则表产物**（418 个题材 tag 逐条看过），且是 jieba 自定义词典的运行时依赖。
+# 入库后 clone 下来不必先跑 946 MB 扫描才能用。
+#
+# ⚠️ 写成 data/interim/* 而不是 data/interim/：被忽略的是**目录**时，
+#    git 不会再进去看，后面的 ! 取反规则会失效。
+data/interim/*
+!data/interim/tag_vocab.json
 
 # Python
 __pycache__/

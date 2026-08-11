@@ -16,8 +16,8 @@ import pathlib
 import sys
 
 sys.path.insert(0, "src")
-from candidates import iter_candidates  # noqa: E402
-from tag_rules import classify, normalize  # noqa: E402
+from candidates import iter_candidates
+from tag_rules import classify, normalize
 
 OUT = pathlib.Path("data/interim/tag_vocab.json")
 MIN_DF = 8

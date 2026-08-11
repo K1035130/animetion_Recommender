@@ -9,7 +9,6 @@
 
 import collections
 import re
-import sys
 
 import orjson
 

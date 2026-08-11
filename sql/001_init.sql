@@ -91,8 +91,13 @@ CREATE TABLE IF NOT EXISTS alias (
 
     created_at        timestamptz NOT NULL DEFAULT now(),
 
-    -- 同一实体下同名别名只留一条
-    CONSTRAINT alias_uniq UNIQUE (entity_type, subject_id, character_id, norm_name)
+    -- 同一实体下同名别名只留一条。
+    -- ⚠️ 必须写 NULLS NOT DISTINCT（PG15+）：subject_id 和 character_id 里
+    --    必有一个是 NULL（作品行没有 character_id，角色行没有 subject_id），
+    --    而 Postgres 默认把 NULL 视为互不相等 —— 不加这句，约束对**每一行**
+    --    都失效，重复别名会全部灌进去。已实测验证。
+    CONSTRAINT alias_uniq UNIQUE NULLS NOT DISTINCT
+        (entity_type, subject_id, character_id, norm_name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_alias_norm   ON alias (norm_name);
