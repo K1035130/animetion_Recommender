@@ -5,6 +5,44 @@
 
 ---
 
+## 📍 当前进度（更新于 2026-08-10）
+
+**第 1 周 · 数据层。下一步：灌数据。**
+
+| 动作 | 状态 |
+|---|---|
+| 1. 拉 dump、摸清字段 | ✅ |
+| 2. 筛候选集 | ✅ **11,453 部**，口径见 [src/candidates.py](src/candidates.py) |
+| 3. 建表 | ✅ `anime_profile`(28列) + `alias`(9列) + 索引，库里 **0 行** |
+| 3b. **灌数据** | ⬜ **← 从这里继续** |
+| 4. AniList 补 staff/studio/英文标题/`idMal` | ⬜ |
+| 5. Tag 清洗 | ✅ **418 个题材 tag**，`data/interim/tag_vocab.json` |
+
+### 下次开工的第一件事
+
+按第 13 节「执行建议」：**先跑 50 部端到端灌库，人工看一遍，再全量。**
+字段理解错了，这时候改是几分钟；全量跑完再发现是几小时。
+
+ETL 需要覆盖的点（都已在本文档各节展开）：
+- 用 `src/candidates.py` 的 `iter_candidates()` 取数，**不要另写筛选逻辑**
+- tag 走 `tag_rules.normalize()` + `classify()`，只有 KEEP 类进 `tags` 列
+- `search_tsv` 用 jieba 预分词，自定义词典喂 `tag_vocab.json` 的 418 个 tag
+- `alias` 表灌 `name` / `name_cn` / infobox 的 `别名` 字段（官方 parser 已验证能取到，如大闹天宫有 6 个别名含英文名）
+- `external_ids` 留空，等动作 4 填 `{"anilist": ..., "mal": ...}`
+- 向量列 `vec` 留空，第 3 周才填
+
+### 环境备忘
+
+```bash
+uv sync                                       # 环境
+PYTHONIOENCODING=utf-8 uv run python ...      # Windows 下中文必加，否则乱码
+uv run ruff check src/ scripts/               # 改过 tag_rules.py 后必跑
+```
+
+⚠️ **Neon 连接串曾在对话中明文出现过，建议灌完库去控制台 Reset password。**
+
+---
+
 ## 1. 项目定位
 
 **要解决的问题：** 每季新番 50–80 部，用户无法判断哪些符合自己口味。
