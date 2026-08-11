@@ -118,8 +118,11 @@ def main() -> None:
         al2sid: dict[int, list[int]] = {}
         for s, _ in todo:
             al2sid.setdefault(id_map[str(s)]["anilist"], []).append(s)
-        written = rejected = missing = 0
-        bad: list[str] = []
+        # ⚠️ 用集合而不是计数器：一个 anilist id 可能落在多个批次里
+        # （一对多展开后同一部作品会被处理两次），用 += 会虚报。
+        missing = 0
+        written: set[int] = set()
+        rejected: dict[int, str] = {}
 
         with httpx.Client(timeout=60) as client:
             for i in tqdm(range(0, len(todo), BATCH), desc="拉取", unit="批"):
@@ -141,9 +144,8 @@ def main() -> None:
                         year = (d["startDate"] or {}).get("year")
                         # 硬门槛：年份对不上就当没匹配到
                         if year is None or abs(year - ours[sid]) > MAX_YEAR_DIFF:
-                            rejected += 1
-                            bad.append(f"{sid} 我们={ours[sid]} AniList={year} "
-                                       f"{(d['title']['romaji'] or '')[:34]}")
+                            rejected[sid] = (f"{sid} 我们={ours[sid]} AniList={year} "
+                                             f"{(d['title']['romaji'] or '')[:34]}")
                             continue
                         ext = {"anilist": d["id"]}
                         if d.get("idMal"):
@@ -161,15 +163,15 @@ def main() -> None:
                     with conn.cursor() as cur:
                         cur.executemany(UPDATE_SQL, rows)
                     conn.commit()
-                    written += len(rows)
+                    written.update(r["subject_id"] for r in rows)
                 time.sleep(args.sleep)
 
-    print(f"\n写入 {written} 部")
-    print(f"年份不符被拒 {rejected} 部（宁可漏不可错）")
+    print(f"\n写入 {len(written)} 部")
+    print(f"年份不符被拒 {len(rejected)} 部（宁可漏不可错）")
     print(f"AniList 查无此 id {missing} 部")
-    if bad:
-        print("\n被拒样本（最多 15 条）:")
-        for b in bad[:15]:
+    if rejected:
+        print("\n被拒明细（最多 20 条）:")
+        for b in list(rejected.values())[:20]:
             print("   ", b)
 
 

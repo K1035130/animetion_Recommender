@@ -69,6 +69,10 @@ CREATE INDEX IF NOT EXISTS idx_profile_metatags ON anime_profile USING gin (meta
 -- 默认过滤 nsfw 的部分索引：问卷选题走的就是这个口径
 CREATE INDEX IF NOT EXISTS idx_profile_sfw_done ON anime_profile (fav_done DESC)
     WHERE NOT nsfw;
+-- Phase 2 按外部 id 反查用：external_ids @> '{"mal": 123}'
+-- 目前（第 1 周）无人使用，pg_stat 显示 idx_scan = 0，占 608 kB。
+-- 若存储吃紧可先 DROP，Phase 2 动工时再建。
+CREATE INDEX IF NOT EXISTS idx_profile_extids ON anime_profile USING gin (external_ids);
 
 -- ============================================================
 -- alias —— 动画与角色实体的别名表
