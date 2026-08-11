@@ -15,43 +15,29 @@ import json
 import pathlib
 import sys
 
-import orjson
-
 sys.path.insert(0, "src")
+from candidates import iter_candidates  # noqa: E402
 from tag_rules import classify, normalize  # noqa: E402
 
-DUMP = "data/raw/dump/subject.jsonlines"
 OUT = pathlib.Path("data/interim/tag_vocab.json")
 MIN_DF = 8
-FORMS = {"TV", "WEB", "剧场版", "OVA"}
 
 df_after_merge = collections.Counter()
 raw_names = collections.defaultdict(set)  # 标准名 -> 合并进来的原始写法
 n_anime = 0
 
-with open(DUMP, "rb") as f:
-    for line in f:
-        r = orjson.loads(line)
-        if r["type"] != 2:
-            continue
-        d = r.get("date") or ""
-        y = int(d[:4]) if len(d) >= 4 and d[:4].isdigit() else None
-        if not y or y < 2011:
-            continue
-        if not (set(r.get("meta_tags") or []) & FORMS):
-            continue
-        if (r.get("favorite") or {}).get("done", 0) < 50:
-            continue
-        n_anime += 1
-        # 步骤 1：合并后在本作品内去重
-        merged = set()
-        for t in r.get("tags") or []:
-            std = normalize(t["name"])
-            merged.add(std)
-            if std != t["name"]:
-                raw_names[std].add(t["name"])
-        for std in merged:
-            df_after_merge[std] += 1
+# 候选集口径统一从 src/candidates.py 取，不在这里复制一份
+for r in iter_candidates():
+    n_anime += 1
+    # 步骤 1：合并后在本作品内去重
+    merged = set()
+    for t in r.get("tags") or []:
+        std = normalize(t["name"])
+        merged.add(std)
+        if std != t["name"]:
+            raw_names[std].add(t["name"])
+    for std in merged:
+        df_after_merge[std] += 1
 
 print(f"候选集 {n_anime:,} 部")
 print(f"合并后不同 tag: {len(df_after_merge):,}\n")
