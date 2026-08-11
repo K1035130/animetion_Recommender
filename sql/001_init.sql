@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS alias (
 
 CREATE INDEX IF NOT EXISTS idx_alias_norm   ON alias (norm_name);
 CREATE INDEX IF NOT EXISTS idx_alias_parent ON alias (parent_subject_id);
--- 模糊匹配兜底：pg_trgm 对中文是字符级 trigram，实测相似度可用（0.438 量级）
--- 用于「用户输入的名字拼错/简写」时的召回，不用于相关性排序
-CREATE INDEX IF NOT EXISTS idx_alias_trgm   ON alias USING gin (norm_name gin_trgm_ops);
+-- 模糊匹配兜底：pg_trgm 对中文是字符级 trigram，实测相似度可用
+--（'fate zeero' → Fate/Zero 相似度 0.727）。用于「名字拼错/简写」时的召回，
+-- 不用于相关性排序。extension 保留 —— similarity() 函数本身需要它。
+--
+-- ⚠️ 索引**故意不建**（2026-08-11，为省空间）：它一个就要 9.9 MB，
+--    而 alias 只有 3.8 万行，顺序扫描算 similarity 约几十毫秒，
+--    对一个很少触发的兜底路径完全够用。将来若发现慢，一条 SQL 即可重建：
+--
+--    CREATE INDEX idx_alias_trgm ON alias USING gin (norm_name gin_trgm_ops);

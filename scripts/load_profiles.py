@@ -54,8 +54,7 @@ INSERT INTO anime_profile (
     %(score)s, %(score_count)s, %(score_details)s, %(rank)s,
     %(fav_done)s, %(favorite)s, %(tags)s, %(meta_tags)s,
     setweight(to_tsvector('simple', %(tsv_title)s), 'A') ||
-    setweight(to_tsvector('simple', %(tsv_tags)s),  'B') ||
-    setweight(to_tsvector('simple', %(tsv_sum)s),   'C')
+    setweight(to_tsvector('simple', %(tsv_tags)s),  'B')
 )
 ON CONFLICT (subject_id) DO UPDATE SET
     name          = EXCLUDED.name,
@@ -186,11 +185,16 @@ def build_row(rec: dict, stats: Counter) -> dict[str, Any]:
     fav = rec.get("favorite") or {}
     aliases = build_aliases(rec)
 
-    # BM25 三档权重：A=标题与别名，B=题材 tag，C=简介
-    # 标题命中显然该排在简介命中前面，这是 tsvector 白送的能力，不用白不用
+    # BM25 两档权重：A=标题与别名，B=题材 tag。标题命中排在标签命中前面。
+    #
+    # ⚠️ 简介**不进** search_tsv（2026-08-11 决定）。实测它一项就占全库 33%：
+    # tsvector 列 15 MB 里 12.5 MB 来自简介，GIN 索引 17 MB 里也是大头 ——
+    # 中文分词后每条简介切出上百个短 token，每个 token 在 tsvector 里都有
+    # 十几字节的位置开销，2.7 MB 的原文能膨胀成 25 MB 的索引。
+    # 剧情关键词检索改由第 4 周的 HyDE + 向量混合检索负责，那本来就是它的活。
+    # summary 列本身保留 —— 第 3 周 embedding 要用它当输入。
     tsv_title = tokenize(" ".join(a[0] for a in aliases))
     tsv_tags = tokenize(" ".join(t["name"] for t in tags))
-    tsv_sum = tokenize(rec.get("summary") or "")
 
     return {
         "subject_id": rec["id"],
@@ -212,7 +216,6 @@ def build_row(rec: dict, stats: Counter) -> dict[str, Any]:
         "meta_tags": list(rec.get("meta_tags") or []),
         "tsv_title": tsv_title,
         "tsv_tags": tsv_tags,
-        "tsv_sum": tsv_sum,
         "_aliases": aliases,
     }
 
