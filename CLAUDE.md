@@ -70,9 +70,23 @@ AniList 保留它真正独有的：`idMal`（Phase 2 锚点）、英文名、全
 
 ```bash
 uv sync                                       # 环境
-PYTHONIOENCODING=utf-8 uv run python ...      # Windows 下中文必加，否则乱码
 uv run ruff check src/ scripts/               # 改过 src/ 或 scripts/ 后必跑
 ```
+
+中文输出要设 `PYTHONIOENCODING`，**两种 shell 语法不同**：
+
+```bash
+PYTHONIOENCODING=utf-8 uv run python ...            # bash / Git Bash
+```
+```powershell
+$env:PYTHONIOENCODING='utf-8'; uv run python ...    # PowerShell（开发机默认）
+```
+
+⚠️ PowerShell **不支持** `VAR=value cmd` 这种前置写法，会报
+`无法将"PYTHONIOENCODING=utf-8"项识别为 cmdlet`。
+
+交互式脚本 [scripts/try_questionnaire.py](scripts/try_questionnaire.py) 自己处理编码
+（切控制台代码页 + reconfigure），**不需要**设这个变量。
 
 ---
 
@@ -100,7 +114,18 @@ uv run ruff check src/ scripts/               # 改过 src/ 或 scripts/ 后必�
 **`relation_type` 码表（dump 无码表，实测反推）：**
 `1`=改编 `2`=前传 `3`=续集(故事序) `4/5`=总集篇 `6/12`=番外篇/主线故事 `8/9`=相同/不同世界观 `11`=衍生 `7`=角色出演 `3001-3099`=音乐关联
 
-同一份数据还能用于**推荐结果多样性**（别给看过第一季的人推第三季），第 6 周做。
+同一份数据还能用于**推荐结果多样性**（别给看过第一季的人推第三季）。
+✅ 2026-08-11 已实现：`questionnaire.select_items(fold_sequels=True)` 与
+`recommend.score(fold_series=True)`，映射由 `scripts/build_series_map.py` 产出
+（3,143 条续作 → 1,604 个系列根）。实测「厨力全开」档案的 6 条推荐从
+覆盖 3 个系列变成 6 个，且推的是第一季而非第六季。
+
+⬜ **遗留缺口：`rt=12`（主线故事）关系没有折叠。**
+实测「电影 摇曳露营△」与 TV 版之间是 `rt=12` 而不是 `rt=2`，于是两者会同时
+出现在推荐列表里。但**不能简单地把 rt=12 也纳入折叠** ——
+`超电磁炮 --12--> 魔法禁书目录` 也是这个关系，而超电磁炮是可独立观看的外传、
+热度还更高，折进禁书目录是错的。两者的区别在于标题是否同源，
+需要额外信号（标题前缀相似度？）才能区分，留到第 6 周做多样性时再解。
 
 ### ⬜ 推荐结果要加热度权重 —— 但**必须等 baseline 跑完再加**（第 5 周后）
 
