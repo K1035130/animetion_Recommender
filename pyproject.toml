@@ -21,6 +21,9 @@ dependencies = [
     # 中文分词：Neon 装不了 zhparser/pgroonga，BM25 只能在 Python 侧预分词
     # ⚠️ 建库与查询必须同版本同词典，锁死
     "jieba>=0.42.1",
+    # P0 推荐（tag 余弦 + mean-centered）。放主依赖不放 embed 组 ——
+    # 推荐链路要上线，而 embed 组的 torch/sklearn 只在离线建库用。
+    "numpy>=2.0",
 ]
 
 [dependency-groups]
