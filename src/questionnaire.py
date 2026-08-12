@@ -18,6 +18,7 @@ v0 先用纯热度，但**必须处理续作**，否则问卷质量会明显受�
    系数第 5 周有 baseline 后再调，现在做成可配置。
 """
 
+import datetime
 from dataclasses import dataclass
 
 import psycopg
@@ -34,6 +35,28 @@ PASS_CONFIDENCE = 0.3      # 更低 —— 「没兴趣」的噪声大于「想�
 # 用户没看过前作就只能选「没看过」。
 POOL_FORMS = ("TV", "WEB")
 
+# 观众资历 → 出题的年份回溯窗口。
+# 问 3 年经验的观众「你看过灼眼的夏娜吗」，拿到的必然是「没看过」，
+# 而那比一条真实评分的信息量低得多 —— 等于浪费一题。
+#
+# ⚠️ **资历只影响出题范围，不影响推荐范围。**
+#    新观众照样可能爱上老番，那正是第 7 节「经典回顾」模式存在的意义。
+#    这和第 7 节「模式只作用在候选池过滤，不影响偏好学习」是同一条原则的两面。
+#
+# 实测三档折叠去重后各有 1,493 / 2,518 / 4,625 部可选，题目绰绰有余；
+# 且三档 Top30 的题材分布高度一致（都是漫画改/奇幻/搞笑/日常/战斗主导），
+# 不存在「限制年份会欠采样老题材」的问题。
+EXPERIENCE: dict[str, int | None] = {
+    "new": 5,        # 入坑 ~3 年 → 问最近 5 年
+    "mid": 10,       # ~5 年     → 最近 10 年
+    "veteran": None,  # 老资历    → 不限
+}
+EXPERIENCE_LABEL = {
+    "new": "新观众（3 年左右）—— 只问最近 5 年的番",
+    "mid": "有点资历（5 年左右）—— 问最近 10 年的番",
+    "veteran": "老观众 —— 不限年份",
+}
+
 
 @dataclass
 class Item:
@@ -47,7 +70,8 @@ class Item:
 
 def select_items(conn: psycopg.Connection, n: int = 30, *,
                  include_nsfw: bool = False,
-                 fold_sequels: bool = True) -> list[Item]:
+                 fold_sequels: bool = True,
+                 experience: str = "veteran") -> list[Item]:
     """按热度选 n 部，续作折叠成系列第一部。
 
     折叠而非丢弃：系列第一部通常热度更高、更适合当问卷题目
@@ -57,6 +81,11 @@ def select_items(conn: psycopg.Connection, n: int = 30, *,
        而根节点按定义就不是续作，这条理由对它不成立 —— 攻壳机动队(1995 剧场版)
        是整个系列的入口，完全适合作为问卷题目。
     """
+    if experience not in EXPERIENCE:
+        raise ValueError(f"未知资历 {experience!r}，可选 {list(EXPERIENCE)}")
+    back = EXPERIENCE[experience]
+    floor = (datetime.datetime.now(datetime.UTC).year - back) if back else None
+
     smap = series.load() if fold_sequels else {}
     with conn.cursor() as cur:
         cur.execute("""
@@ -81,6 +110,11 @@ def select_items(conn: psycopg.Connection, n: int = 30, *,
         if r is None:                      # 根不在候选集里（极少），退回本作
             root, r = sid, (sid, name, year, done, form, nsfw)
         if not include_nsfw and r[5]:      # 根是 nsfw 则整条系列跳过
+            continue
+        # ⚠️ 年份卡在**根节点**上，不是原作品上。折叠后展示的是根，
+        #    一部 2023 年的续作若根在 2015 年，对新观众来说仍是「没看过」——
+        #    问「无职转生 第三季」而他没看过第一季，照样白问一题。
+        if floor is not None and (r[2] is None or r[2] < floor):
             continue
         picked[root] = Item(subject_id=root, name=r[1], year=r[2], done=r[3],
                             form=r[4],

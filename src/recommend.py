@@ -321,10 +321,21 @@ def score(cat: Catalog,
           rank_by: RankBy = "blend",
           blend_alpha: float = DEFAULT_ALPHA,
           top_k: int = 20) -> list[tuple[int, str, float]]:
-    """无状态打分。返回 [(subject_id, 展示名, 分数)]，按分数降序。
+    """无状态打分。返回 [(subject_id, 展示名, 匹配度)]。
 
-    分数是偏好向量与作品向量的余弦，范围 [-1, 1]，
-    正 = 比此人平均口味更对味。
+    第三项恒为**匹配度**（偏好向量与作品向量的余弦，范围 [-1,1]，
+    正 = 比此人平均口味更对味）。
+
+    ⚠️ **列表按 `rank_by` 指定的顺序排列，不一定按第三项降序。**
+       rank_by="match"   → 顺序 == 匹配度降序
+       rank_by="quality" → 顺序 == 贝叶斯加权评分降序
+       rank_by="blend"   → 顺序 == α·匹配 + (1-α)·评分（池内归一化后）降序
+       后两种模式下第三项会出现「大小交错」，这是预期的，不是 bug。
+       消费方**直接按返回顺序展示**，不要拿第三项重新排序。
+
+    📌 写 FastAPI 时先定：是继续返回三元组，还是改成带
+       {match, quality, rank_score} 三个字段的结构体。后者更适合 JSON
+       序列化，也能消掉上面这条容易踩的约定 —— 现在没有消费方，改动成本最低。
     """
     pref = preference_vector(cat, ratings)
     n = np.linalg.norm(pref)

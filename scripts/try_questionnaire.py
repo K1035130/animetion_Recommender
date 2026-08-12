@@ -75,9 +75,43 @@ def save(ans: dict) -> None:
                        encoding="utf-8")
 
 
+META_KEY = "_meta"
+
+
+def answers_only(ans: dict) -> dict:
+    """剔除 _meta 这类非题目键。
+
+    ⚠️ 资历存在同一个 JSON 里，但它不是评分 —— 不过滤的话
+       int("_meta") 会直接抛异常。
+    """
+    return {k: v for k, v in ans.items() if not k.startswith("_")}
+
+
+def ask_experience(ans: dict) -> str:
+    """第一题：观众资历。决定出题的年份窗口，**不影响推荐范围**。"""
+    saved = ans.get(META_KEY, {}).get("experience")
+    if saved:
+        return saved
+    keys = list(Q.EXPERIENCE)
+    print("先问一句 —— 你看番大概多久了？这决定出什么年代的题目。\n")
+    for n, k in enumerate(keys, 1):
+        print(f"  {n}. {Q.EXPERIENCE_LABEL[k]}")
+    while True:
+        try:
+            raw = input("\n        > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return "veteran"
+        if raw.isdigit() and 1 <= int(raw) <= len(keys):
+            exp = keys[int(raw) - 1]
+            ans.setdefault(META_KEY, {})["experience"] = exp
+            save(ans)
+            return exp
+        print("        输 1-3。")
+
+
 def to_ratings(ans: dict) -> list[Rating]:
     out = []
-    for sid, a in ans.items():
+    for sid, a in answers_only(ans).items():
         got = Q.to_rating(a["choice"], a.get("score"))
         if got:
             out.append(Rating(int(sid), got[0], got[1], got[2]))
@@ -88,9 +122,10 @@ def show_recs(cat, ans: dict, mode: str,
               year_min: int | None = None, year_max: int | None = None,
               rank_by: str = "blend", alpha: float = 0.5) -> None:
     rs = to_ratings(ans)
-    seen = sum(1 for a in ans.values() if a["choice"] == "seen")
-    wish = sum(1 for a in ans.values() if a["choice"] == "wish")
-    psss = sum(1 for a in ans.values() if a["choice"] == "pass")
+    vals = answers_only(ans).values()
+    seen = sum(1 for a in vals if a["choice"] == "seen")
+    wish = sum(1 for a in vals if a["choice"] == "wish")
+    psss = sum(1 for a in vals if a["choice"] == "pass")
     print(f"\n{'=' * 66}\n作答：看过 {seen} / 想尝试 {wish} / 不感兴趣 {psss}"
           f"   （共 {len(rs)} 条有效信号）")
     if not rs:
@@ -136,18 +171,30 @@ def main() -> None:
     ap.add_argument("--alpha", type=float, default=0.5,
                     help="blend 模式下匹配度的权重，0=只看评分 1=只看匹配度")
     ap.add_argument("--show", action="store_true", help="不答题，直接看推荐")
+    ap.add_argument("--experience", choices=["new", "mid", "veteran"],
+                    help="观众资历，省略则第一次运行时交互询问")
     ap.add_argument("--reset", action="store_true", help="清空已有答案")
     args = ap.parse_args()
 
     if args.reset:
         if ANSWERS.exists():
+            # 先备份再删。答案是手工一条条答出来的，删掉就没了 ——
+            # 实际发生过一次：测试时顺手 --reset，30 条作答全丢。
+            bak = ANSWERS.with_suffix(".bak.json")
+            bak.write_text(ANSWERS.read_text(encoding="utf-8"), encoding="utf-8")
             ANSWERS.unlink()
-        print("已清空答案")
+            print(f"已清空答案（旧的备份在 {bak}）")
+        else:
+            print("本来就没有答案")
         return
 
     ans = load()
+    exp = args.experience or (ans.get(META_KEY, {}).get("experience"))
+    if not args.show and not exp:
+        exp = ask_experience(ans)
+    exp = exp or "veteran"
     with db.connect() as conn:
-        items = Q.select_items(conn, args.n)
+        items = Q.select_items(conn, args.n, experience=exp)
         cat = build_catalog(conn)
 
     if args.show:
@@ -155,6 +202,7 @@ def main() -> None:
         return
 
     todo = [it for it in items if str(it.subject_id) not in ans]
+    print(f"\n资历：{Q.EXPERIENCE_LABEL[exp]}")
     print(f"共 {len(items)} 题，已答 {len(items) - len(todo)}，剩 {len(todo)}")
     print(HELP)
 

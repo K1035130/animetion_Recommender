@@ -39,7 +39,14 @@ from src import db
 RELATIONS = Path("data/raw/dump/subject-relations.jsonlines")
 OUT = Path("data/interim/series_root.json")
 PREQUEL = 2
-MAX_HOPS = 12          # 防环。柯南/海贼这类超长系列也远不到这个深度
+# 防环的安全上界。真正保证终止的是 root_of() 里的 seen 集合（图是有限的），
+# 这个常数只是兜底。
+# ⚠️ 原先设成 12，理由是「柯南/海贼这类超长系列也远不到这个深度」—— 错了。
+#    哆啦A梦剧场版是**逐年链式**关联（1993→1992→…→1980），实测最长链深 40，
+#    101 条链超过 12 跳。走到 12 跳就停，链条中段的节点会被当成「根」，
+#    同一系列于是分裂成两组，问卷和推荐里各出现一次。自检脚本
+#    「根节点自身不再是续作」抓到了这个。
+MAX_HOPS = 100
 
 
 def main() -> None:
