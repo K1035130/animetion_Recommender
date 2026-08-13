@@ -25,8 +25,7 @@ from typing import Literal
 import numpy as np
 import psycopg
 
-from src import series, tag_rules
-from src.textproc import keep_tags
+from src import series, tagvec
 
 Weighting = Literal["logtf-idf", "binary"]
 Mode = Literal["all", "season", "aired", "upcoming", "recent", "classic"]
@@ -175,56 +174,43 @@ class Recommendation:
     rank_score: float
 
 
-def _clean(names, counts, vocab: frozenset[str]) -> dict[str, float]:
-    """把一组原始 tag 名归一化、分流、并到词表维度上。"""
-    out: dict[str, float] = {}
-    for nm, ct in zip(names, counts, strict=True):
-        canon = tag_rules.normalize(nm)
-        if canon not in vocab or tag_rules.classify(canon) != "KEEP":
-            continue
-        out[canon] = out.get(canon, 0.0) + float(ct)
-    return out
-
-
 def build_catalog(conn: psycopg.Connection,
                   weighting: Weighting = "logtf-idf") -> Catalog:
-    """从库里拉出全部作品，构建 (n, d) 的 tag 矩阵。
+    """从库里拉出全部作品与预计算好的 tag 向量，装配成内存矩阵。
 
-    权重：log(1+count) * idf，再按行 L2 归一化。
-      · log —— count 随作品热度缩放（done=50 的作品 tag count 是个位数，
-        done=50,000 的是几千），不压缩量级的话热门作品会主导一切
-      · idf —— 「漫画改」覆盖 3,798 部，几乎不携带口味信息，应当降权
-      · L2 —— 余弦的前提；同时抵消「tag 多的作品模长更大」
+    ⚠️ **向量不在这里算，直接读 anime_profile.tag_vec。**（2026-08-12 改）
+       此前是每次启动用 log1p×idf×L2 重算一遍（1.31 s）。改成读库之后：
+         · 线上 SQL 打分（recommend_sql）与这里读的是**同一批数字**，
+           两条路径口径一致成了构造上的保证，不靠人记得同步
+         · 顺带省掉每次启动的 Python 侧 tag 清洗
+       计算逻辑搬到 src/tagvec.py，由 scripts/build_tag_vectors.py 写入。
+       ⚠️ 改了词表 / tag_rules / tagvec 之后**必须重跑那个脚本**，
+          否则这里读到的是旧向量。
 
-    binary 模式留给第 5 周做 ablation（第 10 节的可选对照）。
+    ⚠️ binary 模式（第 5 周 ablation 用）仍然现算 —— 库里只存 logtf-idf 一种。
     """
-    vocab = keep_tags()
     with conn.cursor() as cur:
         cur.execute("""
             SELECT subject_id, COALESCE(name_cn, name), air_year, nsfw, fav_done,
-                   tags, meta_tags,
                    COALESCE(EXTRACT(MONTH FROM air_date), 0)::int,
                    COALESCE(score, 0)::float, COALESCE(score_count, 0)::int,
-                   air_date
+                   air_date, tag_vec, tags, meta_tags
             FROM anime_profile
             ORDER BY subject_id
         """)
         rows = cur.fetchall()
 
-    per_work: list[dict[str, float]] = []
+    vlist = tagvec.vocab()
     ids, years, nsfws, dones, names, yms = [], [], [], [], [], []
     scores, votes, ords = [], [], []
-    for sid, nm, yr, nsfw, done, tags, metas, mon, sc, vt, adate in rows:
-        tags = tags or []
-        w = _clean([t["name"] for t in tags], [t.get("count") or 0 for t in tags],
-                   vocab)
-        # meta_tags 没有票数。用该作品 tag 票数的中位数 —— 官方标签的可信度
-        # 不低于用户 tag，但也不该压过最高票的那个。作品一个 tag 都没有时
-        # 退化为 1，此时向量各维等权，L2 归一化后依然可用。
-        base = float(np.median(list(w.values()))) if w else 1.0
-        for m in _clean(metas or [], [base] * len(metas or []), vocab).items():
-            w.setdefault(m[0], m[1])
-        per_work.append(w)
+    mat = np.zeros((len(rows), len(vlist)), dtype=np.float32)
+    missing = 0
+    for i, (sid, nm, yr, nsfw, done, mon, sc, vt, adate, vec, _t, _m) in enumerate(rows):
+        if vec is not None:
+            v = vec.to_numpy() if hasattr(vec, "to_numpy") else np.asarray(vec)
+            mat[i] = v.astype(np.float32)
+        else:
+            missing += 1          # 零向量作品，tag_vec 存 NULL，保持整行为零
         ids.append(sid)
         years.append(yr)
         yms.append((yr or 0) * 100 + (mon or 0))
@@ -235,21 +221,14 @@ def build_catalog(conn: psycopg.Connection,
         votes.append(vt)
         ords.append(adate.toordinal() if adate else 0)
 
-    vlist = sorted(vocab)
-    col = {t: i for i, t in enumerate(vlist)}
-    mat = np.zeros((len(rows), len(vlist)), dtype=np.float32)
-    for i, w in enumerate(per_work):
-        for t, c in w.items():
-            mat[i, col[t]] = 1.0 if weighting == "binary" else np.log1p(c)
-
-    if weighting == "logtf-idf":
-        dfreq = (mat > 0).sum(axis=0)
-        idf = np.log((len(rows) + 1) / (dfreq + 1)).astype(np.float32)
-        mat *= idf
-
-    norm = np.linalg.norm(mat, axis=1, keepdims=True)
-    norm[norm == 0] = 1.0        # 零向量保持为零，不产生 nan
-    mat /= norm
+    if weighting == "binary":
+        # ablation 分支：binary 不入库，现场重算
+        _, mat = tagvec.compute([(r[0], r[10], r[11]) for r in rows],
+                                weighting="binary")
+    elif missing == len(rows):
+        raise RuntimeError(
+            "anime_profile.tag_vec 整列为空 —— 先跑 "
+            "scripts/build_tag_vectors.py。（否则打分会静默返回空结果）")
 
     return Catalog(ids=np.array(ids), vocab=vlist, mat=mat,
                    year=np.array([y if y is not None else 0 for y in years]),
@@ -420,7 +399,13 @@ def score(cat: Catalog,
     keep &= ~np.isin(cat.ids, rated)
 
     idx = np.flatnonzero(keep)
-    order = idx[np.argsort(-sims[idx])]
+    # ⚠️ **必须 stable。** 默认的 quicksort 对并列项给出任意顺序，而实测大量
+    #    作品 tag 集合完全相同、余弦也完全相同（Top5 曾是 0.424/0.424/0.424/
+    #    0.423/0.422）。不稳定排序有两个后果：结果不可复现（第 5 周评测要求
+    #    可复现），以及与 recommend_sql 的 `ORDER BY match DESC, subject_id`
+    #    对不上。idx 由 flatnonzero 产生（升序），cat.ids 又按 subject_id 排过，
+    #    所以 stable 排序在并列时正好给出 subject_id 升序 —— 与 SQL 侧一致。
+    order = idx[np.argsort(-sims[idx], kind="stable")]
     # 两段式排序时第一段要多召回一些，否则质量排序无从选起
     want = top_k if rank_by == "match" else max(top_k * DEFAULT_POOL_FACTOR,
                                                 DEFAULT_POOL_MIN)

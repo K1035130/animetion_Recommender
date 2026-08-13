@@ -16,6 +16,10 @@ dependencies = [
     "httpx>=0.27",
     # Neon Postgres
     "psycopg[binary]>=3.2",
+    # pgvector 的 psycopg3 适配器：让 numpy 数组能直接当参数传给 vector 列。
+    # 打分推进 Postgres 之后（2026-08-12 放弃 Render 常驻进程），
+    # 线上和离线两条路径都要用它。
+    "pgvector>=0.3",
     "python-dotenv>=1.0",
     "tqdm>=4.66",
     # 中文分词：Neon 装不了 zhparser/pgroonga，BM25 只能在 Python 侧预分词
@@ -48,7 +52,13 @@ api = [
 dev = [
     "ruff>=0.6",
     "ipykernel>=6.29",
+    "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+# 让 tests/ 能 import src/ —— 项目没打成包，靠 rootdir 进 sys.path
+pythonpath = ["."]
+testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 100

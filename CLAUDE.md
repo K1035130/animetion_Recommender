@@ -30,7 +30,8 @@
 | 问卷选题 + 三种作答 | ✅ [src/questionnaire.py](src/questionnaire.py) |
 | 续作折叠 | ✅ [src/series.py](src/series.py) + [scripts/build_series_map.py](scripts/build_series_map.py) |
 | 交互式自测 | ✅ [scripts/try_questionnaire.py](scripts/try_questionnaire.py) |
-| FastAPI 接口 | ✅ [api/main.py](api/main.py) + [api/schemas.py](api/schemas.py) |
+| FastAPI 接口 | ✅ [server/main.py](server/main.py) + [server/schemas.py](server/schemas.py) |
+| 打分迁 pgvector（放弃 Render） | ✅ [src/recommend_sql.py](src/recommend_sql.py) + [tests/test_parity.py](tests/test_parity.py) |
 | 前端 v0 | ⬜ **← 从这里继续** |
 
 矩阵 `(11453, 308)`，全库打分 **1 ms** —— 印证第 4 节「不建 HNSW」的判断。
@@ -97,24 +98,99 @@ wr 高达 6.39，按 wr 卡这条线等于什么都没过滤。
 即 blend 模式下目前是空操作，但 blend 是 α=0.5 的**软加权**不是保证；
 `match` 模式下它是唯一防线。
 
-### FastAPI 层（2026-08-12 完工）
+### ⚠️ 部署改道：Render 常驻进程 → Vercel serverless（2026-08-12，推翻第 2 节）
 
-`uv sync --group api` 后 `uv run uvicorn api.main:app --reload`。四个接口全部无状态。
+**Kevin 决定放弃 Render，前后端都上 Vercel。** 第 2 节的 Render 选型与
+「Hobby 工作区 + Starter 实例 $7/月」那整段作废，但**理由本身仍然成立** ——
+只是解法从「买一个不死的进程」换成了「让进程不再需要活着」。
 
-| 接口 | 用途 | 实测延迟（开发机） |
-|---|---|---|
-| `GET /health` | 存活探针 + 指纹回显，Render 用 | 纯内存 |
-| `GET /questionnaire` | 选题，参数 `n` / `experience` / `include_nsfw` / `fold_sequels` | 首次 560 ms，之后 **2 ms**（缓存） |
-| `POST /recommend` | 打分，body 见 `RecommendRequest` | **12–17 ms** |
-| `GET /search` | 按名/别名搜，供用户主动打分 | BM25 103 ms / trgm 兜底 195 ms |
-| `GET /anime/{id}` | 详情 | 103 ms |
+**做不到的那条路（别再试）**：保留内存 Catalog 直接扔上 serverless。
+实测每请求重建要拉 **2.6 MB / 1.31 s**，而打分本身只要 12 ms。
+⚠️ 更反直觉的是**低流量会让冷启动更糟**：作品集项目访问零星 → 实例频繁回收
+→ 大部分请求都是冷启动，而不是偶尔。能靠热实例摊薄冷启动的是高流量服务。
 
-⚠️ **上面带 DB 的三个数字里有 ~100 ms 是跨国 RTT，不是查询成本。**
-实测 `SELECT 1` 自己就要 104 ms（开发机在国内、Neon 在 us-east-2）。
-扣掉后：按主键取行和 BM25 的真实成本 **≈ 0 ms**，trgm 全扫 **≈ 90 ms**。
-后者与第 1 周「3.8 万行顺扫几十毫秒，兜底路径够用」的预判吻合 ——
-**`idx_alias_trgm` 确认不用重建**。上线 Render（俄亥俄，与 Neon 同区）后
-RTT 降到 ~15 ms，届时再看真实数字。
+**采用的路**：把余弦推进 Postgres。每请求只拉用户评过的那几十部（70 ms，
+几乎全是 RTT），11,311 行的暴力余弦由 pgvector 算 —— 实测**成本 ≈ 0 ms**，
+再次印证第 4 节「不建 HNSW」的判断。
+
+新增 `anime_profile.tag_vec vector(308)`（+14 MB，库 44 → 58 MB）与
+`series_root integer`，见 [sql/002_tag_vec.sql](sql/002_tag_vec.sql)。
+
+#### ⚠️ 两套打分实现，靠一致性测试锁住
+
+线上走 SQL（serverless 无常驻内存），第 5 周评测走 numpy（leave-one-out 要跑
+10⁵~10⁶ 次打分，SQL 往返做不到）。这直接顶到第 2 节铁律「评测时不能出现
+两套口径」，所以用**两条构造上的保证**顶住，而不是靠纪律：
+
+1. **向量的唯一定义处是 `anime_profile.tag_vec`。** [src/tagvec.py](src/tagvec.py) 算、
+   [scripts/build_tag_vectors.py](scripts/build_tag_vectors.py) 写，
+   `build_catalog()` 改成**读**这一列而不是重算 —— 两条路径读的是同一批数字。
+   （实测库里的向量与内存里逐位差 0.00e+00。）
+2. **[tests/test_parity.py](tests/test_parity.py) 逐条比对输出**，13 项覆盖
+   3 种 rank_by × 6 种 mode × 11 组开关组合 + 偏好向量 + 边界。CI 里必须绿。
+
+⚠️ **光靠第 1 条不够**：它只保证输入相同，不保证过滤/召回/折叠/重排四步的
+语义相同。测试第一次跑就抓出一个肉眼绝对发现不了的 bug ——
+
+> 大量作品与偏好向量**完全正交**（余弦精确为 0），召回池整片并列。
+> numpy 侧是「match 降序 + subject_id 升序」（stable argsort + ids 已排序），
+> 而 SQL 的 `pool` 层 `ORDER BY match DESC LIMIT` **少了次级排序键**，
+> Postgres 对并列给任意顺序 → **两条路径召回的根本不是同一批候选**，
+> 但两边结果都「像模像样」。
+
+⚠️ 同时修掉 numpy 侧 `np.argsort(-sims[idx])` 的**不稳定排序**（默认 quicksort）。
+它有两个后果：结果不可复现（第 5 周评测要求可复现），以及无法与 SQL 对齐。
+改成 `kind="stable"`。
+
+⚠️ 另一处最难发现的不等价：**取被评作品向量时不能加 `tag_vec IS NOT NULL`。**
+那 142 部零向量作品对向量和贡献为零，却仍要参与 μ 的计算 —— 漏掉会让 μ 偏移，
+进而改变**所有**作品的权重符号，而结果依然像模像样。已单独测。
+
+#### 目录结构与部署
+
+⚠️ **`api/` 目录下的每个 `.py` 都会被 Vercel 当成一个独立的 serverless function。**
+所以应用包叫 **`server/`**，`api/` 下只有一个 [api/index.py](api/index.py) 入口，
+[vercel.json](vercel.json) 用 rewrites 把所有路径打过去。
+把 `schemas.py` 放进 `api/` 会导致构建失败（那个文件没有 handler）。
+
+⚠️ **Vercel 只认 `requirements.txt`，不读 pyproject/uv.lock。**
+必须手工维护一份**只含线上闭包**的子集（约 120 MB）——
+`uv export` 会把 polars 一起导出来（185 MB，ETL 专用，`server/` 一行没 import），
+直接顶爆体积上限。改了运行时依赖后要回去同步，校验方式见该文件注释。
+
+⚠️ `data/raw` 是 **2.1 GB**。`.gitignore` 在走 git 部署时挡得住，但
+`vercel deploy` 从本地上传时**不看 .gitignore**，靠 [.vercelignore](.vercelignore) 再挡一次。
+但 `data/interim/tag_vocab.json` 是**运行时依赖**（jieba 词典 + keep_tags），不能忽略。
+
+```bash
+uv sync --group api
+uv run uvicorn server.main:app --reload     # 本地，不走 api/index.py
+uv run pytest tests/ -q                     # 改过任一条打分路径后必跑
+```
+
+#### 接口与实测延迟
+
+| 接口 | 用途 | 开发机实测 | 扣掉 RTT |
+|---|---|---|---|
+| `GET /health` | 存活探针 + `tag_vec` 回填校验 | 180 ms | ≈ 0 |
+| `GET /questionnaire` | 选题 | 首次 947 ms，之后 **2 ms**（缓存） | — |
+| `POST /recommend` | 打分（3 次往返） | 406–608 ms | **≈ 110 ms** |
+| `GET /search` | BM25 / trgm 兜底 | 178 / 331 ms | ≈ 0 / ≈ 90 ms |
+| `GET /anime/{id}` | 详情 | 181 ms | ≈ 0 |
+
+⚠️ **开发机的每次往返有 ~106 ms 是跨国 RTT**（`SELECT 1` 自己就要 106 ms，
+开发机在国内、Neon 在 us-east-2），不是查询成本。`/recommend` 的三次往返
+（取向量 → 打分 → 取理由）占掉 318 ms。
+
+`/recommend` 扣掉 RTT 后的 ~110 ms 里，**余弦本身 ≈ 0 ms，几乎全是续作折叠的
+三层 CTE**（`DISTINCT ON` 要对全部候选排序）。不折叠时主查询实测 101.8 ms
+≈ 纯 RTT。**要优化先优化那个 CTE，不是余弦。**
+
+Vercel 与 Neon 同区（RTT ~15 ms）时估算：`/recommend` ≈ 3×15 + 110 = **~155 ms**。
+比常驻内存的 12 ms 慢一个量级，这是 serverless 的代价，Kevin 已确认可接受。
+
+⚠️ **`idx_alias_trgm` 确认不用重建** —— trgm 全扫扣掉 RTT 约 90 ms，
+与第 1 周「3.8 万行顺扫几十毫秒，兜底路径够用」的预判吻合。
 
 **几个已定的接口决策：**
 
@@ -127,19 +203,26 @@ RTT 降到 ~15 ms，届时再看真实数字。
   TypeScript，一漂移就是静默的推荐质量下降 —— 与「三种作答带不同置信度」是同一条纪律。
 - **端点一律写 `def` 不写 `async def`。** psycopg 同步、numpy 占 GIL，
   写成 async 会阻塞事件循环把并发拖成串行；同步端点由 FastAPI 丢线程池才对。
-- **Catalog 在 `lifespan` 里建一次常驻内存**（14 MB / 1.7 s）。每请求重建会把
-  12 ms 的打分变成 1.7 s。问卷结果同样整份缓存 —— 第 5–6 周换聚类选代表后更该缓存。
-- **启动时校验分词指纹**，与 `BUILD_FINGERPRINT = 6a1cbbe1bc4f446d` 不符直接启动失败。
-  ⚠️ 改 tag 词表或 `tokenize()` 后必须重跑 `load_profiles.py` 并更新这个常量。
+- **连接池惰性初始化，不放 `lifespan`。**
+  ⚠️ serverless 平台不保证执行 ASGI lifespan 事件，放那里线上会拿到一个
+  None 池，而本地 uvicorn 一切正常 —— 典型的「本地好好的，上线就挂」。
+  分词指纹校验一并挪进去。问卷结果仍用模块级 dict 缓存（容器内跨请求存活）。
 - **连接池走 `DATABASE_URL`（pooler），未配则退回直连**（本地开发方便）。
   ⚠️ 必须带 `prepare_threshold=None` —— Neon 的 pooler 是 PgBouncer transaction 模式。
+  ⚠️ 必须带 `configure=db.prepare` 注册 pgvector 适配器，否则 `tag_vec`
+  **读回来是字符串**、numpy 数组也没法当查询参数，而且不报类型错，
+  是在后面某处解析失败。
 - **CORS 白名单从 `CORS_ORIGINS` 环境变量读，默认放行本地 Vite。**
   ⚠️ 故意不写 `["*"]` —— 第 6 周若把 JWT 放 httpOnly cookie，`"*"` 与
   `allow_credentials` 互斥，到时候要回头改。
 
-⬜ **遗留：`score()` 每次调用都重建续作折叠的 `root_of` / `members` 字典**
-（11k 次 Python dict 操作，占了 12 ms 里的大头，矩阵乘法本身只要 1 ms）。
-搬进 `Catalog` 就能省掉，但现在 12 ms 完全够用，等有压测数据再动。
+⬜ **遗留：续作折叠的三层 CTE 是 `/recommend` 的主要成本**（扣掉 RTT 后
+~110 ms 里几乎全是它，余弦本身 ≈ 0）。`best` 那层要对全部候选做
+`DISTINCT ON (series_root)` 排序。有压测需求时先动这里。
+
+⬜ **遗留：`/recommend` 是三次往返**（取向量 → 打分 → 取理由 + 元数据）。
+取理由那次可以并进主查询（把 `tag_vec` 一起 SELECT 出来），代价是召回池
+200 行 × 1.2 KB = 240 KB 传输。同区 RTT 只有 15 ms 时不划算，先不动。
 
 ### Tag 词表第二轮清洗（2026-08-11，418 → 308）
 
@@ -170,7 +253,8 @@ person 数据自动检测**。方法分两层，缺一不可：
 | [scripts/backfill_staff.py](scripts/backfill_staff.py) | `studios` / `staff` |
 | [scripts/backfill_anilist.py](scripts/backfill_anilist.py) | `anilist_id` / `name_en` / `popularity` / `external_ids` |
 | [scripts/build_id_map.py](scripts/build_id_map.py) | 产出 `data/interim/id_map.json`（4b 的前置依赖，**不入 git，换机器必须先跑**） |
-| [scripts/build_series_map.py](scripts/build_series_map.py) | 产出 `data/interim/series_root.json`（问卷折叠与推荐去重的前置依赖，同样不入 git） |
+| [scripts/build_series_map.py](scripts/build_series_map.py) | 产出 `data/interim/series_root.json`（问卷折叠的前置依赖，同样不入 git） |
+| [scripts/build_tag_vectors.py](scripts/build_tag_vectors.py) | `tag_vec` / `series_root` 两列。⚠️ 改过词表/tag_rules/tagvec 后**必须重跑**，否则打分读到旧向量 |
 
 前三者都幂等，可任意顺序重跑。已实测：重跑不改行数、不洗掉别的脚本填的列。
 
@@ -184,6 +268,7 @@ uv run python scripts/load_profiles.py
 uv run python scripts/backfill_staff.py
 uv run python scripts/backfill_anilist.py    # 需要联网，约 125 次请求
 uv run python scripts/build_series_map.py
+uv run python scripts/build_tag_vectors.py   # 依赖上一步；打分链路的前置
 ```
 
 ### 与本文档原计划的两处偏离（已论证，勿回退）
@@ -205,8 +290,9 @@ AniList 保留它真正独有的：`idMal`（Phase 2 锚点）、英文名、全
 ```bash
 uv sync                                       # 环境
 uv sync --group api                           # 再加 FastAPI/uvicorn/连接池
-uv run ruff check src/ scripts/ api/          # 改过这三个目录后必跑
-uv run uvicorn api.main:app --reload          # 起 API，文档在 /docs
+uv run ruff check src/ scripts/ server/ tests/
+uv run pytest tests/ -q                       # 改过任一条打分路径后必跑
+uv run uvicorn server.main:app --reload       # 起 API，文档在 /docs
 ```
 
 中文输出要设 `PYTHONIOENCODING`，**两种 shell 语法不同**：
@@ -761,7 +847,7 @@ tag 集合**完全相同**，余弦也完全相同 —— 实测某档案的 Top
 | 周 | 内容 |
 |---|---|
 | 1 | ✅ Bangumi/AniList 抓取 + schema + 批次 1 建库 |
-| 2 | ✅ P0 推荐（tag 余弦 + mean-centered）+ 选题 v0 + 续作折叠 + FastAPI ⬜ 前端（评分存 localStorage，接口已是无状态） |
+| 2 | ✅ P0 推荐 + 选题 v0 + 续作折叠 + FastAPI + 打分迁 pgvector ⬜ 前端（评分存 localStorage，接口已是无状态） |
 | 3 | Qwen3-Embedding 接入 + P1 融合 staff/studio + PCA/k-means 产出内容簇 |
 | 4 | 萌娘百科抓取（批次 2）+ HyDE 检索 + 混合检索 |
 | **5** | **离线评测：leave-one-out、NDCG@10/P@10、四条 baseline、共现簇、冷启动曲线** |

@@ -1,0 +1,40 @@
+# Vercel serverless 的运行时依赖。
+#
+# ⚠️ **这个文件只给 Vercel 用，不是项目的依赖清单。**
+#    本地开发/ETL/评测一律 `uv sync`，事实来源是 pyproject.toml + uv.lock。
+#    Vercel 的 Python runtime 不读 pyproject/uv.lock，只认 requirements.txt，
+#    所以这里必须手工维护一份**只含线上闭包**的子集。
+#
+# ⚠️ 为什么不用 `uv export`：那会把 polars 一起导出来（185 MB，ETL 专用，
+#    server/ 一行没 import），直接顶爆 serverless function 的体积上限。
+#    实测 server.main 的第三方 import 闭包只有下面这些，约 120 MB。
+#
+# ⚠️ 版本必须与 uv.lock 对齐，否则线上线下跑的不是同一套代码。
+#    改了 pyproject 的运行时依赖后要回来同步这里 ——
+#    校验方式：uv run python -c "import server.main" 看闭包有没有变。
+#
+# 不在这里的东西及原因：
+#   polars / bgm-tv-wiki / httpx / tqdm  —— ETL 与回填脚本专用
+#   uvicorn                              —— Vercel 自己提供 ASGI 服务器
+#   argon2-cffi / pyjwt                  —— 第 6 周账号系统才用
+#   pytest / ruff / ipykernel            —— 开发工具
+
+fastapi==0.141.1
+starlette==1.6.0
+pydantic==2.13.4
+
+# Neon Postgres。binary 版自带 libpq，serverless 上不能依赖系统库
+psycopg[binary]==3.3.4
+psycopg-pool==3.3.1
+# vector 列的类型适配器。不装的话 tag_vec 读回来是字符串
+pgvector==0.5.0
+
+# 打分：偏好向量与 blend 重排在 Python 侧算（余弦本身在 Postgres 里）
+numpy==2.5.2
+
+# 中文分词。⚠️ 必须与建库同版本 —— 版本漂移会让查询词切出来和
+#    search_tsv 里的对不上，检索静默失效（见 src/textproc.py）
+jieba==0.42.1
+
+python-dotenv==1.2.2
+orjson==3.11.9

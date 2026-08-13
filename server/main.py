@@ -4,23 +4,30 @@
 服务端不存任何用户数据。游客的 localStorage 与第 6 周注册用户的
 user_rating 表都往这同一个入口喂数据，推荐链路一行不改。
 
+⚠️ **本模块不持有 Catalog。**（2026-08-12 改）打分走 src/recommend_sql，
+   余弦由 pgvector 在库里算。原因见 sql/002_tag_vec.sql 的模块注释：
+   目标部署形态是 Vercel serverless，无状态函数里没有常驻进程，
+   14 MB 的 tag 矩阵不可能跨请求存活，每请求重建要 2.6 MB / 1.3 s。
+   recommend.build_catalog() 仍然保留 —— 第 5 周离线评测要用它跑批量打分。
+   两条路径的等价性由 tests/test_parity.py 保证。
+
 ⚠️ 端点一律写成 `def` 而不是 `async def`。
-   psycopg 是同步的、numpy 矩阵乘法会占满 GIL —— 写成 async 会阻塞事件循环，
+   psycopg 是同步的、numpy 会占 GIL —— 写成 async 会阻塞事件循环，
    把并发拖成串行。同步端点由 FastAPI 丢进线程池，才是正确做法。
 """
 
 import os
+import threading
 from collections.abc import Iterator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import contextmanager
 
-import numpy as np
 import psycopg
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg_pool import ConnectionPool
 
-from api import schemas
-from src import db, questionnaire, recommend, tag_rules
+from server import schemas
+from src import db, questionnaire, recommend_sql, tag_rules
 from src.textproc import dict_fingerprint, keep_tags, norm_name, tokenize
 
 # 建库时的分词词典指纹。search_tsv 是用这套词典切出来的，查询端必须一致 ——
@@ -30,60 +37,62 @@ BUILD_FINGERPRINT = "6a1cbbe1bc4f446d"
 
 # trgm 兜底的相似度下限。实测 'fate zeero' → Fate/Zero 是 0.727，
 # 0.3 以下基本是噪声。alias 表没建 trgm 索引（第 1 周为省 9.9 MB 砍掉的），
-# 3.8 万行顺序扫描算 similarity 约几十毫秒，对一个很少触发的兜底够用。
+# 3.8 万行顺序扫描算 similarity 约 90 ms，对一个很少触发的兜底够用。
 TRGM_MIN_SIM = 0.3
 SEARCH_LIMIT_MAX = 50
 
-_state: dict = {}
+_lock = threading.Lock()
+_pool: ConnectionPool | None = None
+# 问卷选题只取决于库内容与几个参数，整份缓存。模块级变量在同一个函数
+# 实例（容器）内跨请求存活；容器被回收就重建，不影响正确性。
+_questions: dict[tuple, list[schemas.QuestionItem]] = {}
+
+
+def _get_pool() -> ConnectionPool:
+    """惰性建池。
+
+    ⚠️ **不放在 lifespan 里。** serverless 平台不保证执行 ASGI lifespan 事件，
+       放那里的话线上会拿到一个 None 池，而本地 uvicorn 一切正常 ——
+       典型的「本地好好的，上线就挂」。惰性初始化两边都成立。
+    """
+    global _pool
+    if _pool is None:
+        with _lock:
+            if _pool is None:                  # 双检：并发首请求只建一次
+                fp = dict_fingerprint()
+                if fp != BUILD_FINGERPRINT:
+                    # 宁可启动失败也别静默降级 —— 见 textproc.dict_fingerprint()
+                    raise RuntimeError(
+                        f"分词词典漂移：当前 {fp}，建库时 {BUILD_FINGERPRINT}。"
+                        "search_tsv 是用旧词典切的，检索召回已不可信。"
+                        "请重跑 scripts/load_profiles.py 并更新 BUILD_FINGERPRINT。")
+                _pool = ConnectionPool(
+                    db.pool_dsn(), min_size=0, max_size=4, open=True, timeout=30,
+                    # ⚠️ Neon 的 -pooler 是 PgBouncer transaction 模式，
+                    #    psycopg3 的 prepared statement 会跨事务失效
+                    kwargs={"prepare_threshold": None},
+                    # ⚠️ 每条新连接都要注册 pgvector 适配器，否则 tag_vec
+                    #    读回来是字符串，且 numpy 数组没法当查询参数
+                    configure=db.prepare,
+                )
+    return _pool
 
 
 @contextmanager
 def _conn() -> Iterator[psycopg.Connection]:
-    with _state["pool"].connection() as c:
+    with _get_pool().connection() as c:
         yield c
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    fp = dict_fingerprint()
-    if fp != BUILD_FINGERPRINT:
-        # 宁可启动失败也别静默降级 —— 见 textproc.dict_fingerprint() 的注释
-        raise RuntimeError(
-            f"分词词典漂移：当前 {fp}，建库时 {BUILD_FINGERPRINT}。"
-            "search_tsv 是用旧词典切的，检索召回已不可信。"
-            "请重跑 scripts/load_profiles.py 并更新 BUILD_FINGERPRINT。"
-        )
-
-    # min_size=1：Neon 免费层 scale-to-zero，保持一条常连能免掉后续请求的冷启动。
-    # max_size 别开大 —— 免费层连接数有限，且本服务几乎不并发写。
-    pool = ConnectionPool(
-        db.pool_dsn(), min_size=1, max_size=5, open=True, timeout=30,
-        # ⚠️ Neon 的 -pooler 是 PgBouncer transaction 模式，
-        #    psycopg3 的 prepared statement 会跨事务失效
-        kwargs={"prepare_threshold": None},
-    )
-    _state["pool"] = pool
-
-    # Catalog 常驻内存：11453×308 float32 = 14 MB，构建要 1.7 s（拉全库 + 清洗 tag）。
-    # ⚠️ 绝不能每请求重建 —— 那会把 10 ms 的打分变成 1.7 s。
-    with pool.connection() as c:
-        _state["catalog"] = recommend.build_catalog(c)
-    _state["questions"] = {}
-    yield
-    pool.close()
 
 
 app = FastAPI(
     title="动画推荐 API",
-    version="0.1.0",
+    version="0.2.0",
     description="基于偏好问卷的当季新番推荐（P0：tag 余弦 + mean-centered）",
-    lifespan=lifespan,
 )
 
-# 前端在 Vercel、后端在 Render，属跨站。默认放开本地 Vite 端口，
-# 线上用 CORS_ORIGINS 环境变量覆盖（逗号分隔）。
-# ⚠️ 不要图省事写 ["*"] —— 第 6 周加 Cookie 认证时 "*" 与 credentials 互斥，
-#    到时候要回头改，不如现在就写对。
+# 前端在 Vercel、后端也在 Vercel（2026-08-12 起），但域名仍可能不同
+# （预览部署、自定义域名），CORS 该配还得配。
+# ⚠️ 不要图省事写 ["*"] —— 第 6 周加 Cookie 认证时 "*" 与 credentials 互斥。
 _origins = os.environ.get(
     "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
 ).split(",")
@@ -96,18 +105,17 @@ app.add_middleware(
 )
 
 
-def _catalog() -> recommend.Catalog:
-    return _state["catalog"]
-
-
 @app.get("/health")
 def health() -> dict:
-    """存活探针。Render 用它判断实例是否就绪。"""
-    cat = _catalog()
+    """存活探针。也顺带确认库里的向量列已回填 —— 忘了跑
+    scripts/build_tag_vectors.py 的话打分会静默返回空列表。"""
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("SELECT count(*), count(tag_vec) FROM anime_profile")
+        total, with_vec = cur.fetchone()
     return {
-        "status": "ok",
-        "catalog_size": len(cat.ids),
-        "vocab_size": len(cat.vocab),
+        "status": "ok" if with_vec else "tag_vec 未回填",
+        "catalog_size": total,
+        "with_tag_vec": with_vec,
         "dict_fingerprint": dict_fingerprint(),
     }
 
@@ -119,35 +127,30 @@ def get_questionnaire(
     fold_sequels: bool = True,
     experience: schemas.Experience = "veteran",
 ) -> schemas.QuestionnaireResponse:
-    """选题。第 9 节要求「超发」：要 10 条有效评分就展示 25–30 部。
-
-    结果只取决于库内容与这几个参数，因此可以整份缓存 ——
-    否则每次进首页都要全表扫 11k 行。第 5–6 周换成聚类选代表时，
-    这层缓存同样适用（那时更该缓存，k-means 不可能每请求跑一遍）。
-    """
+    """选题。第 9 节要求「超发」：要 10 条有效评分就展示 25–30 部。"""
     key = (n, include_nsfw, fold_sequels, experience)
-    if key not in _state["questions"]:
+    if key not in _questions:
         with _conn() as c:
             items = questionnaire.select_items(
                 c, n=n, include_nsfw=include_nsfw,
                 fold_sequels=fold_sequels, experience=experience,
             )
-        _state["questions"][key] = [
+        _questions[key] = [
             schemas.QuestionItem(
                 subject_id=it.subject_id, name=it.name, year=it.year,
                 done=it.done, form=it.form, replaced_from=it.replaced_from,
             )
             for it in items
         ]
-    items = _state["questions"][key]
+    items = _questions[key]
     return schemas.QuestionnaireResponse(
         items=items, experience=experience, total=len(items)
     )
 
 
-def _to_ratings(answers: list[schemas.Answer]) -> list[recommend.Rating]:
+def _to_ratings(answers: list[schemas.Answer]) -> list[recommend_sql.Rating]:
     """作答 → Rating。分数/置信度的映射全部委托给 to_rating()。"""
-    out: list[recommend.Rating] = []
+    out: list[recommend_sql.Rating] = []
     for a in answers:
         try:
             t = questionnaire.to_rating(a.choice, a.score)
@@ -155,55 +158,56 @@ def _to_ratings(answers: list[schemas.Answer]) -> list[recommend.Rating]:
             raise HTTPException(422, f"subject_id={a.subject_id}: {e}") from e
         if t is None:                               # skip：用缺失表示，不占位
             continue
-        out.append(recommend.Rating(a.subject_id, t[0], t[1], t[2]))
+        out.append(recommend_sql.Rating(a.subject_id, t[0], t[1], t[2]))
     return out
-
-
-def _reasons(cat: recommend.Catalog, pref: np.ndarray, i: int, k: int = 4) -> list[str]:
-    """推荐理由：对余弦贡献最大的几个 tag。
-
-    ⚠️ 取 pref[j] × item[j] 而不是「该作品票数最高的 tag」——
-       后者与用户无关，解释不了「为什么推给你」。只取正贡献：
-       负贡献是「这部有你不喜欢的元素」，不该出现在推荐理由里。
-    """
-    contrib = pref * cat.mat[i]
-    top = np.argsort(-contrib)[:k]
-    return [cat.vocab[j] for j in top if contrib[j] > 0]
 
 
 @app.post("/recommend", response_model=schemas.RecommendResponse)
 def post_recommend(req: schemas.RecommendRequest) -> schemas.RecommendResponse:
-    """无状态打分。评分随请求传入，服务端零写入。"""
-    cat = _catalog()
+    """无状态打分。评分随请求传入，服务端零写入。
+
+    三次往返：取被评作品的向量 → 算余弦+过滤+召回 → 取 top_k 的向量生成理由。
+    第三次只查最终返回的那 20 部，不查整个召回池。
+    """
     ratings = _to_ratings(req.answers)
     if not ratings:
         # 空作答不是错误 —— 用户可能刚打开问卷。返回空列表让前端提示继续答题。
         return schemas.RecommendResponse(items=[], used_ratings=0,
                                          rank_by=req.rank_by)
 
-    recs = recommend.score(
-        cat, ratings, mode=req.mode, year_min=req.year_min,
-        year_max=req.year_max, include_nsfw=req.include_nsfw,
-        min_score=req.min_score, fold_series=req.fold_series, rank_by=req.rank_by,
-        blend_alpha=req.blend_alpha, top_k=req.top_k,
-    )
+    with _conn() as c:
+        # 只算一次偏好向量，打分与推荐理由共用 —— 否则要多一次往返
+        pref = recommend_sql.preference_vector(c, ratings)
+        recs = recommend_sql.score(
+            c, ratings, pref=pref, mode=req.mode, year_min=req.year_min,
+            year_max=req.year_max, include_nsfw=req.include_nsfw,
+            min_score=req.min_score, fold_series=req.fold_series,
+            rank_by=req.rank_by, blend_alpha=req.blend_alpha, top_k=req.top_k,
+        )
+        if not recs:
+            return schemas.RecommendResponse(items=[],
+                                             used_ratings=len(ratings),
+                                             rank_by=req.rank_by)
+        ids = [r.subject_id for r in recs]
+        norm = pref / (float((pref @ pref) ** 0.5) or 1.0)
+        reasons = recommend_sql.explain(c, norm, ids)
+        with c.cursor() as cur:
+            cur.execute("SELECT subject_id, air_year, score, fav_done "
+                        "FROM anime_profile WHERE subject_id = ANY(%s)", (ids,))
+            meta = {r[0]: r for r in cur.fetchall()}
 
-    # 推荐理由要用偏好向量，这里重算一次（11k×308 约 3 ms，比改 score() 签名划算）
-    pref = recommend.preference_vector(cat, ratings)
-    n = float(np.linalg.norm(pref))
-    pref = pref / n if n else pref
-
-    items = []
-    for r in recs:
-        i = cat.index_of(r.subject_id)
-        items.append(schemas.Recommendation(
+    items = [
+        schemas.Recommendation(
             subject_id=r.subject_id, name=r.name,
-            year=int(cat.year[i]) or None,
+            year=meta[r.subject_id][1],
             match=r.match, quality=r.quality, rank_score=r.rank_score,
-            bgm_score=float(cat.bgm_score[i]) or None,
-            done=int(cat.done[i]),
-            reasons=_reasons(cat, pref, i),
-        ))
+            bgm_score=(float(meta[r.subject_id][2])
+                       if meta[r.subject_id][2] else None),
+            done=meta[r.subject_id][3],
+            reasons=reasons.get(r.subject_id, []),
+        )
+        for r in recs
+    ]
     return schemas.RecommendResponse(items=items, used_ratings=len(ratings),
                                      rank_by=req.rank_by)
 

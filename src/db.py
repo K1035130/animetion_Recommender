@@ -9,6 +9,18 @@ import os
 
 import psycopg
 from dotenv import load_dotenv
+from pgvector.psycopg import register_vector
+
+
+def prepare(conn: psycopg.Connection) -> psycopg.Connection:
+    """注册 pgvector 类型适配器。
+
+    ⚠️ **每条新连接都必须过这里。** 不注册的话 `tag_vec` 读回来是**字符串**
+       而不是向量，写入时 numpy 数组也没法直接当参数 —— 而且不报类型错，
+       是在后面某处解析失败，很难定位。连接池要走 configure= 回调（见 api/main.py）。
+    """
+    register_vector(conn)
+    return conn
 
 
 def connect(*, autocommit: bool = False) -> psycopg.Connection:
@@ -16,7 +28,7 @@ def connect(*, autocommit: bool = False) -> psycopg.Connection:
     dsn = os.environ.get("DATABASE_URL_DIRECT")
     if not dsn:
         raise RuntimeError("缺少环境变量 DATABASE_URL_DIRECT（见 .env.example）")
-    return psycopg.connect(dsn, autocommit=autocommit)
+    return prepare(psycopg.connect(dsn, autocommit=autocommit))
 
 
 def pool_dsn() -> str:

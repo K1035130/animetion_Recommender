@@ -1,0 +1,26 @@
+# ⚠️ data/raw 是 2.1 GB 的 Bangumi dump（解压后 1.8 GB + 压缩包）。
+#    走 git 部署时 .gitignore 已经挡住了，但 `vercel deploy` 从本地目录
+#    上传时**不看 .gitignore**，必须在这里再挡一次。
+data/raw/
+data/processed/
+
+# ⚠️ data/interim/tag_vocab.json 是**运行时依赖**，不能忽略 ——
+#    src/textproc.py 要用它做 jieba 自定义词典和 keep_tags()。
+#    这里只忽略其余中间产物。
+data/interim/*
+!data/interim/tag_vocab.json
+
+# ETL / 回填脚本不上线：它们依赖 polars(185 MB)、bgm-tv-wiki、httpx，
+# 而 requirements.txt 里没有这些（见那个文件的注释）。
+scripts/
+sql/
+tests/
+
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+uv.lock
