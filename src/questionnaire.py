@@ -23,8 +23,6 @@ from dataclasses import dataclass
 
 import psycopg
 
-from src import series
-
 # 未观看选项的赋分与置信度
 WISH_SCORE = 8.0
 PASS_SCORE = 3.0
@@ -86,11 +84,16 @@ def select_items(conn: psycopg.Connection, n: int = 30, *,
     back = EXPERIENCE[experience]
     floor = (datetime.datetime.now(datetime.UTC).year - back) if back else None
 
-    smap = series.load() if fold_sequels else {}
+    # ⚠️ 系列关系读 **anime_profile.series_root 列**，不读 series_root.json。
+    #    那个文件不入 git（data/interim/* 被忽略，只放行 tag_vocab.json），
+    #    线上根本不存在 —— 而 series.load() 默认 required=True 会抛
+    #    FileNotFoundError，`/questionnaire` 直接 500。
+    #    列由 scripts/build_tag_vectors.py 写入，值与 series.load() 逐条相同。
+    #    COALESCE 兜底：列没回填时退化成「不折叠」，与 fold_sequels=False 同义。
     with conn.cursor() as cur:
         cur.execute("""
             SELECT subject_id, COALESCE(name_cn, name), air_year, fav_done, form,
-                   nsfw
+                   nsfw, COALESCE(series_root, subject_id)
             FROM anime_profile
             ORDER BY fav_done DESC
         """)
@@ -98,12 +101,12 @@ def select_items(conn: psycopg.Connection, n: int = 30, *,
     meta = {r[0]: r for r in rows}
 
     picked: dict[int, Item] = {}
-    for sid, name, year, done, form, nsfw in rows:
+    for sid, name, year, done, form, nsfw, sroot in rows:
         if not include_nsfw and nsfw:
             continue
         if form not in POOL_FORMS:
             continue
-        root = smap.get(sid, sid)
+        root = sroot if fold_sequels else sid
         if root in picked:
             continue
         r = meta.get(root)
