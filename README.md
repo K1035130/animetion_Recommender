@@ -22,6 +22,7 @@ A preference-questionnaire-driven anime recommender. Users rate shows they've se
 | Questionnaire selection + sequel folding | ✅ [src/questionnaire.py](src/questionnaire.py) |
 | FastAPI endpoints | ✅ [server/main.py](server/main.py) |
 | Scoring pushed into Postgres (pgvector) | ✅ [src/recommend_sql.py](src/recommend_sql.py) |
+| Deployed to Vercel | ✅ live, all endpoints verified |
 | Frontend v0 | ⬜ **next** |
 
 Database: **58 MB / 500 MB** on Neon's free tier.
@@ -232,6 +233,7 @@ The second one is not redundant. It immediately caught a missing tie-break in th
 | 问卷选题 + 续作折叠 | ✅ [src/questionnaire.py](src/questionnaire.py) |
 | FastAPI 接口 | ✅ [server/main.py](server/main.py) |
 | 打分推进 Postgres（pgvector） | ✅ [src/recommend_sql.py](src/recommend_sql.py) |
+| 部署到 Vercel | ✅ 已上线，四个接口实测通过 |
 | 前端 v0 | ⬜ **下一步** |
 
 Neon 免费层占用 **58 MB / 500 MB**。
