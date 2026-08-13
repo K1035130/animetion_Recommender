@@ -46,10 +46,16 @@ Database: **58 MB / 500 MB** on Neon's free tier.
 ### 1. Environment
 
 ```bash
-uv sync                  # core deps
-uv sync --group api      # fastapi / uvicorn / psycopg-pool
-uv sync --group embed    # week 3: torch / sentence-transformers / sklearn
+uv sync                       # runtime deps only — what the deployed app needs
+uv sync --group etl           # + polars / bgm-tv-wiki / httpx — needed by scripts/
+uv sync --group api --group etl --group dev   # everything, for development
 ```
+
+⚠️ **The main dependency group is deliberately minimal: it is exactly what the
+deployed function needs.** Vercel's Python runtime finds `pyproject.toml` +
+`uv.lock` and installs *that group* — a `requirements.txt` is ignored entirely.
+Anything ETL-only (polars alone drags in a 55 MB runtime) must stay in a group,
+or it lands in the function bundle. So `scripts/` need `--group etl`.
 
 `requires-python` is pinned to 3.12 to match the deployment runtime.
 
@@ -199,6 +205,8 @@ The second one is not redundant. It immediately caught a missing tie-break in th
 
 **Anything under `api/` becomes its own Vercel function.** The application package therefore lives in `server/`, with a single entry file in `api/`. Putting `schemas.py` there fails the build.
 
+**Vercel installs your main dependency group, not `requirements.txt`.** Its Python runtime detects `pyproject.toml` + `uv.lock` and runs uv against the *main* group; a hand-maintained `requirements.txt` is silently ignored. The first deploy therefore installed polars and no FastAPI. The fix isn't a deploy setting — it's treating the main group as the deployment manifest and pushing every ETL-only package into a group.
+
 ---
 ---
 
@@ -244,10 +252,15 @@ Neon 免费层占用 **58 MB / 500 MB**。
 ### 1. 环境
 
 ```bash
-uv sync                  # 核心依赖
-uv sync --group api      # fastapi / uvicorn / psycopg-pool
-uv sync --group embed    # 第 3 周：torch / sentence-transformers / sklearn
+uv sync                       # 只装运行时依赖 —— 线上跑的就是这一组
+uv sync --group etl           # + polars / bgm-tv-wiki / httpx，scripts/ 要用
+uv sync --group api --group etl --group dev   # 开发全量
 ```
+
+⚠️ **主依赖组是刻意精简的：它等于线上 function 真正需要的东西。**
+Vercel 的 Python runtime 检测到 `pyproject.toml` + `uv.lock` 就装**这一组**，
+`requirements.txt` 会被完全忽略。任何只在 ETL 用的包（光 polars 就带 55 MB 运行时）
+都必须待在 group 里，否则会被打进 function bundle。所以跑 `scripts/` 要加 `--group etl`。
 
 ### 2. 配置
 
@@ -372,6 +385,8 @@ AND favorite.done >= 50                      # 质量门槛
 **评分下限比评分上限有用。** 高分不保证好看，低分却几乎必然难看。排除 78 部低于 3.5 的作品（占全库 0.68%）几乎没有代价，却挡住了一个具体的失败模式：烂续作的 tag 与你喜欢的那一季几乎相同，于是 tag 余弦把它排到第一 —— 实测 `match=0.983`。
 
 **`api/` 目录下的任何文件都会变成一个独立的 Vercel function。** 所以应用包放在 `server/`，`api/` 只留一个入口文件。把 `schemas.py` 放进去会导致构建失败。
+
+**Vercel 装的是主依赖组，不是 `requirements.txt`。** 它的 Python runtime 检测到 `pyproject.toml` + `uv.lock` 就用 uv 装**主依赖组**，手工维护的 `requirements.txt` 被静默忽略。第一次部署因此装了 polars 却没装 FastAPI。修法不是改部署设置，而是**把主依赖组当作部署清单**，把所有 ETL 专用包挪进 group。
 
 ---
 

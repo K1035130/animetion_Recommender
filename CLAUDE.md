@@ -153,10 +153,26 @@ wr 高达 6.39，按 wr 卡这条线等于什么都没过滤。
 [vercel.json](vercel.json) 用 rewrites 把所有路径打过去。
 把 `schemas.py` 放进 `api/` 会导致构建失败（那个文件没有 handler）。
 
-⚠️ **Vercel 只认 `requirements.txt`，不读 pyproject/uv.lock。**
-必须手工维护一份**只含线上闭包**的子集（约 120 MB）——
-`uv export` 会把 polars 一起导出来（185 MB，ETL 专用，`server/` 一行没 import），
-直接顶爆体积上限。改了运行时依赖后要回去同步，校验方式见该文件注释。
+⚠️ **Vercel 装的是 `pyproject.toml` 的主依赖组，`requirements.txt` 会被完全忽略。**
+（2026-08-12 首次部署实测纠正 —— 此前这里写反了，说的是「只认 requirements.txt」。）
+它的 Python runtime 检测到 `pyproject.toml` + `uv.lock` 就用 uv 装**主依赖组**。
+第一次部署因此装了 polars/bgm-tv-wiki/httpx/tqdm，却**没装 fastapi**，
+报 `ModuleNotFoundError: No module named 'fastapi'`。
+
+**所以主依赖组 = 部署清单。** 已按这条重排 `pyproject.toml`：
+
+| 组 | 内容 | 上线 |
+|---|---|---|
+| **主依赖** | fastapi / psycopg[binary] / psycopg-pool / pgvector / numpy / jieba / dotenv / orjson | ✅ **19 个包** |
+| `etl` | polars / bgm-tv-wiki / httpx / tqdm | ❌ `scripts/` 专用 |
+| `api` | uvicorn / argon2 / pyjwt | ❌ 本地跑服务器 + 第 6 周认证 |
+| `embed` | torch / sentence-transformers / sklearn | ❌ 第 3 周离线建库 |
+
+⚠️ 光 polars 一个就带 **55 MB** 的 `polars-runtime-32`，而 `server/` 一行没 import 它。
+⚠️ **`uv sync` 不再自带 ETL 依赖** —— 跑 `scripts/` 要加 `--group etl`。
+⚠️ `requirements.txt` **已删除**：它被忽略却看着像事实来源，是纯粹的漂移隐患。
+校验方式：`uv sync --no-dev --no-group api --no-group etl --no-group embed`
+后跑 `uv run --no-sync python -c "import server.main"`，这精确复现了线上的安装集合。
 
 ⚠️ `data/raw` 是 **2.1 GB**。`.gitignore` 在走 git 部署时挡得住，但
 `vercel deploy` 从本地上传时**不看 .gitignore**，靠 [.vercelignore](.vercelignore) 再挡一次。
@@ -296,8 +312,9 @@ AniList 保留它真正独有的：`idMal`（Phase 2 锚点）、英文名、全
 ### 环境备忘
 
 ```bash
-uv sync                                       # 环境
-uv sync --group api                           # 再加 FastAPI/uvicorn/连接池
+uv sync                                       # 只装运行时依赖（= 线上那一组）
+uv sync --group etl                           # scripts/ 要用：polars/httpx/bgm-tv-wiki
+uv sync --group api                           # 本地跑 uvicorn
 uv run ruff check src/ scripts/ server/ tests/
 uv run pytest tests/ -q                       # 改过任一条打分路径后必跑
 uv run uvicorn server.main:app --reload       # 起 API，文档在 /docs

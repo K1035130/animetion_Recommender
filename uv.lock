@@ -7,23 +7,19 @@ name = "anime-recommender"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
-    { name = "bgm-tv-wiki" },
-    { name = "httpx" },
+    { name = "fastapi" },
     { name = "jieba" },
     { name = "numpy" },
     { name = "orjson" },
     { name = "pgvector" },
-    { name = "polars" },
     { name = "psycopg", extra = ["binary"] },
+    { name = "psycopg-pool" },
     { name = "python-dotenv" },
-    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
 api = [
     { name = "argon2-cffi" },
-    { name = "fastapi" },
-    { name = "psycopg-pool" },
     { name = "pyjwt" },
     { name = "uvicorn", extra = ["standard"] },
 ]
@@ -37,26 +33,28 @@ embed = [
     { name = "sentence-transformers" },
     { name = "torch" },
 ]
+etl = [
+    { name = "bgm-tv-wiki" },
+    { name = "httpx" },
+    { name = "polars" },
+    { name = "tqdm" },
+]
 
 [package.metadata]
 requires-dist = [
-    { name = "bgm-tv-wiki", specifier = ">=0.0.6" },
-    { name = "httpx", specifier = ">=0.27" },
+    { name = "fastapi", specifier = ">=0.115" },
     { name = "jieba", specifier = ">=0.42.1" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "orjson", specifier = ">=3.10" },
     { name = "pgvector", specifier = ">=0.3" },
-    { name = "polars", specifier = ">=1.0" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
+    { name = "psycopg-pool", specifier = ">=3.2" },
     { name = "python-dotenv", specifier = ">=1.0" },
-    { name = "tqdm", specifier = ">=4.66" },
 ]
 
 [package.metadata.requires-dev]
 api = [
     { name = "argon2-cffi", specifier = ">=23.1" },
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "psycopg-pool", specifier = ">=3.2" },
     { name = "pyjwt", specifier = ">=2.9" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
 ]
@@ -69,6 +67,12 @@ embed = [
     { name = "scikit-learn", specifier = ">=1.5" },
     { name = "sentence-transformers", specifier = ">=3.0" },
     { name = "torch", specifier = ">=2.4" },
+]
+etl = [
+    { name = "bgm-tv-wiki", specifier = ">=0.0.6" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "polars", specifier = ">=1.0" },
+    { name = "tqdm", specifier = ">=4.66" },
 ]
 
 [[package]]

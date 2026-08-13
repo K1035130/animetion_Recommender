@@ -1,3 +1,10 @@
+# ⚠️ **不要在这里忽略 pyproject.toml 或 uv.lock。**
+#    Vercel 的 Python runtime 就是靠它俩用 uv 装依赖的（requirements.txt 会被
+#    完全忽略，别再建那个文件）。少了 uv.lock 就变成每次部署重新解析版本 ——
+#    而这个项目明确依赖版本钉死：jieba 版本一漂移，分词切出来就和库里的
+#    search_tsv 对不上，启动时的指纹校验会直接拒绝服务。
+#    （bgm-tv-wiki 声明无向后兼容承诺，同理，虽然它现在只在 etl 组里。）
+
 # ⚠️ data/raw 是 2.1 GB 的 Bangumi dump（解压后 1.8 GB + 压缩包）。
 #    走 git 部署时 .gitignore 已经挡住了，但 `vercel deploy` 从本地目录
 #    上传时**不看 .gitignore**，必须在这里再挡一次。
@@ -7,11 +14,13 @@ data/processed/
 # ⚠️ data/interim/tag_vocab.json 是**运行时依赖**，不能忽略 ——
 #    src/textproc.py 要用它做 jieba 自定义词典和 keep_tags()。
 #    这里只忽略其余中间产物。
+#    ⚠️ 必须写 `data/interim/*` 而不是 `data/interim/`：被忽略的是**目录**时，
+#       后面的 ! 取反规则会失效（与 .gitignore 同一套语义）。
 data/interim/*
 !data/interim/tag_vocab.json
 
-# ETL / 回填脚本不上线：它们依赖 polars(185 MB)、bgm-tv-wiki、httpx，
-# 而 requirements.txt 里没有这些（见那个文件的注释）。
+# ETL / 回填脚本与测试不上线。它们的依赖在 pyproject 的 etl / dev 组里，
+# 线上那一组本来就不会装，排掉源码只是顺带减小 bundle。
 scripts/
 sql/
 tests/
@@ -23,4 +32,3 @@ __pycache__/
 .ruff_cache/
 .env
 .env.*
-uv.lock

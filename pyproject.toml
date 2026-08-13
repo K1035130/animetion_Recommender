@@ -3,49 +3,60 @@ name = "anime-recommender"
 version = "0.1.0"
 description = "基于偏好问卷的当季新番推荐系统"
 readme = "README.md"
-# 锁 3.12 对齐 Render 运行时，避免本地/生产解释器漂移
+# 锁 3.12 对齐部署运行时，避免本地/生产解释器漂移
 requires-python = ">=3.12,<3.13"
 
+# ⚠️ **主依赖组 = 线上 serverless 真正需要的东西，一个不多。**
+#    Vercel 的 Python runtime 检测到 pyproject.toml + uv.lock 就用 uv 装**主依赖组**
+#    （requirements.txt 会被完全忽略 —— 别再往那里加东西）。
+#    所以任何只在 ETL / 评测 / 开发时用的包都必须待在下面的 dependency-groups 里，
+#    否则会被打进 function bundle。
+#    ⚠️ 实测教训：polars 一个就带 55 MB 的 polars-runtime-32，而 server/ 一行没 import 它。
+#    校验方式：uv run python -c "import server.main" 后看 sys.modules 的第三方闭包。
 dependencies = [
-    # 数据处理：400 MB jsonlines 用 polars 比 pandas 快一个量级
-    "polars>=1.0",
-    "orjson>=3.10",
-    # Bangumi 官方 wiki 语法解析器（无向后兼容承诺，靠 uv.lock 锁死）
-    "bgm-tv-wiki>=0.0.6",
-    # AniList GraphQL
-    "httpx>=0.27",
-    # Neon Postgres
+    "fastapi>=0.115",
+    # Neon Postgres。binary 版自带 libpq，serverless 上不能依赖系统库
     "psycopg[binary]>=3.2",
+    # 连接池。Neon 的 -pooler 端点是 PgBouncer transaction 模式，
+    # ⚠️ 必须配 prepare_threshold=None，否则 psycopg3 的 prepared statement
+    #    会跨事务复用一个不存在的 statement 名，报 "prepared statement does not exist"
+    "psycopg-pool>=3.2",
     # pgvector 的 psycopg3 适配器：让 numpy 数组能直接当参数传给 vector 列。
     # 打分推进 Postgres 之后（2026-08-12 放弃 Render 常驻进程），
     # 线上和离线两条路径都要用它。
     "pgvector>=0.3",
-    "python-dotenv>=1.0",
-    "tqdm>=4.66",
+    # 偏好向量与 blend 重排在 Python 侧算（余弦本身在 Postgres 里）
+    "numpy>=2.0",
     # 中文分词：Neon 装不了 zhparser/pgroonga，BM25 只能在 Python 侧预分词
     # ⚠️ 建库与查询必须同版本同词典，锁死
     "jieba>=0.42.1",
-    # P0 推荐（tag 余弦 + mean-centered）。放主依赖不放 embed 组 ——
-    # 推荐链路要上线，而 embed 组的 torch/sklearn 只在离线建库用。
-    "numpy>=2.0",
+    "python-dotenv>=1.0",
+    "orjson>=3.10",
 ]
 
 [dependency-groups]
+# ETL 与回填脚本专用，**不上线**：uv sync --group etl
+# 灌库、回填、重建向量都要它；只跑 API 或跑测试则不需要。
+etl = [
+    # 400 MB jsonlines 用 polars 比 pandas 快一个量级。
+    # ⚠️ 它带 55 MB 的 polars-runtime-32，是当初把 function bundle 撑爆的元凶
+    "polars>=1.0",
+    # Bangumi 官方 wiki 语法解析器（无向后兼容承诺，靠 uv.lock 锁死）
+    "bgm-tv-wiki>=0.0.6",
+    # AniList GraphQL
+    "httpx>=0.27",
+    "tqdm>=4.66",
+]
 # 第 3 周才装：uv sync --group embed
 embed = [
     "torch>=2.4",
     "sentence-transformers>=3.0",
     "scikit-learn>=1.5",
 ]
-# 第 2 周末装（原计划第 6 周，FastAPI 提前到第 2 周）：uv sync --group api
-# argon2/pyjwt 仍是第 6 周账号系统才用，先留着不拆。
+# 本地跑 API 用。⚠️ uvicorn **不上线** —— Vercel 自带 ASGI 服务器。
+# argon2/pyjwt 是第 6 周账号系统才用，先放这里。
 api = [
-    "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
-    # 连接池。Neon 的 -pooler 端点是 PgBouncer transaction 模式，
-    # ⚠️ 必须配 prepare_threshold=None，否则 psycopg3 的 prepared statement
-    #    会跨事务复用一个不存在的 statement 名，报 "prepared statement does not exist"
-    "psycopg-pool>=3.2",
     "argon2-cffi>=23.1",
     "pyjwt>=2.9",
 ]
