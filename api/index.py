@@ -20,6 +20,11 @@ schema 校验会拒掉任何多余的键（`"//"` 之类），报
     /recommend 一次要打三次库，跨区能轻易多出 150–300 ms。
     iad1（华盛顿）是离 us-east-2 最近的可选区。Hobby 计划只能指定一个区域。
 
+`maxDuration: 30`
+    /recommend 要打三次库，Neon scale-to-zero 冷启动时首个请求可能要几秒。
+    ⚠️ 不要加 `memory` —— Active CPU 计费下该项被忽略，只会在构建日志里
+       刷 "Provided `memory` setting in `vercel.json` is ignored" 警告。
+
 `includeFiles: "{server,src}/**/*.py"`
     保险。Python builder 默认会带上项目目录，但 server/ 与 src/ 是被本文件
     **间接** import 的。漏掉就是 ModuleNotFoundError。
