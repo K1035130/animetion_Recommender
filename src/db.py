@@ -17,7 +17,7 @@ def prepare(conn: psycopg.Connection) -> psycopg.Connection:
 
     ⚠️ **每条新连接都必须过这里。** 不注册的话 `tag_vec` 读回来是**字符串**
        而不是向量，写入时 numpy 数组也没法直接当参数 —— 而且不报类型错，
-       是在后面某处解析失败，很难定位。连接池要走 configure= 回调（见 api/main.py）。
+       是在后面某处解析失败，很难定位。连接池要走 configure= 回调（见 server/main.py）。
     """
     register_vector(conn)
     return conn

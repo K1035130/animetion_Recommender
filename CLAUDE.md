@@ -263,13 +263,21 @@ person 数据自动检测**。方法分两层，缺一不可：
 ```
 uv sync
 psql < sql/001_init.sql
+psql < sql/002_tag_vec.sql                   # ⚠️ 别漏：没有 tag_vec 列，最后一步会直接报错
 uv run python scripts/build_id_map.py        # 需要联网，会下 bangumi-data
 uv run python scripts/load_profiles.py
 uv run python scripts/backfill_staff.py
 uv run python scripts/backfill_anilist.py    # 需要联网，约 125 次请求
 uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py   # 依赖上一步；打分链路的前置
+psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
+uv run pytest tests/ -q                      # 验收：13 项一致性测试应全绿
 ```
+
+⚠️ **最后两步不是可选的。** 跳过 VACUUM 会让库虚涨一倍（实测 58 → 116 MB），
+误判预算吃紧；跳过 pytest 就没人发现 `tag_vec` 是不是漏跑或跑歪了 ——
+`build_tag_vectors.py` 没跑的话打分**静默返回空列表**，不报错。
+（`GET /health` 的 `with_tag_vec` 字段也能看出来。）
 
 ### 与本文档原计划的两处偏离（已论证，勿回退）
 

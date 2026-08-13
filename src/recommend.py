@@ -27,7 +27,8 @@ import psycopg
 
 from src import series, tagvec
 
-Weighting = Literal["logtf-idf", "binary"]
+# 加权方式跟着向量计算走，定义在 tagvec 里 —— 两处各定义一份迟早漂移
+Weighting = tagvec.Weighting
 Mode = Literal["all", "season", "aired", "upcoming", "recent", "classic"]
 
 # 日本动画按季度（cour）放送，每季起始于 1/4/7/10 月 1 日。
