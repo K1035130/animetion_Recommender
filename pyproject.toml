@@ -38,9 +38,10 @@ dependencies = [
 # ETL 与回填脚本专用，**不上线**：uv sync --group etl
 # 灌库、回填、重建向量都要它；只跑 API 或跑测试则不需要。
 etl = [
-    # 400 MB jsonlines 用 polars 比 pandas 快一个量级。
-    # ⚠️ 它带 55 MB 的 polars-runtime-32，是当初把 function bundle 撑爆的元凶
-    "polars>=1.0",
+    # 📌 polars 已移除（2026-08-12）：全仓库零 import，git 历史里也没用过。
+    #    当初按「400 MB jsonlines 用 polars 比 pandas 快一个量级」的设想加的，
+    #    但实际 ETL 全是 orjson 逐行解析 —— 流式读 jsonlines 本来就不需要 DataFrame。
+    #    它带 55 MB 的 polars-runtime-32，是首次部署把依赖装歪时最扎眼的那一项。
     # Bangumi 官方 wiki 语法解析器（无向后兼容承诺，靠 uv.lock 锁死）
     "bgm-tv-wiki>=0.0.6",
     # AniList GraphQL

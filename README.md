@@ -33,7 +33,7 @@ Database: **58 MB / 500 MB** on Neon's free tier.
 
 | Layer | Choice |
 |---|---|
-| Data processing | Python 3.12 · polars · orjson · [bgm-tv-wiki](https://github.com/bangumi/wiki-parser-py) |
+| Data processing | Python 3.12 · orjson · [bgm-tv-wiki](https://github.com/bangumi/wiki-parser-py) |
 | Database | Neon Postgres 18.4 + pgvector 0.8.1 (`us-east-2`) |
 | Chinese tokenization | jieba — Neon can't install `zhparser`, so BM25 requires pre-tokenizing in Python |
 | Env management | uv |
@@ -48,15 +48,16 @@ Database: **58 MB / 500 MB** on Neon's free tier.
 
 ```bash
 uv sync                       # runtime deps only — what the deployed app needs
-uv sync --group etl           # + polars / bgm-tv-wiki / httpx — needed by scripts/
+uv sync --group etl           # + bgm-tv-wiki / httpx / tqdm — needed by scripts/
 uv sync --group api --group etl --group dev   # everything, for development
 ```
 
 ⚠️ **The main dependency group is deliberately minimal: it is exactly what the
 deployed function needs.** Vercel's Python runtime finds `pyproject.toml` +
 `uv.lock` and installs *that group* — a `requirements.txt` is ignored entirely.
-Anything ETL-only (polars alone drags in a 55 MB runtime) must stay in a group,
-or it lands in the function bundle. So `scripts/` need `--group etl`.
+Anything ETL-only must stay in a group, or it lands in the function bundle —
+so `scripts/` need `--group etl`. (The audit that followed also found polars
+was never imported anywhere, so it is gone entirely.)
 
 `requires-python` is pinned to 3.12 to match the deployment runtime.
 
@@ -87,6 +88,7 @@ The archive is ~410 MB compressed, ~1.8 GB extracted.
 ### 4. Build the database, in this order
 
 ```bash
+uv sync --group etl                          # scripts/ need this group
 psql < sql/001_init.sql
 psql < sql/002_tag_vec.sql                   # don't skip: adds tag_vec / series_root
 
@@ -98,7 +100,7 @@ uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py   # depends on the step above
 
 psql -c 'VACUUM FULL anime_profile'          # reclaim MVCC bloat from the bulk UPDATEs
-uv run pytest tests/ -q                      # acceptance: 13 parity tests must pass
+uv run pytest tests/ -q                      # acceptance: all 20 tests must pass
 ```
 
 Every script is idempotent and safe to re-run. **The last two steps are not optional** — skipping `VACUUM FULL` inflates the database to roughly double its real size, and skipping the tests means nobody notices if `tag_vec` was never populated: scoring then returns an empty list *silently*. `GET /health` reports `with_tag_vec` for the same reason.
@@ -242,7 +244,7 @@ Neon 免费层占用 **58 MB / 500 MB**。
 
 | 层 | 选型 |
 |---|---|
-| 数据处理 | Python 3.12 · polars · orjson · [bgm-tv-wiki](https://github.com/bangumi/wiki-parser-py) |
+| 数据处理 | Python 3.12 · orjson · [bgm-tv-wiki](https://github.com/bangumi/wiki-parser-py) |
 | 数据库 | Neon Postgres 18.4 + pgvector 0.8.1（`us-east-2`） |
 | 中文分词 | jieba —— Neon 装不了 `zhparser`，BM25 只能在 Python 侧预分词 |
 | 环境管理 | uv |
@@ -255,14 +257,15 @@ Neon 免费层占用 **58 MB / 500 MB**。
 
 ```bash
 uv sync                       # 只装运行时依赖 —— 线上跑的就是这一组
-uv sync --group etl           # + polars / bgm-tv-wiki / httpx，scripts/ 要用
+uv sync --group etl           # + bgm-tv-wiki / httpx / tqdm，scripts/ 要用
 uv sync --group api --group etl --group dev   # 开发全量
 ```
 
 ⚠️ **主依赖组是刻意精简的：它等于线上 function 真正需要的东西。**
 Vercel 的 Python runtime 检测到 `pyproject.toml` + `uv.lock` 就装**这一组**，
-`requirements.txt` 会被完全忽略。任何只在 ETL 用的包（光 polars 就带 55 MB 运行时）
+`requirements.txt` 会被完全忽略。任何只在 ETL 用的包
 都必须待在 group 里，否则会被打进 function bundle。所以跑 `scripts/` 要加 `--group etl`。
+（顺带查出 polars 全仓库零 import，已整个删除。）
 
 ### 2. 配置
 
@@ -289,6 +292,7 @@ python -c "import zipfile; zipfile.ZipFile('data/raw/dump.zip').extractall('data
 ### 4. 建库，顺序不能乱
 
 ```bash
+uv sync --group etl                          # scripts/ 要这一组
 psql < sql/001_init.sql
 psql < sql/002_tag_vec.sql                   # 别漏：加 tag_vec / series_root 两列
 
@@ -300,7 +304,7 @@ uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py   # 依赖上一步
 
 psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
-uv run pytest tests/ -q                      # 验收：13 项一致性测试应全绿
+uv run pytest tests/ -q                      # 验收：20 项测试应全绿
 ```
 
 脚本都幂等，可重复执行。**最后两步不是可选的** —— 跳过 VACUUM 会让库虚涨一倍；跳过 pytest 就没人发现 `tag_vec` 是否漏跑，而它没跑的话打分**静默返回空列表**，不报错。`GET /health` 的 `with_tag_vec` 字段也是为此存在。

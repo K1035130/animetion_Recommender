@@ -164,11 +164,13 @@ wr 高达 6.39，按 wr 卡这条线等于什么都没过滤。
 | 组 | 内容 | 上线 |
 |---|---|---|
 | **主依赖** | fastapi / psycopg[binary] / psycopg-pool / pgvector / numpy / jieba / dotenv / orjson | ✅ **19 个包** |
-| `etl` | polars / bgm-tv-wiki / httpx / tqdm | ❌ `scripts/` 专用 |
+| `etl` | bgm-tv-wiki / httpx / tqdm | ❌ `scripts/` 专用 |
 | `api` | uvicorn / argon2 / pyjwt | ❌ 本地跑服务器 + 第 6 周认证 |
 | `embed` | torch / sentence-transformers / sklearn | ❌ 第 3 周离线建库 |
 
-⚠️ 光 polars 一个就带 **55 MB** 的 `polars-runtime-32`，而 `server/` 一行没 import 它。
+⚠️ 顺带查出 **polars 全仓库零 import**（git 历史里也没用过），已整个删除 ——
+当初按「400 MB jsonlines 用 polars 更快」加的，但实际 ETL 全是 orjson 逐行解析，
+流式读 jsonlines 本来就不需要 DataFrame。它带 55 MB 的 `polars-runtime-32`。
 ⚠️ **`uv sync` 不再自带 ETL 依赖** —— 跑 `scripts/` 要加 `--group etl`。
 ⚠️ `requirements.txt` **已删除**：它被忽略却看着像事实来源，是纯粹的漂移隐患。
 校验方式：`uv sync --no-dev --no-group api --no-group etl --no-group embed`
@@ -288,7 +290,7 @@ person 数据自动检测**。方法分两层，缺一不可：
 ⚠️ **换机器 / 重新 clone 后的启动顺序**（`data/interim/*` 除 tag 词表外都不入 git）：
 
 ```
-uv sync
+uv sync --group etl          # ⚠️ 必须带 --group etl：脚本要用 httpx/tqdm/bgm-tv-wiki
 psql < sql/001_init.sql
 psql < sql/002_tag_vec.sql                   # ⚠️ 别漏：没有 tag_vec 列，最后一步会直接报错
 uv run python scripts/build_id_map.py        # 需要联网，会下 bangumi-data
@@ -298,7 +300,7 @@ uv run python scripts/backfill_anilist.py    # 需要联网，约 125 次请求
 uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py   # 依赖上一步；打分链路的前置
 psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
-uv run pytest tests/ -q                      # 验收：13 项一致性测试应全绿
+uv run pytest tests/ -q                      # 验收：20 项测试应全绿
 ```
 
 ⚠️ **最后两步不是可选的。** 跳过 VACUUM 会让库虚涨一倍（实测 58 → 116 MB），
@@ -324,7 +326,7 @@ AniList 保留它真正独有的：`idMal`（Phase 2 锚点）、英文名、全
 
 ```bash
 uv sync                                       # 只装运行时依赖（= 线上那一组）
-uv sync --group etl                           # scripts/ 要用：polars/httpx/bgm-tv-wiki
+uv sync --group etl                           # scripts/ 要用：httpx/tqdm/bgm-tv-wiki
 uv sync --group api                           # 本地跑 uvicorn
 uv run ruff check src/ scripts/ server/ tests/
 uv run pytest tests/ -q                       # 改过任一条打分路径后必跑
