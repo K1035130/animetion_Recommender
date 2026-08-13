@@ -8,7 +8,8 @@ A preference-questionnaire-driven anime recommender. Users rate shows they've se
 
 ## Status
 
-**Week 1 · Data layer — done. Week 2 · P0 recommender + API — done.**
+**Weeks 1–2 are complete and live** at `animetion-recommender.vercel.app` —
+frontend and API in one Vercel project, same origin. Next up: week 3, embeddings.
 
 | Step | Status |
 |---|---|
@@ -25,7 +26,30 @@ A preference-questionnaire-driven anime recommender. Users rate shows they've se
 | Deployed to Vercel | ✅ live, all endpoints verified |
 | Frontend v0 | ✅ [web/](web/) — questionnaire + results, ratings in localStorage |
 
-Database: **58 MB / 500 MB** on Neon's free tier.
+Database **58 MB / 500 MB** on Neon's free tier · **20 tests** (13 scoring-parity, 7 API).
+
+---
+
+## Roadmap
+
+| Week | Content | Status |
+|---|---|---|
+| 1 | Data layer: dump → candidate set → load → tag cleaning | ✅ |
+| 2 | P0 scoring, questionnaire, sequel folding, API, pgvector, frontend v0, deploy | ✅ |
+| **3** | **Qwen3 embeddings · P1 fusing staff/studio · content clusters** | ⬜ next |
+| 4 | Moegirl corpus · HyDE · hybrid retrieval | ⬜ |
+| **5** | **Offline evaluation — the point of the project** | ⬜ |
+| 6 | Information-gain question selection · accounts · quarterly sync | ⬜ |
+
+Week 5 is the part that makes this a portfolio piece rather than a demo:
+leave-one-out on Bangumi's public collection data, NDCG@10 and P@10 against four
+baselines, and a cold-start curve over question count. It is not compressible.
+
+⚠️ **One thing is still unverified: the deployment config *with* the frontend.**
+The last verified deploy was API-only. Adding the frontend changed `vercel.json`
+to a build command plus an `/api/*`-only rewrite, and that combination has not
+run once. Watch the first build log — there is no `package.json` at the repo
+root, so if Vercel's install step trips over that, blank out the Install Command.
 
 ---
 
@@ -69,7 +93,10 @@ cp .env.example .env
 
 - `DATABASE_URL_DIRECT` — DDL and bulk loading. Direct connection, avoiding the conflict between PgBouncer and psycopg3's prepared statements.
 - `DATABASE_URL` — the deployed app. Uses the pooler (hostname has an extra `-pooler` segment). Optional locally; the code falls back to the direct URL.
-- `CORS_ORIGINS` — comma-separated frontend origins. Defaults to local Vite.
+- `CORS_ORIGINS` — **local development only.** Defaults to Vite's 5173. Do not set
+  it in production: the frontend and the API share one origin there, so the CORS
+  middleware never runs. A cross-origin error in production means the client is
+  calling some other host — check `web/src/api.ts`, not this variable.
 
 ### 3. Fetch the data
 
@@ -223,7 +250,8 @@ The second one is not redundant. It immediately caught a missing tie-break in th
 
 ## 当前进度
 
-**第 1 周数据层完工，第 2 周 P0 推荐 + API 完工。**
+**第 1–2 周全部完工并已上线** —— `animetion-recommender.vercel.app`，
+前端与 API 同一个 Vercel 项目、同源。下一步是第 3 周 embedding。
 
 | 步骤 | 状态 |
 |---|---|
@@ -240,7 +268,26 @@ The second one is not redundant. It immediately caught a missing tie-break in th
 | 部署到 Vercel | ✅ 已上线，四个接口实测通过 |
 | 前端 v0 | ✅ [web/](web/) —— 问卷 + 推荐结果，评分存 localStorage |
 
-Neon 免费层占用 **58 MB / 500 MB**。
+Neon 免费层占用 **58 MB / 500 MB** · 测试 **20 项**（13 项打分一致性 + 7 项接口）。
+
+## 路线图
+
+| 周 | 内容 | 状态 |
+|---|---|---|
+| 1 | 数据层：dump → 候选集 → 灌库 → tag 清洗 | ✅ |
+| 2 | P0 打分、问卷、续作折叠、API、pgvector、前端 v0、部署 | ✅ |
+| **3** | **Qwen3 embedding · P1 融合 staff/studio · 内容簇** | ⬜ 下一步 |
+| 4 | 萌娘百科语料 · HyDE · 混合检索 | ⬜ |
+| **5** | **离线评测 —— 这个项目的核心** | ⬜ |
+| 6 | 信息增益选题 · 账号系统 · 季度同步 | ⬜ |
+
+第 5 周是让这个项目区别于 demo 的部分：Bangumi 公开收藏数据上做 leave-one-out、
+四条 baseline 的 NDCG@10 与 P@10、以及按题目数展开的冷启动曲线。**不可压缩。**
+
+⚠️ **有一件事仍未实测：带前端的部署配置。** 上次验证过的是纯 API 部署。
+加前端后 `vercel.json` 换成了 buildCommand + 只转发 `/api/*`，这套组合还没跑过。
+首次部署盯着构建日志 —— 仓库根目录没有 `package.json`，
+若 Vercel 的 install 阶段因此报错，把面板里的 Install Command 清空。
 
 ## 技术栈
 
@@ -277,7 +324,9 @@ cp .env.example .env
 
 - `DATABASE_URL_DIRECT` —— 建表和批量灌数据用。走直连，避开 PgBouncer 与 psycopg3 prepared statement 的冲突
 - `DATABASE_URL` —— 线上用，走连接池（主机名多一段 `-pooler`）。本地可不填，代码会退回直连
-- `CORS_ORIGINS` —— 前端域名，逗号分隔。不填则默认放行本地 Vite
+- `CORS_ORIGINS` —— **只在本地开发有用**，不填则默认放行 Vite 的 5173。
+  ⚠️ 线上不要配：前后端同源，CORS 中间件根本不参与。线上若报跨域，
+  说明前端把请求打到了别的域名 —— 该查 `web/src/api.ts`，不是这个变量
 
 ### 3. 拉数据
 

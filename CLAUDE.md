@@ -5,9 +5,27 @@
 
 ---
 
-## 📍 当前进度（更新于 2026-08-11）
+## 📍 当前进度（更新于 2026-08-13）
 
-**第 1 周数据层完工。第 2 周 P0 推荐链路已端到端跑通，剩 FastAPI + 前端。**
+**第 1–2 周全部完工并已上线。下一步是第 3 周 embedding。**
+
+`animetion-recommender.vercel.app` —— 前端 + API 同一个 Vercel 项目、同源。
+库占用 **58 MB / 500 MB**。测试 **20 项**（13 项打分一致性 + 7 项接口）。
+
+| 周 | 内容 | 状态 |
+|---|---|---|
+| 1 | 数据层：dump → 候选集 → 灌库 → tag 清洗 | ✅ |
+| 2 | P0 推荐 + 选题 + 续作折叠 + API + pgvector + 前端 v0 + 部署 | ✅ |
+| **3** | **Qwen3-Embedding + P1 融合 staff/studio + 内容簇** | ⬜ **← 从这里继续** |
+| 4 | 萌娘百科语料 + HyDE + 混合检索 | ⬜ |
+| **5** | **离线评测（核心卖点，不可压缩）** | ⬜ |
+| 6 | 信息增益选题 + 账号系统 + 季度同步 | ⬜ |
+
+⚠️ **唯一未经实测的环节：带前端的部署配置。** 上一次验证过的部署是纯 API
+（`/(.*)` 全转发给函数）。加前端后 `vercel.json` 变成
+`buildCommand` + `outputDirectory` + 只转发 `/api/*`，**这套组合还没真跑过一次**。
+首次部署要盯构建日志：根目录没有 `package.json`，若 Vercel 的 install 阶段
+因此报错，就在面板把 Install Command 设成空。
 
 ### 第 1 周 · 数据层 ✅
 
@@ -20,7 +38,8 @@
 | 4b. AniList id / 英文名 / popularity | ✅ 6,445 部（56.3%） |
 | 5. Tag 清洗 | ✅ **308 个题材 tag**，`data/interim/tag_vocab.json`（第二轮清洗后，见下）|
 
-**库占用 44 MB / 500 MB。** 分词词典指纹 `6a1cbbe1bc4f446d`（第 3 周查询层启动时必须比对）。
+分词词典指纹 `6a1cbbe1bc4f446d`。⚠️ **API 启动时已强制比对**（`server/main.py`
+的 `BUILD_FINGERPRINT`），不符直接拒绝服务 —— 不再是「第 3 周记得做」的待办。
 
 ### 第 2 周 · P0 推荐
 
@@ -34,7 +53,15 @@
 | 打分迁 pgvector（放弃 Render） | ✅ [src/recommend_sql.py](src/recommend_sql.py) + [tests/test_parity.py](tests/test_parity.py) |
 | 前端 v0 | ✅ [web/](web/)：问卷 + 推荐，评分存 localStorage |
 
-矩阵 `(11453, 308)`，全库打分 **1 ms** —— 印证第 4 节「不建 HNSW」的判断。
+📌 **前端刻意冻结在 v0（2026-08-13 定）** —— Kevin：等功能都做完再统一升级。
+没有路由、没有状态库、没有详情页，`/api/search` 与 `/api/anime/{id}` 已能用但界面没接。
+**不要顺手美化它。** 第 3–5 周的产出（embedding、聚类选题、评测）都会改变前端要展示的
+东西，现在打磨的 UI 大概率要重做。届时一次性重写比分次调整省事。
+
+矩阵 `(11453, 308)`。⚠️ **线上打分已不走这个矩阵** —— 余弦由 pgvector 在库里算
+（见下「部署改道」）。内存矩阵保留给第 5 周评测的批量打分，两条路径由
+[tests/test_parity.py](tests/test_parity.py) 锁死等价。全库暴力余弦实测 **≈ 0 ms**，
+无论哪条路径都印证了第 4 节「不建 HNSW」的判断。
 
 **已定的几件事：**
 
@@ -240,9 +267,14 @@ DB 往返已经便宜到可以忽略。
   ⚠️ 必须带 `configure=db.prepare` 注册 pgvector 适配器，否则 `tag_vec`
   **读回来是字符串**、numpy 数组也没法当查询参数，而且不报类型错，
   是在后面某处解析失败。
-- **CORS 白名单从 `CORS_ORIGINS` 环境变量读，默认放行本地 Vite。**
-  ⚠️ 故意不写 `["*"]` —— 第 6 周若把 JWT 放 httpOnly cookie，`"*"` 与
-  `allow_credentials` 互斥，到时候要回头改。
+- **所有路由挂在 `/api` 下**（含 `/api/docs`）。这是同源部署的前提 ——
+  `vercel.json` 靠前缀把 `/api/*` 转给函数、其余交给 `web/dist`。
+- **CORS 只服务本地开发**（Vite 5173 → uvicorn 8000）。
+  ⚠️ **线上同源，这段中间件不参与，`CORS_ORIGINS` 线上不要配。**
+  若线上报跨域，说明前端把请求打到了别的域名 —— 该查 `web/src/api.ts` 的
+  `BASE`（应恒为相对路径 `'/api'`），不是改这里。
+  ⚠️ 仍不写 `["*"]`：第 6 周若把 JWT 放 httpOnly cookie，`"*"` 与
+  `allow_credentials` 互斥。
 
 ~~⬜ 遗留：续作折叠的三层 CTE 是 `/recommend` 的主要成本~~
 **已作废（2026-08-12 线上实测）**：同区部署后「2 次额外往返 + 整个 CTE」

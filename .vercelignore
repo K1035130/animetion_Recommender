@@ -3,7 +3,9 @@
 #    完全忽略，别再建那个文件）。少了 uv.lock 就变成每次部署重新解析版本 ——
 #    而这个项目明确依赖版本钉死：jieba 版本一漂移，分词切出来就和库里的
 #    search_tsv 对不上，启动时的指纹校验会直接拒绝服务。
-#    （bgm-tv-wiki 声明无向后兼容承诺，同理，虽然它现在只在 etl 组里。）
+#
+# ⚠️ 也不要忽略 web/ 的源码 —— vercel.json 的 buildCommand 要在云端构建它。
+#    这里只挡本地产物（node_modules / dist），它们会在云端重新生成。
 
 # ⚠️ data/raw 是 2.1 GB 的 Bangumi dump（解压后 1.8 GB + 压缩包）。
 #    走 git 部署时 .gitignore 已经挡住了，但 `vercel deploy` 从本地目录
@@ -18,6 +20,11 @@ data/processed/
 #       后面的 ! 取反规则会失效（与 .gitignore 同一套语义）。
 data/interim/*
 !data/interim/tag_vocab.json
+
+# 前端的本地产物。同上：源码要上传，这两个由云端构建重新生成。
+# node_modules 动辄几百 MB，CLI 部署时不挡会把上传拖垮。
+web/node_modules/
+web/dist/
 
 # ETL / 回填脚本与测试不上线。它们的依赖在 pyproject 的 etl / dev 组里，
 # 线上那一组本来就不会装，排掉源码只是顺带减小 bundle。
