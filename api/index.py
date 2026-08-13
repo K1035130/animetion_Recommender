@@ -12,8 +12,15 @@ vercel.json 的三项配置在这里说明 —— **那个文件不能写注释*
 schema 校验会拒掉任何多余的键（`"//"` 之类），报
 `Invalid request: should NOT have additional property "//"`。
 
-`rewrites: /(.*) -> /api/index`
-    所有路径都打到这一个 function 上，由 FastAPI 自己路由。
+`buildCommand` / `outputDirectory`
+    前端（web/，Vite + React）与本 API 在**同一个 Vercel 项目**里。
+    Vercel 构建静态产物到 web/dist，同时把 api/index.py 编成 function。
+
+`rewrites: /api/(.*) -> /api/index`
+    ⚠️ **只转发 /api/**，其余路径留给前端静态产物。
+    因此 server/main.py 里所有路由都带 `/api` 前缀（含 docs：/api/docs）。
+    前后端同源 → **线上根本不需要 CORS**；server 里那段 CORS 中间件
+    只为本地 Vite dev server（5173 → 8000）存在。
 
 `regions: ["iad1"]`
     ⚠️ 必须与 Neon 的 us-east-2 对齐。真正影响性能的是 API↔DB 的往返延迟 ——

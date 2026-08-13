@@ -1,0 +1,20 @@
+@import 'tailwindcss';
+
+/* 跟随系统深浅色。作品集项目不做主题切换按钮，少一个状态少一类 bug。 */
+@theme {
+  --color-ink: light-dark(#18181b, #fafafa);
+  --color-muted: light-dark(#71717a, #a1a1aa);
+  --color-surface: light-dark(#ffffff, #18181b);
+  --color-page: light-dark(#fafafa, #09090b);
+  --color-line: light-dark(#e4e4e7, #27272a);
+  --color-brand: light-dark(#7c3aed, #a78bfa);
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+body {
+  background: var(--color-page);
+  color: var(--color-ink);
+}

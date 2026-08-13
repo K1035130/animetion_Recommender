@@ -86,13 +86,22 @@ def _conn() -> Iterator[psycopg.Connection]:
 
 app = FastAPI(
     title="动画推荐 API",
-    version="0.2.0",
+    version="0.3.0",
     description="基于偏好问卷的当季新番推荐（P0：tag 余弦 + mean-centered）",
+    # 全部接口挂在 /api 下。前端与 API 同属一个 Vercel 项目、共用一个域名，
+    # vercel.json 把 /api/* 转给这个函数、其余交给前端静态产物。
+    # ⚠️ 前缀是**同源部署的前提** —— 没有它就没法把静态页面和 API 分流。
+    docs_url="/api/docs",
+    openapi_url="/api/openapi.json",
+    redoc_url="/api/redoc",
 )
+API = "/api"
 
-# 前端在 Vercel、后端也在 Vercel（2026-08-12 起），但域名仍可能不同
-# （预览部署、自定义域名），CORS 该配还得配。
-# ⚠️ 不要图省事写 ["*"] —— 第 6 周加 Cookie 认证时 "*" 与 credentials 互斥。
+# CORS 仅供本地开发：Vite dev server 在 5173，而 API 跑在 8000，属跨源。
+# ⚠️ **线上同源，这段不生效也不需要生效。**
+#    别因为「线上出了跨域问题」就来改这里 —— 那说明前端把请求打到了
+#    别的域名上（比如硬编码了 API 域名），该改的是前端的 baseURL。
+# ⚠️ 仍然不写 ["*"]：第 6 周若把 JWT 放 httpOnly cookie，"*" 与 credentials 互斥。
 _origins = os.environ.get(
     "CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
 ).split(",")
@@ -105,7 +114,7 @@ app.add_middleware(
 )
 
 
-@app.get("/health")
+@app.get(f"{API}/health")
 def health() -> dict:
     """存活探针。也顺带确认库里的向量列已回填 —— 忘了跑
     scripts/build_tag_vectors.py 的话打分会静默返回空列表。"""
@@ -120,7 +129,7 @@ def health() -> dict:
     }
 
 
-@app.get("/questionnaire", response_model=schemas.QuestionnaireResponse)
+@app.get(f"{API}/questionnaire", response_model=schemas.QuestionnaireResponse)
 def get_questionnaire(
     n: int = Query(default=30, ge=1, le=100),
     include_nsfw: bool = False,
@@ -162,7 +171,7 @@ def _to_ratings(answers: list[schemas.Answer]) -> list[recommend_sql.Rating]:
     return out
 
 
-@app.post("/recommend", response_model=schemas.RecommendResponse)
+@app.post(f"{API}/recommend", response_model=schemas.RecommendResponse)
 def post_recommend(req: schemas.RecommendRequest) -> schemas.RecommendResponse:
     """无状态打分。评分随请求传入，服务端零写入。
 
@@ -217,7 +226,7 @@ _SEARCH_COLS = """
 """
 
 
-@app.get("/search", response_model=list[schemas.SearchHit])
+@app.get(f"{API}/search", response_model=list[schemas.SearchHit])
 def search(q: str = Query(min_length=1, max_length=100),
            limit: int = Query(default=20, ge=1, le=SEARCH_LIMIT_MAX)
            ) -> list[schemas.SearchHit]:
@@ -268,7 +277,7 @@ def _hit(row: tuple, via: str) -> schemas.SearchHit:
     )
 
 
-@app.get("/anime/{subject_id}", response_model=schemas.AnimeDetail)
+@app.get(API + "/anime/{subject_id}", response_model=schemas.AnimeDetail)
 def anime_detail(subject_id: int) -> schemas.AnimeDetail:
     with _conn() as c, c.cursor() as cur:
         cur.execute("""

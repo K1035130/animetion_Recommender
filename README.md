@@ -23,7 +23,7 @@ A preference-questionnaire-driven anime recommender. Users rate shows they've se
 | FastAPI endpoints | ✅ [server/main.py](server/main.py) |
 | Scoring pushed into Postgres (pgvector) | ✅ [src/recommend_sql.py](src/recommend_sql.py) |
 | Deployed to Vercel | ✅ live, all endpoints verified |
-| Frontend v0 | ⬜ **next** |
+| Frontend v0 | ✅ [web/](web/) — questionnaire + results, ratings in localStorage |
 
 Database: **58 MB / 500 MB** on Neon's free tier.
 
@@ -108,7 +108,8 @@ Every script is idempotent and safe to re-run. **The last two steps are not opti
 ### 5. Run it
 
 ```bash
-uv run uvicorn server.main:app --reload      # http://127.0.0.1:8000/docs
+uv run uvicorn server.main:app --reload      # API, docs at /api/docs
+cd web && npm install && npm run dev         # frontend at :5173, /api proxied to :8000
 uv run pytest tests/ -q                      # after touching either scoring path
 uv run ruff check src/ scripts/ server/ tests/
 ```
@@ -152,7 +153,8 @@ src/
   recommend_sql.py   Postgres scoring — used online; must stay equivalent to the above
   questionnaire.py   Question selection + answer→rating mapping
   textproc.py        jieba tokenization + dictionary fingerprint
-server/              FastAPI app (schemas + endpoints)
+server/              FastAPI app — every route is under /api
+web/                 Vite + React + Tailwind frontend (same Vercel project)
 api/index.py         Vercel entry point — this directory must hold nothing else
 sql/                 001 tables · 002 tag_vec + series_root
 scripts/             ETL and backfill, one column-set each, never overlapping
@@ -236,7 +238,7 @@ The second one is not redundant. It immediately caught a missing tie-break in th
 | FastAPI 接口 | ✅ [server/main.py](server/main.py) |
 | 打分推进 Postgres（pgvector） | ✅ [src/recommend_sql.py](src/recommend_sql.py) |
 | 部署到 Vercel | ✅ 已上线，四个接口实测通过 |
-| 前端 v0 | ⬜ **下一步** |
+| 前端 v0 | ✅ [web/](web/) —— 问卷 + 推荐结果，评分存 localStorage |
 
 Neon 免费层占用 **58 MB / 500 MB**。
 
@@ -312,7 +314,8 @@ uv run pytest tests/ -q                      # 验收：20 项测试应全绿
 ### 5. 跑起来
 
 ```bash
-uv run uvicorn server.main:app --reload      # 接口文档 http://127.0.0.1:8000/docs
+uv run uvicorn server.main:app --reload      # API，文档在 /api/docs
+cd web && npm install && npm run dev         # 前端 :5173，/api 自动代理到 :8000
 uv run pytest tests/ -q                      # 改过任一条打分路径后必跑
 uv run ruff check src/ scripts/ server/ tests/
 ```
@@ -344,7 +347,8 @@ src/
   recommend_sql.py   Postgres 打分 —— 线上用，必须与上面逐条等价
   questionnaire.py   选题 + 作答→评分映射
   textproc.py        jieba 分词 + 词典指纹
-server/              FastAPI 应用（schemas + 端点）
+server/              FastAPI 应用 —— 所有路由都在 /api 下
+web/                 Vite + React + Tailwind 前端（同一个 Vercel 项目）
 api/index.py         Vercel 入口 —— 这个目录**只能放这一个文件**
 sql/                 001 建表 · 002 tag_vec + series_root
 scripts/             ETL 与回填，各管各的列，绝不交叉

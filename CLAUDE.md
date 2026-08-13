@@ -32,7 +32,7 @@
 | 交互式自测 | ✅ [scripts/try_questionnaire.py](scripts/try_questionnaire.py) |
 | FastAPI 接口 | ✅ [server/main.py](server/main.py) + [server/schemas.py](server/schemas.py) |
 | 打分迁 pgvector（放弃 Render） | ✅ [src/recommend_sql.py](src/recommend_sql.py) + [tests/test_parity.py](tests/test_parity.py) |
-| 前端 v0 | ⬜ **← 从这里继续** |
+| 前端 v0 | ✅ [web/](web/)：问卷 + 推荐，评分存 localStorage |
 
 矩阵 `(11453, 308)`，全库打分 **1 ms** —— 印证第 4 节「不建 HNSW」的判断。
 
@@ -330,7 +330,8 @@ uv sync --group etl                           # scripts/ 要用：httpx/tqdm/bgm
 uv sync --group api                           # 本地跑 uvicorn
 uv run ruff check src/ scripts/ server/ tests/
 uv run pytest tests/ -q                       # 改过任一条打分路径后必跑
-uv run uvicorn server.main:app --reload       # 起 API，文档在 /docs
+uv run uvicorn server.main:app --reload       # 起 API，文档在 /api/docs
+cd web && npm install && npm run dev          # 起前端（5173），/api 自动代理到 8000
 ```
 
 中文输出要设 `PYTHONIOENCODING`，**两种 shell 语法不同**：
