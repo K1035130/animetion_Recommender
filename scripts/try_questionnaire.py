@@ -146,14 +146,14 @@ def show_recs(cat, ans: dict, mode: str,
                "upcoming": "当季未开播",
                "classic": "经典回顾（2011 前）"}[mode]
     print(f"\n推荐（{rng}）:")
-    for rank, (sid, nm, s) in enumerate(out, 1):
-        i = cat.index_of(sid)
+    for rank, rec in enumerate(out, 1):
+        i = cat.index_of(rec.subject_id)
         tags = [cat.vocab[j] for j in np.argsort(-cat.mat[i])[:5]
                 if cat.mat[i, j] > 0]
-        star = " ★想看过" if str(sid) in ans else ""
+        star = " ★想看过" if str(rec.subject_id) in ans else ""
         sc = (f"{cat.bgm_score[i]:.1f}" if cat.bgm_score[i] > 0 else " - ")
-        print(f"  {rank:>2}. 评分{sc} 匹配{s:.3f}  {nm[:28]:<30}{cat.year[i]}  "
-              f"{'/'.join(tags)}{star}")
+        print(f"  {rank:>2}. 评分{sc} 匹配{rec.match:.3f}  "
+              f"{rec.name[:28]:<30}{cat.year[i]}  {'/'.join(tags)}{star}")
 
 
 def main() -> None:

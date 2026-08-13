@@ -30,8 +30,8 @@
 | 问卷选题 + 三种作答 | ✅ [src/questionnaire.py](src/questionnaire.py) |
 | 续作折叠 | ✅ [src/series.py](src/series.py) + [scripts/build_series_map.py](scripts/build_series_map.py) |
 | 交互式自测 | ✅ [scripts/try_questionnaire.py](scripts/try_questionnaire.py) |
-| FastAPI 接口 | ⬜ **← 从这里继续** |
-| 前端 v0 | ⬜ |
+| FastAPI 接口 | ✅ [api/main.py](api/main.py) + [api/schemas.py](api/schemas.py) |
+| 前端 v0 | ⬜ **← 从这里继续** |
 
 矩阵 `(11453, 308)`，全库打分 **1 ms** —— 印证第 4 节「不建 HNSW」的判断。
 
@@ -55,6 +55,91 @@
 ⚠️ **零向量作品必须排除在候选之外。** 它们与任何偏好向量的余弦都是 0，
 而偏好向量整体为负时（用户对问卷多数作品选「不感兴趣」），0 反而**高于**所有
 负相关作品，Top5 会变成虫虫危机、隐形墨水这类没有 tag 的条目。
+
+### ✅ 推荐结果加评分下限 `MIN_SCORE = 3.5`（2026-08-12）
+
+**依据是评分信号的不对称性**：高分不保证好看（小众神作与过誉作品混在一起），
+但低分几乎必然难看。所以低分可以当硬过滤，高分不能当硬排序。
+
+⚠️ **和「热度权重必须等 baseline」不冲突，但要注意口径。** 那条讲的是把热度
+**混进排序**会污染 NDCG 归因；这里是**候选池定义**，对四条 baseline 一视同仁。
+`score(min_score=...)` 做成了参数，第 5 周**四条线必须传同一个值**（要么全默认、
+要么全传 None），否则候选池不一致，NDCG 没有可比性。
+
+⚠️ **判据是「有评分且低于 3.5」，未评分作品放行。** 写成 `>= 3.5` 会把
+未评分作品一并排除，而 `mode="upcoming"` 推的正是还没播的新番。当前 dump 里
+那 2 部碰巧有开播前评分（小圆剧场版 8.1、上低音号后篇 5.2），所以现在看不出问题，
+但第 6 周季度同步接进真正的新公布作品后，upcoming 档会被**静默清空**。
+
+⚠️ **必须用原始均分，不能用 `wr`。** wr 向 7.07 收缩，60 票打 3.0 的作品
+wr 高达 6.39，按 wr 卡这条线等于什么都没过滤。
+
+实测：库内低于 3.5 的共 **78 部（0.68%）**，最热门的是三体(1.70)、
+兽娘动物园2(1.40)、约定的梦幻岛第二季(3.30)、国王游戏(2.70)，全是公认翻车作。
+其中 26 部票数不足 100（最少 25 票），单看统计噪声偏大，
+但误伤几部冷门作品的代价远小于推出一部烂片。
+
+**为什么 tag 余弦特别容易踩这个坑**：烂续作的题材标签与前作几乎相同，
+向量上和用户口味高度吻合 —— 烂的是执行不是题材。实测「只给约定的梦幻岛打 9 分」，
+关掉下限时第二季以 **match=0.983 排在第 1 位**。
+
+⚠️ **续作折叠挡不住这种情况，而且会加剧它。** 折叠逻辑是「换成系列里用户
+**还没作答过**的最早一部」，而用户恰恰给第一季打了分 → 第一季作为「已看过」被剔除
+→ 第二季反而成了该系列的入口。「给第一季打高分」正是最常见的情形。
+
+实测各场景（默认配置）低分作品漏出数：
+
+| rank_by | 开下限 | 关下限 |
+|---|---|---|
+| `blend`（用户实际看到的） | 0 | **0** —— 质量项已把低分压下去 |
+| `match`（第 5 周 baseline 用） | 0 | **2**，含第 1 位 |
+
+即 blend 模式下目前是空操作，但 blend 是 α=0.5 的**软加权**不是保证；
+`match` 模式下它是唯一防线。
+
+### FastAPI 层（2026-08-12 完工）
+
+`uv sync --group api` 后 `uv run uvicorn api.main:app --reload`。四个接口全部无状态。
+
+| 接口 | 用途 | 实测延迟（开发机） |
+|---|---|---|
+| `GET /health` | 存活探针 + 指纹回显，Render 用 | 纯内存 |
+| `GET /questionnaire` | 选题，参数 `n` / `experience` / `include_nsfw` / `fold_sequels` | 首次 560 ms，之后 **2 ms**（缓存） |
+| `POST /recommend` | 打分，body 见 `RecommendRequest` | **12–17 ms** |
+| `GET /search` | 按名/别名搜，供用户主动打分 | BM25 103 ms / trgm 兜底 195 ms |
+| `GET /anime/{id}` | 详情 | 103 ms |
+
+⚠️ **上面带 DB 的三个数字里有 ~100 ms 是跨国 RTT，不是查询成本。**
+实测 `SELECT 1` 自己就要 104 ms（开发机在国内、Neon 在 us-east-2）。
+扣掉后：按主键取行和 BM25 的真实成本 **≈ 0 ms**，trgm 全扫 **≈ 90 ms**。
+后者与第 1 周「3.8 万行顺扫几十毫秒，兜底路径够用」的预判吻合 ——
+**`idx_alias_trgm` 确认不用重建**。上线 Render（俄亥俄，与 Neon 同区）后
+RTT 降到 ~15 ms，届时再看真实数字。
+
+**几个已定的接口决策：**
+
+- **`score()` 改回结构体 `Recommendation`**（原三元组 + 「顺序不按第三项排」的隐式约定）。
+  现在 `{match, quality, rank_score}` 三个字段各自独立，**列表恒按 `rank_score` 降序**，
+  这条不变式对三种 `rank_by` 都成立。⚠️ `rank_score` 的量纲随 `rank_by` 变
+  （match→[-1,1]，quality→[0,10]，blend→[0,1]），**不要跨请求比较或展示给用户**。
+- **前端传 `choice` 不传分数。** 请求体是 `{subject_id, choice, score?}`，
+  分数/置信度由服务端的 `to_rating()` 映射。⚠️ 让前端算等于把映射复制进
+  TypeScript，一漂移就是静默的推荐质量下降 —— 与「三种作答带不同置信度」是同一条纪律。
+- **端点一律写 `def` 不写 `async def`。** psycopg 同步、numpy 占 GIL，
+  写成 async 会阻塞事件循环把并发拖成串行；同步端点由 FastAPI 丢线程池才对。
+- **Catalog 在 `lifespan` 里建一次常驻内存**（14 MB / 1.7 s）。每请求重建会把
+  12 ms 的打分变成 1.7 s。问卷结果同样整份缓存 —— 第 5–6 周换聚类选代表后更该缓存。
+- **启动时校验分词指纹**，与 `BUILD_FINGERPRINT = 6a1cbbe1bc4f446d` 不符直接启动失败。
+  ⚠️ 改 tag 词表或 `tokenize()` 后必须重跑 `load_profiles.py` 并更新这个常量。
+- **连接池走 `DATABASE_URL`（pooler），未配则退回直连**（本地开发方便）。
+  ⚠️ 必须带 `prepare_threshold=None` —— Neon 的 pooler 是 PgBouncer transaction 模式。
+- **CORS 白名单从 `CORS_ORIGINS` 环境变量读，默认放行本地 Vite。**
+  ⚠️ 故意不写 `["*"]` —— 第 6 周若把 JWT 放 httpOnly cookie，`"*"` 与
+  `allow_credentials` 互斥，到时候要回头改。
+
+⬜ **遗留：`score()` 每次调用都重建续作折叠的 `root_of` / `members` 字典**
+（11k 次 Python dict 操作，占了 12 ms 里的大头，矩阵乘法本身只要 1 ms）。
+搬进 `Catalog` 就能省掉，但现在 12 ms 完全够用，等有压测数据再动。
 
 ### Tag 词表第二轮清洗（2026-08-11，418 → 308）
 
@@ -119,7 +204,9 @@ AniList 保留它真正独有的：`idMal`（Phase 2 锚点）、英文名、全
 
 ```bash
 uv sync                                       # 环境
-uv run ruff check src/ scripts/               # 改过 src/ 或 scripts/ 后必跑
+uv sync --group api                           # 再加 FastAPI/uvicorn/连接池
+uv run ruff check src/ scripts/ api/          # 改过这三个目录后必跑
+uv run uvicorn api.main:app --reload          # 起 API，文档在 /docs
 ```
 
 中文输出要设 `PYTHONIOENCODING`，**两种 shell 语法不同**：
@@ -674,7 +761,7 @@ tag 集合**完全相同**，余弦也完全相同 —— 实测某档案的 Top
 | 周 | 内容 |
 |---|---|
 | 1 | ✅ Bangumi/AniList 抓取 + schema + 批次 1 建库 |
-| 2 | ✅ P0 推荐（tag 余弦 + mean-centered）+ 选题 v0 + 续作折叠 ⬜ FastAPI + 前端（评分存 localStorage，接口已是无状态） |
+| 2 | ✅ P0 推荐（tag 余弦 + mean-centered）+ 选题 v0 + 续作折叠 + FastAPI ⬜ 前端（评分存 localStorage，接口已是无状态） |
 | 3 | Qwen3-Embedding 接入 + P1 融合 staff/studio + PCA/k-means 产出内容簇 |
 | 4 | 萌娘百科抓取（批次 2）+ HyDE 检索 + 混合检索 |
 | **5** | **离线评测：leave-one-out、NDCG@10/P@10、四条 baseline、共现簇、冷启动曲线** |

@@ -33,10 +33,15 @@ embed = [
     "sentence-transformers>=3.0",
     "scikit-learn>=1.5",
 ]
-# 第 6 周才装：uv sync --group api
+# 第 2 周末装（原计划第 6 周，FastAPI 提前到第 2 周）：uv sync --group api
+# argon2/pyjwt 仍是第 6 周账号系统才用，先留着不拆。
 api = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
+    # 连接池。Neon 的 -pooler 端点是 PgBouncer transaction 模式，
+    # ⚠️ 必须配 prepare_threshold=None，否则 psycopg3 的 prepared statement
+    #    会跨事务复用一个不存在的 statement 名，报 "prepared statement does not exist"
+    "psycopg-pool>=3.2",
     "argon2-cffi>=23.1",
     "pyjwt>=2.9",
 ]

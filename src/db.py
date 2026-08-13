@@ -17,3 +17,18 @@ def connect(*, autocommit: bool = False) -> psycopg.Connection:
     if not dsn:
         raise RuntimeError("缺少环境变量 DATABASE_URL_DIRECT（见 .env.example）")
     return psycopg.connect(dsn, autocommit=autocommit)
+
+
+def pool_dsn() -> str:
+    """线上 API 用的 DSN。优先 pooler，没配则退回直连。
+
+    退回是有意的：本地开发通常只配了 DATABASE_URL_DIRECT，
+    不该为了跑一次 uvicorn 就逼着填第二个连接串。
+    ⚠️ 但线上必须配 pooler —— Render 实例重启/扩容时直连会耗尽
+       Neon 免费层的连接数上限。
+    """
+    load_dotenv()
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("DATABASE_URL_DIRECT")
+    if not dsn:
+        raise RuntimeError("缺少 DATABASE_URL / DATABASE_URL_DIRECT（见 .env.example）")
+    return dsn

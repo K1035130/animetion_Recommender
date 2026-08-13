@@ -73,6 +73,21 @@ PRIOR_WEIGHT = 2.0
 # 贝叶斯加权评分里的「先验票数」。取库内评分人数的中位数（286）圆整。
 # 票数低于它的作品，其评分会被显著拉向全站均分。
 VOTE_PRIOR = 300
+
+# 推荐结果的评分下限（2026-08-12 加）。低于它的作品直接不进候选。
+#
+# 依据是评分信号的**不对称性**：高分不保证好看（小众神作与过誉作品混在一起），
+# 但低分几乎必然难看 —— 实测 78 部低于 3.5 的作品里，最热门的是
+# 三体(1.70)、兽娘动物园2(1.40)、约定的梦幻岛第二季(3.30)、国王游戏(2.70)，
+# 全是公认的翻车作。这类作品**恰恰容易被 tag 余弦召回**：它们的题材标签
+# 与原作/前作一致，向量上和用户口味高度吻合，烂的是执行不是题材。
+#
+# ⚠️ 用**原始均分**而不是 wr。wr 会向 7.07 收缩，60 票打 3.0 的作品
+#    wr 高达 6.39，按 wr 卡这条线等于什么都没过滤。
+# ⚠️ 只有 0.68%（78/11453）会被排除，对候选池规模无影响。
+#    其中 26 部票数不足 100（最少 25 票），单看统计确实噪声偏大，
+#    但方向是对的：误伤几部冷门作品的代价远小于推出一部烂片。
+MIN_SCORE = 3.5
 # 两段式排序里，第一段按匹配度召回多少候选。太小会让质量排序无从选起，
 # 太大会把弱相关作品放进来 —— 取 top_k 的 10 倍，下限 100。
 DEFAULT_POOL_FACTOR = 10
@@ -134,6 +149,30 @@ class Catalog:
     def index_of(self, subject_id: int) -> int | None:
         hit = np.flatnonzero(self.ids == subject_id)
         return int(hit[0]) if len(hit) else None
+
+
+@dataclass(frozen=True)
+class Recommendation:
+    """一条推荐。三个分数各有各的用途，**不要互相换算**。
+
+    ⚠️ 曾经的接口返回 (sid, name, match) 三元组，而列表顺序由 rank_by 决定、
+       并不按 match 降序 —— 消费方按第三项重排就会悄悄改变结果。
+       现在把排序依据显式化成 `rank_score`，**列表恒按它降序**，
+       这条不变式对三种 rank_by 都成立。
+    """
+
+    subject_id: int
+    name: str
+    # 偏好向量与作品向量的余弦，[-1,1]。正 = 比此人平均口味更对味。
+    match: float
+    # 贝叶斯加权评分，[0,10]。与用户无关，是作品自身的口碑。
+    quality: float
+    # 实际排序依据，列表恒按它降序：
+    #   rank_by="match"   → == match（[-1,1]）
+    #   rank_by="quality" → == quality（[0,10]）
+    #   rank_by="blend"   → 池内归一化后的加权和（[0,1]）
+    # ⚠️ 量纲随 rank_by 变，**不要**拿它跨请求比较或展示给用户。
+    rank_score: float
 
 
 def _clean(names, counts, vocab: frozenset[str]) -> dict[str, float]:
@@ -317,25 +356,21 @@ def score(cat: Catalog,
           year_min: int | None = None,
           year_max: int | None = None,
           include_nsfw: bool = False,
+          min_score: float | None = MIN_SCORE,
           fold_series: bool = True,
           rank_by: RankBy = "blend",
           blend_alpha: float = DEFAULT_ALPHA,
-          top_k: int = 20) -> list[tuple[int, str, float]]:
-    """无状态打分。返回 [(subject_id, 展示名, 匹配度)]。
+          top_k: int = 20) -> list[Recommendation]:
+    """无状态打分。返回按 `rank_score` 降序的 Recommendation 列表。
 
-    第三项恒为**匹配度**（偏好向量与作品向量的余弦，范围 [-1,1]，
-    正 = 比此人平均口味更对味）。
+    `min_score` 是硬性质量下限（默认 MIN_SCORE=3.5），传 None 关闭。
+    ⚠️ 第 5 周跑 baseline 时**四条线必须用同一个 min_score**，否则候选池
+       口径不一致，NDCG 没有可比性。要么全开、要么全传 None。
 
-    ⚠️ **列表按 `rank_by` 指定的顺序排列，不一定按第三项降序。**
-       rank_by="match"   → 顺序 == 匹配度降序
-       rank_by="quality" → 顺序 == 贝叶斯加权评分降序
-       rank_by="blend"   → 顺序 == α·匹配 + (1-α)·评分（池内归一化后）降序
-       后两种模式下第三项会出现「大小交错」，这是预期的，不是 bug。
-       消费方**直接按返回顺序展示**，不要拿第三项重新排序。
-
-    📌 写 FastAPI 时先定：是继续返回三元组，还是改成带
-       {match, quality, rank_score} 三个字段的结构体。后者更适合 JSON
-       序列化，也能消掉上面这条容易踩的约定 —— 现在没有消费方，改动成本最低。
+    ⚠️ **匹配度不是排序依据。** `rank_by` 决定 `rank_score` 怎么算
+       （见 Recommendation 的字段注释），列表恒按 `rank_score` 降序，
+       而 `match` 在 quality/blend 模式下会出现「大小交错」—— 那是预期的。
+       消费方**直接按返回顺序展示**即可，不需要也不应该重排。
     """
     pref = preference_vector(cat, ratings)
     n = np.linalg.norm(pref)
@@ -352,6 +387,14 @@ def score(cat: Catalog,
     keep = cat.mat.any(axis=1)
     if not include_nsfw:
         keep &= ~cat.nsfw                          # 第 13 节：入库保留、默认过滤
+    if min_score is not None:
+        # ⚠️ 判据是「**有评分**且低于下限」，没评分的（bgm_score<=0）放行 ——
+        #    「还没人打分」不等于「难看」。写成 `>= min_score` 会把未评分作品
+        #    一并排除，而 mode="upcoming" 推的正是还没播的新番：
+        #    当前 dump 里那 2 部碰巧有开播前评分，所以现在看不出问题，
+        #    但第 6 周季度同步接进真正的新公布作品后，upcoming 档会被
+        #    **静默清空**（不报错，只是永远返回空列表）。
+        keep &= (cat.bgm_score >= min_score) | (cat.bgm_score <= 0)
     # 年份区间。显式的 year_min/year_max 优先于 mode 预设 ——
     # 两者都给时以显式区间为准，不做交集（交集容易出空结果且难排查）。
     if year_min is not None or year_max is not None:
@@ -382,8 +425,12 @@ def score(cat: Catalog,
     want = top_k if rank_by == "match" else max(top_k * DEFAULT_POOL_FACTOR,
                                                 DEFAULT_POOL_MIN)
 
-    def finish(picked: list[tuple[int, str, float]]) -> list[tuple[int, str, float]]:
+    def finish(picked: list[tuple[int, int, str, float]]) -> list[Recommendation]:
         """第二段：按贝叶斯加权评分重排。
+
+        入参每项是 (展示作品在 cat 中的行号, subject_id, 展示名, 匹配度)。
+        ⚠️ 行号必须随 picked 一起传进来，不能在这里用 index_of 反查 ——
+           那是对 11k 长数组的线性扫描，召回池 200 条就是 200 次全表扫。
 
         ⚠️ 为什么需要这一步：平均每部只有 3.8 个非零维 / 308 维，大量作品的
            tag 集合**完全相同**，余弦也就完全相同 —— 实测 Top5 是
@@ -393,32 +440,35 @@ def score(cat: Catalog,
 
         ⚠️ 用 wr 而不是原始 score：5 人打 9.2 的冷门条目会盖过 3 万人打 9.2 的神作。
         """
-        if rank_by == "match" or not picked:
-            return picked[:top_k]
-        pos = {sid: n for n, (sid, _, _) in enumerate(picked)}
-        if rank_by == "quality":
-            return sorted(
-                picked, key=lambda x: (-cat.wr[cat.index_of(x[0])], pos[x[0]])
-            )[:top_k]
+        if not picked:
+            return []
+        ms = np.array([p[3] for p in picked], dtype=np.float64)
+        qs = np.array([cat.wr[p[0]] for p in picked], dtype=np.float64)
 
-        # blend：两个量纲差得远（余弦 0.2–0.45，评分 4–9），
-        # 各自在候选池内 min-max 归一化到 [0,1] 再加权。
-        # 用池内极值而非全局极值 —— 全局范围会把池内的差异压扁，
-        # 比如池内余弦全在 0.30–0.42，按全局 [0,1] 归一化后差异几乎消失。
-        ms = np.array([x[2] for x in picked], dtype=np.float64)
-        qs = np.array([cat.wr[cat.index_of(x[0])] for x in picked],
-                      dtype=np.float64)
+        if rank_by == "match":
+            final = ms
+        elif rank_by == "quality":
+            final = qs
+        else:
+            # blend：两个量纲差得远（余弦 0.2–0.45，评分 4–9），
+            # 各自在候选池内 min-max 归一化到 [0,1] 再加权。
+            # 用池内极值而非全局极值 —— 全局范围会把池内的差异压扁，
+            # 比如池内余弦全在 0.30–0.42，按全局 [0,1] 归一化后差异几乎消失。
+            def unit(v: np.ndarray) -> np.ndarray:
+                lo, hi = v.min(), v.max()
+                return np.full_like(v, 0.5) if hi - lo < 1e-9 else (v - lo) / (hi - lo)
 
-        def unit(v: np.ndarray) -> np.ndarray:
-            lo, hi = v.min(), v.max()
-            return np.full_like(v, 0.5) if hi - lo < 1e-9 else (v - lo) / (hi - lo)
+            final = blend_alpha * unit(ms) + (1 - blend_alpha) * unit(qs)
 
-        final = blend_alpha * unit(ms) + (1 - blend_alpha) * unit(qs)
-        order2 = np.argsort(-final, kind="stable")
-        return [picked[j] for j in order2[:top_k]]
+        # stable：分数并列时保持第一段（匹配度）的先后，与旧实现一致
+        order2 = np.argsort(-final, kind="stable")[:top_k]
+        return [Recommendation(subject_id=picked[j][1], name=picked[j][2],
+                               match=float(ms[j]), quality=float(qs[j]),
+                               rank_score=float(final[j]))
+                for j in order2]
 
     if not fold_series:
-        return finish([(int(cat.ids[i]), cat.name[i], float(sims[i]))
+        return finish([(int(i), int(cat.ids[i]), cat.name[i], float(sims[i]))
                        for i in order[:want]])
 
     # 系列去重：同一系列只出一条，且换成该系列里用户还没作答过的最早一部。
@@ -430,7 +480,7 @@ def score(cat: Catalog,
     for pos, sid in enumerate(cat.ids):
         members.setdefault(root_of[int(sid)], []).append(pos)
 
-    out: list[tuple[int, str, float]] = []
+    out: list[tuple[int, int, str, float]] = []
     seen_roots: set[int] = set()
     for i in order:
         root = root_of[int(cat.ids[i])]
@@ -450,7 +500,9 @@ def score(cat: Catalog,
         if cand:
             # 同系列里挑用户没答过的最早一部作为入口；同年则取热度高的
             i = min(cand, key=lambda p: (cat.year[p], -cat.done[p]))
-        out.append((int(cat.ids[i]), cat.name[i], rank_score))
+        # ⚠️ quality 取**入口作品**的（i 已被替换），match 取系列最佳的。
+        #    两者语义本就不同：「这个系列多对你口味」vs「这一部口碑如何」。
+        out.append((int(i), int(cat.ids[i]), cat.name[i], rank_score))
         if len(out) >= want:
             break
     return finish(out)
