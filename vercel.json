@@ -1,35 +1,13 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-
-  "//": [
-    "所有路径都打到唯一的 serverless function 上。",
-    "⚠️ api/ 目录下的每个 .py 都会被 Vercel 当成一个独立 function，",
-    "   所以应用代码在 server/，api/ 只有 index.py 这一个入口。"
-  ],
   "rewrites": [
     { "source": "/(.*)", "destination": "/api/index" }
   ],
-
-  "//regions": [
-    "⚠️ 必须与 Neon 的 us-east-2 对齐。真正影响性能的是 API↔DB 的往返延迟",
-    "   —— /recommend 一次要打三次库，跨区能轻易多出 150-300 ms。",
-    "   iad1 = 华盛顿(us-east-1)，是离 us-east-2 最近的可选区。",
-    "   Hobby 计划只能指定一个区域。"
-  ],
   "regions": ["iad1"],
-
   "functions": {
     "api/index.py": {
       "memory": 1024,
       "maxDuration": 30,
-      "//": [
-        "includeFiles 是保险：Python builder 默认会带上项目目录，",
-        "但 server/ 与 src/ 是被 api/index.py 间接 import 的，",
-        "而 data/interim/tag_vocab.json 是运行时依赖（jieba 词典 + keep_tags），",
-        "漏掉任何一个都是 ModuleNotFoundError / FileNotFoundError。",
-        "⚠️ series_root.json 不在这里 —— 它不入 git，运行时也不再需要，",
-        "   系列关系走 anime_profile.series_root 列。"
-      ],
       "includeFiles": "{server,src}/**/*.py"
     }
   }
