@@ -12,12 +12,20 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server.main import API, app
+from src import db
 
 
 @pytest.fixture(scope="module")
 def client():
     with TestClient(app) as c:
         yield c
+
+
+@pytest.fixture(scope="module")
+def db_conn():
+    """直连库，用于校验接口返回与库里的派生列一致（如 mmr_rank 的排序）。"""
+    with db.connect() as conn:
+        yield conn
 
 
 @pytest.fixture(scope="module")
@@ -41,13 +49,28 @@ def test_health(client):
     assert b["catalog_size"] - b["with_tag_vec"] < 200
 
 
-def test_questionnaire_folds_and_orders(client):
+def test_questionnaire_folds_and_orders(client, db_conn):
     items = client.get(f"{API}/questionnaire", params={"n": 20}).json()["items"]
     assert len(items) == 20
-    done = [i["done"] for i in items]
-    assert done == sorted(done, reverse=True), "选题应按热度降序"
     ids = [i["subject_id"] for i in items]
     assert len(set(ids)) == len(ids), "折叠后不该出现重复系列"
+
+    # ⚠️ **不再断言「按热度降序」**（2026-08-14 改）。选题已从纯热度换成
+    #    MMR 多样性排序 —— 纯热度选出的 30 题两两余弦均值 0.4552，比随机抽
+    #    （0.3627）还冗余，问 30 题拿不到 30 题的信息量。热度降序恰恰是要打破的。
+    with db_conn.cursor() as cur:
+        cur.execute("SELECT subject_id, mmr_rank FROM anime_profile "
+                    "WHERE subject_id = ANY(%s)", (ids,))
+        rank = dict(cur.fetchall())
+    ranks = [rank.get(i) for i in ids]
+    assert all(r is not None for r in ranks), \
+        "问卷选出了没有 mmr_rank 的作品 —— build_clusters.py 没跑或候选池口径漂移了"
+    assert ranks == sorted(ranks), "选题应按 mmr_rank 升序"
+
+    # 多样性不能以牺牲热度为代价：题目仍须是用户可能看过的作品。
+    # 实测 MMR λ=0.5 的中位热度 41,040，纯热度是 44,146 —— 几乎不掉。
+    assert sorted(i["done"] for i in items)[len(items) // 2] > 5_000, \
+        "中位热度过低，MMR 的 λ 可能偏小，问卷会问到用户没看过的冷门作"
 
 
 def test_recommend_shape_and_order(client, answers):

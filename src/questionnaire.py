@@ -93,15 +93,19 @@ def select_items(conn: psycopg.Connection, n: int = 30, *,
     with conn.cursor() as cur:
         cur.execute("""
             SELECT subject_id, COALESCE(name_cn, name), air_year, fav_done, form,
-                   nsfw, COALESCE(series_root, subject_id)
+                   nsfw, COALESCE(series_root, subject_id), mmr_rank
             FROM anime_profile
             ORDER BY fav_done DESC
         """)
         rows = cur.fetchall()
     meta = {r[0]: r for r in rows}
+    # 位次由 scripts/build_clusters.py 离线算好（MMR 贪心序）。
+    # ⚠️ 这里仍按 fav_done 取全表：折叠需要遍历所有作品才能把续作映射到根，
+    #    最终排序才换成 mmr_rank。
+    rank_of = {r[0]: r[7] for r in rows if r[7] is not None}
 
     picked: dict[int, Item] = {}
-    for sid, name, year, done, form, nsfw, sroot in rows:
+    for sid, name, year, done, form, nsfw, sroot, _rank in rows:
         if not include_nsfw and nsfw:
             continue
         if form not in POOL_FORMS:
@@ -123,7 +127,19 @@ def select_items(conn: psycopg.Connection, n: int = 30, *,
                             form=r[4],
                             replaced_from=sid if root != sid else None)
 
-    return sorted(picked.values(), key=lambda x: -x.done)[:n]
+    # ⚠️ **按 mmr_rank 排，不再按热度。**（2026-08-14 改，见 sql/005_mmr_rank.sql）
+    #    纯热度选出来的题目彼此高度相似 —— 实测 30 题两两余弦均值 0.4552，
+    #    比随机抽 30 部（0.3627）还冗余，因为热门作品扎堆在校园/恋爱/日常。
+    #    问 30 题拿不到 30 题的信息量。MMR 序把这个数压到 0.3781 且热度几乎不掉。
+    #
+    # ⚠️ 没有位次的根排在最后、退回热度序 —— 池外的根（非 TV/WEB、
+    #    nsfw、或 vec 为空）本来就不该优先出题，但也不能凭空消失，
+    #    否则 include_nsfw=True 会直接少掉一批题。
+    def order(it: Item) -> tuple[int, int, int]:
+        r = rank_of.get(it.subject_id)
+        return (0, r, 0) if r is not None else (1, 0, -it.done)
+
+    return sorted(picked.values(), key=order)[:n]
 
 
 def to_rating(choice: str, score: float | None = None

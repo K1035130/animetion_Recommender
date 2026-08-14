@@ -49,9 +49,17 @@ etl = [
     "tqdm>=4.66",
 ]
 # 第 3 周才装：uv sync --group embed
-embed = [
-    "torch>=2.4",
-    "sentence-transformers>=3.0",
+ml = [
+    # 📌 torch / sentence-transformers 已移除（2026-08-14）：
+    #    它们是「本地跑 Qwen3-Embedding 建库」方案的依赖，而 CLAUDE.md A.7
+    #    已定为**全程走 API**（线上只能是 API，Vercel 跑不了模型；两条路径不一致时
+    #    唯一可行的收敛方向就是把建库也搬到 API 上）。
+    #    ⇒ 本地推理这条路彻底不存在了，留着就是 ~2.5 GB 的死重量。
+    #    embedding 现在只需要 httpx（在 etl 组）+ src/embed.py。
+    #    ⚠️ 这也是组名从 embed 改成 ml 的原因 —— 它已经不做 embedding 了。
+    #
+    # 第 3 周聚类（PCA + k-means + silhouette + ARI）
+    # 第 5 周离线评测（NDCG / 指标计算）同样用它
     "scikit-learn>=1.5",
 ]
 # 本地跑 API 用。⚠️ uvicorn **不上线** —— Vercel 自带 ASGI 服务器。

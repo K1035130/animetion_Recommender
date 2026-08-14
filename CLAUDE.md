@@ -45,7 +45,7 @@
 |---|---|---|
 | 1 | 数据层：dump → 候选集 → 灌库 → tag 清洗 | ✅ |
 | 2 | P0 推荐 + 选题 + 续作折叠 + API + pgvector + 前端 v0 + 部署 | ✅ |
-| **3** | Qwen3-Embedding 建库 ✅ · **P1 融合 staff/studio + 内容簇** ⬜ | 🔶 **← 从这里继续** |
+| **3** | Embedding 建库 ✅ · 问卷选题多样化(MMR) ✅ · **P1 融合 staff/studio** ⬜ | 🔶 **← 从这里继续** |
 | 4 | 萌娘百科语料 + HyDE + 混合检索 | ⬜ |
 | **5** | **离线评测（核心卖点，不可压缩）** | ⬜ |
 | 6 | 信息增益选题 + 账号系统 + 季度同步 | ⬜ |
@@ -116,25 +116,33 @@ CLANNAD → 君吻/幸运星。
 ⚠️ 但乐队番那个案例（孤独摇滚 vs MyGO）staff/studio 解决不了，只能靠简介
 embedding —— **这两类论据第 5 周报告里要分开讲**。
 
-**5. 内容簇：PCA → k-means → 回填 `cluster_id`**（列已建好）
-PCA 降到 30–50 维，N 从 30 起试，用 silhouette 定。
+**5. 问卷选题多样化** —— ✅ **已完成（2026-08-14），但方案与原计划不同**
 
-⚠️ **动手前先做三件诊断，成本远低于事后返工：**
+原计划是「PCA → k-means → 每簇选代表」。**动手前的三个诊断直接推翻了它**
+（这三个诊断本身就是这一步最大的产出，详见第 9 节顶部的标注）：
 
-1. **测噪声地板**：同一批向量、只换随机种子跑两次 k-means，用 **ARI** 量化一致性。
-   实测经验里同模型不同种子的 ARI 常常只有 0.6–0.8，不是 1.0。
-   没有这个基线，你后面看到任何「不一致」都会误判成模型有问题。
-2. **查 PC1 是不是被 summary 长度占了**。实测 summary 均 245 字、p50 203、
-   p90 452、max 7,225 —— 长度跨度很大，embedding 的前几个主成分很可能编码的是
-   文本长度和撰写风格而不是题材，而结果看起来还挺像回事。
-   算一下 PC1 与 `char_length(summary)` 的相关系数即可。
-3. **跑一遍 HDBSCAN 做结构性对照**。它允许离群点、不假设球形簇。
-   如果 HDBSCAN 发现大量噪声点，说明 k-means 在往数据上强加不存在的结构
-   —— 而题材簇本来就大小悬殊（「恋爱日常」几千部，「实验动画」几十部），
-   正是 k-means 假设最不成立的场景。
+```
+silhouette ≈ 0.035，随 N 单调下降  → 无分离，且定不出 N
+ARI 跨种子 ≈ 0.48                  → 一半簇结构是随机的，不可复现
+PC1 vs 简介长度 r=+0.053           → ✅ 这项虚惊，PC1 没被长度占据
+```
 
-⚠️ **第 5 周那条冷启动曲线不能只跑一个种子出一个数。** 既然 k-means 有种子方差，
-要跑 5–10 个种子报**均值 ± 标准差**，否则「内容簇比随机好 3%」可能整个落在噪声里。
+⇒ 改用 **MMR（最大边际相关）**：`argmax[ λ·热度 − (1−λ)·与已选的最大相似度 ]`。
+实测 N=30 冗余 **0.4552（纯热度）→ 0.3781**，而中位热度只从 44,146 掉到 41,040；
+k-means 代表是 0.4101/38,990，**MMR 两项都更优**。且 MMR 确定性、无随机种子。
+
+产出：`mmr_rank` 4,439 行（[sql/005_mmr_rank.sql](sql/005_mmr_rank.sql)）+
+`cluster_id` 30 簇（留作第 5 周 baseline），
+由 [scripts/build_clusters.py](scripts/build_clusters.py) 一次算出。
+`questionnaire.select_items` 已改为按 `mmr_rank` 排序，测试同步更新
+（原来断言「按热度降序」，那正是要打破的）。
+
+⚠️ **第 5 周那条冷启动曲线仍不能只跑一个种子出一个数。** MMR 本身确定，
+但对照线里的 k-means 有种子方差（ARI≈0.48），要跑 5–10 个种子报
+**均值 ± 标准差**，否则「内容簇比随机好 3%」可能整个落在噪声里。
+
+⬜ **HDBSCAN 结构性对照没做** —— silhouette 和 ARI 已经足够判定「不该用聚类」，
+它只会再确认一次。第 5 周若要在报告里论证「空间是连续体」可以补跑。
 
 **6.（可选）统计全库 tag 共现矩阵**
 看 `轻小说改`+`小说改`、`异世界`+`穿越`、`后宫`+`校园` 的 PMI 有多高。
@@ -761,14 +769,14 @@ P1 要把 tag（308 维）+ embedding（1024 维）+ staff/studio 融合成偏�
 | **主依赖** | fastapi / psycopg[binary] / psycopg-pool / pgvector / numpy / jieba / dotenv / orjson | ✅ **19 个包** |
 | `etl` | bgm-tv-wiki / httpx / tqdm | ❌ `scripts/` 专用 |
 | `api` | uvicorn / argon2 / pyjwt | ❌ 本地跑服务器 + 第 6 周认证 |
-| `embed` | torch / sentence-transformers / sklearn | ❌ 第 3 周离线建库 |
+| `ml` | scikit-learn | ❌ 第 3 周聚类 + 第 5 周评测 |
 
 ⚠️ 顺带查出 **polars 全仓库零 import**（git 历史里也没用过），已整个删除 ——
 当初按「400 MB jsonlines 用 polars 更快」加的，但实际 ETL 全是 orjson 逐行解析，
 流式读 jsonlines 本来就不需要 DataFrame。它带 55 MB 的 `polars-runtime-32`。
 ⚠️ **`uv sync` 不再自带 ETL 依赖** —— 跑 `scripts/` 要加 `--group etl`。
 ⚠️ `requirements.txt` **已删除**：它被忽略却看着像事实来源，是纯粹的漂移隐患。
-校验方式：`uv sync --no-dev --no-group api --no-group etl --no-group embed`
+校验方式：`uv sync --no-dev --no-group api --no-group etl --no-group ml`
 后跑 `uv run --no-sync python -c "import server.main"`，这精确复现了线上的安装集合。
 
 ⚠️ `data/raw` 是 **2.1 GB**。`.gitignore` 在走 git 部署时挡得住，但
@@ -876,6 +884,7 @@ psql < sql/001_init.sql
 psql < sql/002_tag_vec.sql                   # ⚠️ 别漏：没有 tag_vec 列，最后一步会直接报错
 psql < sql/003_vec_halfvec.sql               # vec: vector(1024) → halfvec(1024)。幂等
 psql < sql/004_build_meta.sql                # ⚠️ 别漏：build_embeddings.py 会前置检查它
+psql < sql/005_mmr_rank.sql                  # 问卷选题的多样性排序列
 uv run python scripts/build_id_map.py        # 需要联网，会下 bangumi-data
 uv run python scripts/load_profiles.py
 uv run python scripts/backfill_staff.py
@@ -884,6 +893,7 @@ uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py   # 依赖上一步；打分链路的前置
 uv run python scripts/build_embeddings.py    # ⚠️ 需要 .env 的 SILICONFLOW_API_KEY
                                              #    约 12 分钟 / ¥0.19（缓存命中则秒完成）
+uv run --group ml python scripts/build_clusters.py   # mmr_rank + cluster_id，依赖上一步
 psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
 uv run pytest tests/ -q                      # 验收：20 项测试应全绿
 ```
@@ -1675,6 +1685,50 @@ embedding。这两类论据要分开讲 —— 混在一起会让「为什么既
 ---
 
 ## 9. 聚类选题设计（第 5–6 周）
+
+> 🚫 **核心方案已被实测推翻（2026-08-14）。现行实现是 MMR，不是聚类。**
+> 详见 [sql/005_mmr_rank.sql](sql/005_mmr_rank.sql) 与
+> [scripts/build_clusters.py](scripts/build_clusters.py)。
+>
+> **三个诊断的结果**（候选池 4,439 部，embedding 向量）：
+>
+> | 诊断 | 结果 | 含义 |
+> |---|---|---|
+> | silhouette | ≈ **0.035**，随 N 单调下降 | 簇间毫无分离，**且定不出 N** |
+> | ARI（跨随机种子） | ≈ **0.48** | 换个种子一半簇结构就变 → 不可复现 |
+> | PC1 vs 简介长度 | r = +0.053 | ✅ 这一项虚惊，PC1 没有被长度占据 |
+>
+> 动画简介的 embedding 空间是**连续体**不是分离团块 —— 题材本就渐变。
+>
+> ⚠️ **但真正的问题是目标搞错了**：本节要的「选 N 部覆盖口味空间」是
+> **多样性问题**，不是聚类问题。聚类只是达成它的一种手段，而这手段在这份
+> 数据上不成立。MMR（最大边际相关）直接优化目标，且**确定性无随机种子**。
+>
+> 实测对照（N=30，冗余 = 选中集合两两余弦均值，越低越好）：
+>
+> | 方法 | 冗余 | 中位热度 |
+> |---|---|---|
+> | 纯热度（原实现） | 0.4552 | 44,146 |
+> | 内容簇 k-means 代表 | 0.4101 | 38,990 |
+> | **MMR λ=0.5（现行）** | **0.3781** | **41,040** |
+> | *（随机对照）* | *0.3627* | — |
+>
+> ⚠️ **纯热度选出的题目比随机抽的还冗余 25%** —— 热门作品扎堆在校园/恋爱/日常。
+> 实测最冗余的三对：轻音少女×MyGO(0.65)、CLANNAD×春物(0.65)、龙与虎×CLANNAD(0.64)。
+> 问 30 题拿不到 30 题的信息量，这就是本节存在的全部理由。
+>
+> 📌 **k-means 不删**：第 10 节冷启动曲线里「内容簇选题」本就是四条对照线之一，
+> `cluster_id` 继续由 build_clusters.py 产出作 **baseline**。
+> 「试了聚类 → 量出它不成立 → 换成直接优化多样性」这个过程本身就是第 5 周的材料。
+>
+> ⚠️ **本节以下的「三个关键设计点」仍然有效** —— 设计点 ① 的
+> 「热度权重要够大」正是 MMR 的 λ，② 内容簇 vs 口味簇的区分、
+> ③ 与信息增益串联，都不受影响。失效的只是「用 k-means 实现」这一条。
+>
+> ⚠️ **范围修正**：设计点 ② 说「两个都做当对照实验」，但 dump 里**没有用户
+> 收藏数据**（只有 subject/person/character/relations），口味簇需要的
+> item-item 共现矩阵得另走 Bangumi API 抓用户收藏 —— 那是独立的数据获取
+> 任务。**第 3 周只做内容簇**，共现簇那条线要么排到第 5–6 周要么砍掉。
 
 ### 目的
 先把 11,259 部聚成 N 个簇，每簇选一部代表作进问卷 → 用最少的题覆盖最大的口味空间。
