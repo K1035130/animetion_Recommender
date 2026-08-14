@@ -9,7 +9,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from src import recommend
 
@@ -83,7 +83,32 @@ class RecommendRequest(BaseModel):
     fold_series: bool = True
     rank_by: RankBy = "blend"
     blend_alpha: float = Field(default=0.5, ge=0.0, le=1.0)
+    # P1 三路相似度的融合权重。不传则用 src/recommend.py 的 DEFAULT_WEIGHTS。
+    #
+    # ⚠️ **暴露出来是为了第 5 周的评测能扫参数与跑 baseline**，不是给前端用的。
+    #    第 10 节的四条 baseline 直接由它构造：
+    #      tag 模型       w_tag=1, w_emb=0, w_staff=0
+    #      embedding 模型 w_tag=0, w_emb=1, w_staff=0
+    #
+    # ⚠️ 权重不必和为 1 —— 服务端按实际参与的路数归一化。
+    #    某一路的偏好向量为零（如用户评过的作品全无 staff 数据）时整项跳过，
+    #    而不是贡献 0 —— 后者会一视同仁地稀释另外两路。
+    #
+    # ⚠️ 三个必须一起给或一起不给。只给一个的话另外两个会取默认值，
+    #    组合出一个谁也没想要的权重 —— 所以下面的校验会拒绝部分指定。
+    w_tag: float | None = Field(default=None, ge=0.0, le=1.0)
+    w_emb: float | None = Field(default=None, ge=0.0, le=1.0)
+    w_staff: float | None = Field(default=None, ge=0.0, le=1.0)
     top_k: int = Field(default=20, ge=1, le=100)
+
+    @model_validator(mode="after")
+    def _weights_all_or_none(self) -> "RecommendRequest":
+        given = [w for w in (self.w_tag, self.w_emb, self.w_staff) if w is not None]
+        if given and len(given) != 3:
+            raise ValueError("w_tag / w_emb / w_staff 必须三个一起给")
+        if given and sum(given) <= 0:
+            raise ValueError("三个融合权重不能全为 0")
+        return self
 
 
 class RecommendResponse(BaseModel):

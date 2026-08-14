@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg_pool import ConnectionPool
 
 from server import schemas
-from src import db, questionnaire, recommend_sql, tag_rules
+from src import db, questionnaire, recommend, recommend_sql, tag_rules
 from src.textproc import dict_fingerprint, keep_tags, norm_name, tokenize
 
 # 建库时的分词词典指纹。search_tsv 是用这套词典切出来的，查询端必须一致 ——
@@ -196,6 +196,17 @@ def get_questionnaire(
     )
 
 
+def _weights_of(req: schemas.RecommendRequest) -> recommend.Weights | None:
+    """请求里的融合权重 → Weights；三个都没给则返回 None（用服务端默认值）。
+
+    ⚠️ schemas 的 model_validator 已保证「三个一起给或一起不给」，
+       所以这里只需看其中一个是不是 None。
+    """
+    if req.w_tag is None:
+        return None
+    return recommend.Weights(tag=req.w_tag, emb=req.w_emb, staff=req.w_staff)
+
+
 def _to_ratings(answers: list[schemas.Answer]) -> list[recommend_sql.Rating]:
     """作答 → Rating。分数/置信度的映射全部委托给 to_rating()。"""
     out: list[recommend_sql.Rating] = []
@@ -224,13 +235,17 @@ def post_recommend(req: schemas.RecommendRequest) -> schemas.RecommendResponse:
                                          rank_by=req.rank_by)
 
     with _conn() as c:
-        # 只算一次偏好向量，打分与推荐理由共用 —— 否则要多一次往返
-        pref = recommend_sql.preference_vector(c, ratings)
+        # 只算一次偏好向量，打分与推荐理由共用 —— 否则要多一次往返。
+        # ⚠️ P1 之后是三元组 (tag, emb, staff)：只传 tag 的话 score() 会为
+        #    另外两路再查一次库，`/recommend` 就从 3 次往返变成 4 次。
+        prefs = recommend_sql.preference_vectors(c, ratings)
+        pref = prefs[0]                      # explain() 只解释 tag 维度
         recs = recommend_sql.score(
-            c, ratings, pref=pref, mode=req.mode, year_min=req.year_min,
+            c, ratings, prefs=prefs, mode=req.mode, year_min=req.year_min,
             year_max=req.year_max, include_nsfw=req.include_nsfw,
             min_score=req.min_score, fold_series=req.fold_series,
             rank_by=req.rank_by, blend_alpha=req.blend_alpha, top_k=req.top_k,
+            weights=_weights_of(req),
         )
         if not recs:
             return schemas.RecommendResponse(items=[],

@@ -28,13 +28,17 @@ from src.recommend import (
     DEFAULT_ALPHA,
     DEFAULT_POOL_FACTOR,
     DEFAULT_POOL_MIN,
+    DEFAULT_WEIGHTS,
+    EMB_DIM,
     MIN_SCORE,
     PRIOR_MEAN,
     PRIOR_WEIGHT,
+    STAFF_DIM,
     Mode,
     RankBy,
     Rating,
     Recommendation,
+    Weights,
     _weighted_rating,
     season_window,
 )
@@ -54,7 +58,7 @@ WITH cand AS (
     SELECT subject_id, series_root, COALESCE(name_cn, name) AS name,
            air_year, fav_done, COALESCE(score, 0)::float AS score,
            COALESCE(score_count, 0) AS votes,
-           1 - (tag_vec <=> %(pref)s) AS match
+           {match} AS match
     FROM anime_profile
     WHERE {filters}
 ),
@@ -89,7 +93,7 @@ ORDER BY p.match DESC, p.best_id
 _SQL_FLAT = """
 SELECT subject_id, COALESCE(name_cn, name) AS name, air_year, fav_done,
        COALESCE(score, 0)::float AS score, COALESCE(score_count, 0) AS votes,
-       1 - (tag_vec <=> %(pref)s) AS match
+       {match} AS match
 FROM anime_profile
 WHERE {filters}
 ORDER BY match DESC, subject_id
@@ -110,40 +114,123 @@ def preference_vector(conn: psycopg.Connection, ratings: list[Rating],
        进而改变**所有**作品的权重符号。numpy 侧 `cat.mat[rows]` 取到的是
        一行零，两边必须一致。这是最容易漏掉的一处不等价。
     """
-    d = len(vocab())
+    return preference_vectors(conn, ratings, prior_mean=prior_mean,
+                              prior_weight=prior_weight)[0]
+
+
+def preference_vectors(conn: psycopg.Connection, ratings: list[Rating],
+                       *, prior_mean: float = PRIOR_MEAN,
+                       prior_weight: float = PRIOR_WEIGHT
+                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """三个空间各自的偏好向量 (tag, emb, staff)。P1 融合用。
+
+    ⚠️ **μ 只算一次、三个空间共用** —— 与 recommend._rating_weights() 一致。
+       各空间各算各的 μ 的话，同一条评分在 tag 空间是「喜欢」、在 embedding
+       空间可能变成「不喜欢」，融合出来的东西没有意义。
+    """
+    dims = (len(vocab()), EMB_DIM, STAFF_DIM)
     by_id = {r.subject_id: r for r in ratings}
+    empty = tuple(np.zeros(d, dtype=np.float32) for d in dims)
     if not by_id:
-        return np.zeros(d, dtype=np.float32)
+        return empty
 
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT subject_id, tag_vec FROM anime_profile "
+            "SELECT subject_id, tag_vec, vec, staff_vec FROM anime_profile "
             "WHERE subject_id = ANY(%s)", (list(by_id),))
         rows = cur.fetchall()
     if not rows:
-        return np.zeros(d, dtype=np.float32)
+        return empty
 
     # 只保留库内存在的评分 —— 与 numpy 侧 `index_of(...) is not None` 一致
-    rs = [by_id[sid] for sid, _ in rows]
+    rs = [by_id[r[0]] for r in rows]
     cw = sum(r.confidence for r in rs)
     mu = ((sum(r.confidence * r.score for r in rs) + prior_weight * prior_mean)
           / (cw + prior_weight))
 
-    pref = np.zeros(d, dtype=np.float32)
-    for (sid, vec), r in zip(rows, rs, strict=True):
-        if vec is None:                       # 零向量作品：只进 μ，不进向量和
-            continue
-        v = vec.to_numpy() if hasattr(vec, "to_numpy") else np.asarray(vec)
-        pref += v.astype(np.float32) * np.float32(r.confidence * (r.score - mu))
-    return pref
+    prefs = [np.zeros(d, dtype=np.float32) for d in dims]
+    for row, r in zip(rows, rs, strict=True):
+        w = np.float32(r.confidence * (r.score - mu))
+        for k, vec in enumerate(row[1:]):
+            if vec is None:               # 该空间无向量：只进 μ，不进向量和
+                continue
+            # ⚠️ .astype(float32) 不能省：halfvec 的 to_numpy() 是 float16
+            prefs[k] += vec.to_numpy().astype(np.float32) * w
+    return tuple(prefs)
+
+
+#: 三路的 (列名, Weights 字段名, 偏好向量参数名, 类型转换)
+_SPACES = (("tag_vec", "tag", "pref_tag", "vector"),
+           ("vec", "emb", "pref_emb", "halfvec"),
+           ("staff_vec", "staff", "pref_staff", "sparsevec"))
+
+
+def _active(prefs: tuple[np.ndarray, ...], weights: Weights) -> list[int]:
+    """哪几路真正参与。逐条对应 recommend._cosines() 的跳过逻辑。
+
+    ⚠️ 权重 >0 **且** 偏好向量非零才算参与。零偏好向量必须跳过而不是当成
+       0 相似度：pgvector 对零向量的 `<=>` 返回 **NaN**（实测），
+       NaN 会污染整个加权和，让所有作品的 match 都变成 NaN，
+       而 `ORDER BY match DESC` 对 NaN 不报错 —— 又是「不报错但全错」。
+    """
+    out = []
+    for k, (_col, attr, _pname, _cast) in enumerate(_SPACES):
+        if getattr(weights, attr) > 0 and float(np.linalg.norm(prefs[k])) > 0:
+            out.append(k)
+    return out
+
+
+def _match_expr(params: dict, prefs: tuple[np.ndarray, ...],
+                weights: Weights, active: list[int]) -> str:
+    """match 的 SQL 表达式：参与各路的余弦加权和，再按参与权重归一化。
+
+    ⚠️ **必须与 recommend._cosines() 逐字对应**：那边先各自除以偏好向量模长
+       得到余弦，再加权、再除以参与权重之和。这里把「除以模长」交给 pgvector
+       的 `<=>`（它算的就是余弦距离，与向量模长无关），所以只需加权 + 归一化。
+
+    ⚠️ `COALESCE(..., 0)`：该空间无向量的作品，`<=>` 返回 NULL，
+       整个表达式会变成 NULL。numpy 侧对应的是「零行 → 余弦 0」，
+       所以这里必须补 0 而不是让它传播成 NULL。
+    """
+    terms, total = [], 0.0
+    for k in active:
+        col, attr, pname, cast = _SPACES[k]
+        w = getattr(weights, attr)
+        params[pname] = _lit(prefs[k], cast)
+        terms.append(f"{w!r} * COALESCE(1 - ({col} <=> %({pname})s::{cast}), 0)")
+        total += w
+    return f"(({' + '.join(terms)}) / {total!r})"
+
+
+def _lit(v: np.ndarray, cast: str) -> str:
+    """偏好向量 → pgvector 字面量。sparsevec 要写成 `{i:v,...}/dim`。
+
+    ⚠️ **必须 `.9g` 不能 `.7g`。** float32 需要 9 位有效数字才能无损往返 ——
+       实测 `.7g` 每个元素差 1.49e-08，1024 维累积后约 5e-7。
+       那个量级虽然被 halfvec 的 fp16 噪声（~2e-5）掩盖，但它是**白送的损失**，
+       而且掩盖它的前提（emb 参与）不总是成立：跑纯 tag baseline 时
+       fp32 精度是 2e-7 量级，`.7g` 的误差就不再可忽略了。
+    """
+    if cast != "sparsevec":
+        return "[" + ",".join(f"{x:.9g}" for x in v.tolist()) + "]"
+    nz = {i: float(x) for i, x in enumerate(v.tolist()) if x != 0.0}
+    # ⚠️ sparsevec 下标从 1 开始；空向量不会走到这里（_active 已过滤）
+    body = ",".join(f"{i + 1}:{x:.9g}" for i, x in sorted(nz.items()))
+    return "{" + body + "}/" + str(len(v))
 
 
 def _filters(params: dict, *, mode: Mode, year_min: int | None,
              year_max: int | None, include_nsfw: bool,
-             min_score: float | None, excluded: list[int]) -> str:
+             min_score: float | None, excluded: list[int],
+             active: list[int]) -> str:
     """拼过滤条件。逐条对应 recommend.score() 里的 keep 掩码。"""
     # 零向量存 NULL，这一句同时完成「排除零向量」—— 见 sql/002_tag_vec.sql
-    parts = ["tag_vec IS NOT NULL"]
+    # ⚠️ P1 之后判据是「**参与的任一路**有向量」，与 numpy 侧的
+    #    `for mat, wt in ...: keep |= mat.any(axis=1)` 逐条对应。
+    #    只看 tag_vec 的话，跑 embedding baseline 时会把 131 部
+    #    「无 tag 但有 embedding」的作品错误排除。
+    cols = [_SPACES[k][0] for k in active]
+    parts = ["(" + " OR ".join(f"{c} IS NOT NULL" for c in cols) + ")"]
 
     if not include_nsfw:
         parts.append("NOT nsfw")
@@ -210,7 +297,7 @@ def explain(conn: psycopg.Connection, pref: np.ndarray,
 def score(conn: psycopg.Connection,
           ratings: "list[Rating | tuple]",
           *,
-          pref: np.ndarray | None = None,
+          prefs: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
           mode: Mode = "all",
           year_min: int | None = None,
           year_max: int | None = None,
@@ -219,30 +306,39 @@ def score(conn: psycopg.Connection,
           fold_series: bool = True,
           rank_by: RankBy = "blend",
           blend_alpha: float = DEFAULT_ALPHA,
+          weights: Weights | None = None,
           top_k: int = 20) -> list[Recommendation]:
     """无状态打分，逐条等价于 recommend.score()。返回按 rank_score 降序。
 
     两次往返：一次取被评作品的向量，一次算余弦 + 过滤 + 召回。
     第二段的 blend 重排在 Python 侧对 ~200 行做，不值得再回一次库。
 
-    `pref` 可以传入已算好的偏好向量，省掉第一次往返 —— 调用方若还要
-    调 explain() 生成推荐理由，就该复用同一个 pref，别算两遍。
+    `prefs` 可以传入已算好的三元组 (tag, emb, staff)，省掉第一次往返 ——
+    调用方若还要调 explain() 生成推荐理由，就该复用同一份，别算两遍。
+
+    ⚠️ **必须是三元组，不能只传 tag。** P1 之前这里收的是单个 tag 向量；
+       融合后若只覆盖 tag、另外两路仍查库，`/recommend` 就会从 3 次往返
+       变成 4 次 —— 而调用方明明已经查过一次了。
     """
     rs = [Rating.coerce(x) for x in ratings]
-    if pref is None:
-        pref = preference_vector(conn, rs)
-    n = float(np.linalg.norm(pref))
-    if n == 0:
+    wts = weights or DEFAULT_WEIGHTS
+    if prefs is None:
+        prefs = preference_vectors(conn, rs)
+
+    active = _active(prefs, wts)
+    if not active:
         return []
-    pref = pref / n
 
     want = top_k if rank_by == "match" else max(top_k * DEFAULT_POOL_FACTOR,
                                                 DEFAULT_POOL_MIN)
-    params: dict = {"pref": pref, "want": want}
+    params: dict = {"want": want}
+    match = _match_expr(params, prefs, wts, active)
     where = _filters(params, mode=mode, year_min=year_min, year_max=year_max,
                      include_nsfw=include_nsfw, min_score=min_score,
-                     excluded=[r.subject_id for r in rs if r.exclude])
-    sql = (_SQL_FOLD if fold_series else _SQL_FLAT).format(filters=where)
+                     excluded=[r.subject_id for r in rs if r.exclude],
+                     active=active)
+    sql = (_SQL_FOLD if fold_series else _SQL_FLAT).format(
+        filters=where, match=match)
 
     with conn.cursor() as cur:
         cur.execute(sql, params)

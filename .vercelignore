@@ -20,6 +20,11 @@ data/processed/
 #       后面的 ! 取反规则会失效（与 .gitignore 同一套语义）。
 data/interim/*
 !data/interim/tag_vocab.json
+# staff_vec 的维度定义，与 tag_vocab.json 同一条理由：它不是纯派生数据，
+# 而是「库里每个向量的每一维代表谁」的唯一记录。
+# ⚠️ 不入 git 的文件一旦参与打分链路就是定时炸弹 —— 开发机上永远正常，
+#    只在别人的机器上静默地错（recommend.py 的 series_root.json 就是前车之鉴）。
+!data/interim/staff_vocab.json
 
 # 前端的本地产物。同上：源码要上传，这两个由云端构建重新生成。
 # node_modules 动辄几百 MB，CLI 部署时不挡会把上传拖垮。

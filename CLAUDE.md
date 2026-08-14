@@ -35,18 +35,21 @@
 
 ## 📍 当前进度（更新于 2026-08-14）
 
-**第 1–2 周完工并已上线；第 3 周 embedding 建库已完成，下一步是 P1 融合与聚类。**
+**第 1–3 周全部完工。下一步是第 4 周：萌娘百科语料 + HyDE + 混合检索。**
+
+第 3 周产出：Qwen3-Embedding 建库（10,864 部）· 问卷选题改 MMR 多样性序 ·
+问卷支持多次作答 · P1 三路融合（tag + embedding + staff/studio）。
 
 `animetion-recommender.vercel.app` —— 前端 + API 同一个 Vercel 项目、同源。
 库占用 **85 MB / 500 MB**（第 3 周灌入 `vec` 后从 58 MB 增长）。
-测试 **22 项**（13 项打分一致性 + 9 项接口）。
+测试 **28 项**（18 项打分一致性 + 10 项接口）。
 
 | 周 | 内容 | 状态 |
 |---|---|---|
 | 1 | 数据层：dump → 候选集 → 灌库 → tag 清洗 | ✅ |
 | 2 | P0 推荐 + 选题 + 续作折叠 + API + pgvector + 前端 v0 + 部署 | ✅ |
-| **3** | Embedding 建库 ✅ · 问卷选题多样化(MMR) ✅ · **P1 融合 staff/studio** ⬜ | 🔶 **← 从这里继续** |
-| 4 | 萌娘百科语料 + HyDE + 混合检索 | ⬜ |
+| 3 | Embedding 建库 ✅ · 问卷选题多样化(MMR) ✅ · P1 融合 staff/studio ✅ | ✅ |
+| **4** | **萌娘百科语料 + HyDE + 混合检索** | ⬜ **← 从这里继续** |
 | **5** | **离线评测（核心卖点，不可压缩）** | ⬜ |
 | 6 | 信息增益选题 + 账号系统 + 季度同步 | ⬜ |
 
@@ -110,11 +113,41 @@ CLANNAD → 君吻/幸运星。
 值得先交叉看一下：如果两批基本不重叠，说明 embedding 确实补上了 tag 的缺口，
 这本身就是第 5 周报告里的一个论据。
 
-**4. P1：融合 staff/studio 结构化特征**
-论据已经量好，是可复现的失败案例（见第三部分「P0 的天花板」）：
-大闹天宫的 `上海美术电影制片厂`、攻壳的 `Production I.G` 都在库里但没进向量。
-⚠️ 但乐队番那个案例（孤独摇滚 vs MyGO）staff/studio 解决不了，只能靠简介
-embedding —— **这两类论据第 5 周报告里要分开讲**。
+**4. P1：融合 staff/studio 结构化特征** —— ✅ **已完成（2026-08-14）**
+
+```
+match = (Σ wᵢ·cosᵢ) / Σ wᵢ            三路各自归一化后加权，再按参与权重归一
+rank_score = α·match + (1−α)·quality   现有 blend 结构不变
+默认 w_tag=0.3 / w_emb=0.6 / w_staff=0.1（⬜ 占位值，第 5 周要扫）
+```
+
+产出：`staff_vec sparsevec(1933)` 10,269 行 + `data/interim/staff_vocab.json`
+（[sql/006](sql/006_staff_vec.sql) · [src/staffvec.py](src/staffvec.py) ·
+[scripts/build_staff_vectors.py](scripts/build_staff_vectors.py)），
+两条打分路径都改（[src/recommend.py](src/recommend.py) 的 `Weights`/`_cosines` +
+[src/recommend_sql.py](src/recommend_sql.py) 的动态 match 表达式），
+API 暴露 `w_tag/w_emb/w_staff`（**第 5 周跑四条 baseline 的入口**）。
+
+**三个设计决定：**
+
+- **三个空间分开算余弦，不拼成一个大向量。** 拼接等于让 308 维 tag 和
+  1024 维 embedding 按维数比例隐式分权重，而我们要的是显式可调、可扫描的权重。
+- **μ 只算一次、三路共用。** 各空间各算各的 μ 的话，同一条评分在 tag 空间是
+  「喜欢」、在 embedding 空间可能变成「不喜欢」，融合出来没有意义。
+- ⚠️ **某一路偏好向量为零时整项跳过，不是当成 0 相似度。** 贡献 0 会对所有
+  作品一视同仁地稀释另外两路。而且 **pgvector 对零向量的 `<=>` 返回 NaN**，
+  `ORDER BY match DESC` 对 NaN 不报错 —— 又是「不报错但全错」。
+
+⚠️ **存储必须用 `sparsevec`。** 1,933 维但每部只有 4.1 个非零值：
+`vector` 要 88 MB、`halfvec` 44 MB、**`sparsevec` 实测 0.47 MB**。
+为 99.8% 的零付 44 MB 不可接受，而 sparsevec 同样支持 `<=>`，链路形状不变。
+
+⚠️ **P1 的论证框架变了。** 原文档说它对付「区分信息在库里但没进向量」
+（大闹天宫→上美影、攻壳→Production I.G），但 **embedding 已经顺手解决了
+大闹天宫那个案例**。所以 P1 现在要证明的是「**在 embedding 之上还能再加多少**」，
+不是「比 tag 好多少」—— 第 5 周报告要按这个改。
+⚠️ 而乐队番那个案例（孤独摇滚 vs MyGO 的基调差异）staff/studio 解决不了，
+只能靠简介 embedding —— **这两类论据必须分开讲**。
 
 **5. 问卷选题多样化** —— ✅ **已完成（2026-08-14），但方案与原计划不同**
 
@@ -758,6 +791,29 @@ P1 要把 tag（308 维）+ embedding（1024 维）+ staff/studio 融合成偏�
 新增 `anime_profile.tag_vec vector(308)`（+14 MB，库 44 → 58 MB）与
 `series_root integer`，见 [sql/002_tag_vec.sql](sql/002_tag_vec.sql)。
 
+#### ⚠️ P1 之后 parity 有三档容差，各有实测依据（2026-08-14）
+
+| 常数 | 值 | 管什么 | 实测上界 |
+|---|---|---|---|
+| `TOL` | 1e-5 | fp32 路径（tag/staff）的 match | tag 9.9e-08 · staff 6.2e-08 |
+| `EMB_TOL` | 5e-4 | embedding 参与时的 match | **7.73e-05** |
+| `RANK_TOL` | 5e-3 | rank_score（min-max 会放大 ~11×） | **8.46e-04** |
+
+⚠️ **偏差全部来自 `vec` 的 halfvec（fp16）存储**，两侧读同一批值、只是累加不同；
+**所有情况下结果顺序都完全一致**。放宽的只是数值比较，
+「顺序是否相同」由 id 序列检查独立把关 —— 逻辑错误会让顺序整个变掉，拦得住。
+
+⚠️ **决定性理由**：embedding API 自身的不确定性在余弦上就有 ~6.4e-5（A.7 实测），
+要求两条路径对齐到比数据源自身可复现性更高的精度，没有意义。
+
+⚠️ **这些数是按 120 组随机档案的实测上界定的。** 首次只测 12 组得到 1.94e-05、
+据此定 1e-4，扩样后真实上界 7.73e-05 —— 余量只剩 1.3 倍，换批档案就会假红。
+**改这几个常数前先重跑那个测量，不要凭感觉调。**
+
+⚠️ 顺带修掉一处自己引入的精度损失：SQL 侧把偏好向量格式化成字面量时用了
+`%.7g`，而 float32 需要 **9 位**才能无损往返（实测 `.7g` 每元素差 1.49e-08）。
+改成 `.9g` 后 fp32 路径的偏差降了一半。
+
 #### ⚠️ 两套打分实现，靠一致性测试锁住
 
 线上走 SQL（serverless 无常驻内存），第 5 周评测走 numpy（leave-one-out 要跑
@@ -783,6 +839,16 @@ P1 要把 tag（308 维）+ embedding（1024 维）+ staff/studio 融合成偏�
 ⚠️ 同时修掉 numpy 侧 `np.argsort(-sims[idx])` 的**不稳定排序**（默认 quicksort）。
 它有两个后果：结果不可复现（第 5 周评测要求可复现），以及无法与 SQL 对齐。
 改成 `kind="stable"`。
+
+⚠️ **2026-08-14 又抓到一处同类的**：`recommend.py` 的续作折叠读的是
+`data/interim/series_root.json`，而**那个文件不入 git**（`data/interim/*` 只放行
+`tag_vocab.json`）。在任何新 clone 上 `series.load(required=False)` 返回空映射 →
+**numpy 侧静默停止折叠、SQL 侧照常折叠，两条路径就此分叉**。
+实测把文件移走后 `test_parity.py` 立刻失败。
+questionnaire 早已因同样理由改成读库列（commit 0c16ba4），`recommend.py` 是漏网的。
+✅ 已改成读 `Catalog.series_root`（来自库列），现在文件缺失时 parity 依然全绿。
+📌 **教训：凡是「不入 git 的文件」参与打分链路，就是一颗定时炸弹** ——
+它在开发机上永远正常，只在别人的机器上错，而且是静默地错。
 
 ⚠️ 另一处最难发现的不等价：**取被评作品向量时不能加 `tag_vec IS NOT NULL`。**
 那 142 部零向量作品对向量和贡献为零，却仍要参与 μ 的计算 —— 漏掉会让 μ 偏移，
@@ -924,6 +990,7 @@ psql < sql/002_tag_vec.sql                   # ⚠️ 别漏：没有 tag_vec �
 psql < sql/003_vec_halfvec.sql               # vec: vector(1024) → halfvec(1024)。幂等
 psql < sql/004_build_meta.sql                # ⚠️ 别漏：build_embeddings.py 会前置检查它
 psql < sql/005_mmr_rank.sql                  # 问卷选题的多样性排序列
+psql < sql/006_staff_vec.sql                 # P1 的 staff/studio 向量列
 uv run python scripts/build_id_map.py        # 需要联网，会下 bangumi-data
 uv run python scripts/load_profiles.py
 uv run python scripts/backfill_staff.py
@@ -932,9 +999,10 @@ uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py   # 依赖上一步；打分链路的前置
 uv run python scripts/build_embeddings.py    # ⚠️ 需要 .env 的 SILICONFLOW_API_KEY
                                              #    约 12 分钟 / ¥0.19（缓存命中则秒完成）
-uv run --group ml python scripts/build_clusters.py   # mmr_rank + cluster_id，依赖上一步
+uv run python scripts/build_staff_vectors.py # staff_vec + data/interim/staff_vocab.json
+uv run --group ml python scripts/build_clusters.py   # mmr_rank + cluster_id，依赖 vec
 psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
-uv run pytest tests/ -q                      # 验收：22 项测试应全绿
+uv run pytest tests/ -q                      # 验收：28 项测试应全绿
 ```
 
 ⚠️ **`SILICONFLOW_API_KEY` 是新机器唯一需要人工去申请的东西**（见 .env.example）。
@@ -1206,6 +1274,37 @@ AniList 保留它真正独有的：`idMal`（Phase 2 锚点）、英文名、全
 ---
 
 # 第四部分 · 待办（按优先级）
+
+### ⬜ `staff_vec` 缺声优 —— P1 特征层的已知缺口（2026-08-14 记）
+
+**Kevin 认为最要紧的因素是：声优 · 导演 · 音乐 · 制作公司。**
+其中三项已经有了，缺的只有声优：
+
+| 因素 | 现状 | 维数 |
+|---|---|---|
+| 导演 | ✅ | 370 |
+| 音乐 | ✅ | 284 |
+| 制作公司 | ✅ | 284 |
+| **声优** | ❌ **完全缺失** | — |
+| 脚本 / 人物设定 / 原作 | ✅ 有，但 Kevin 认为不要紧 | 423 / 348 / 224 |
+
+⚠️ **声优不在 `subject-persons` 里，所以 `backfill_staff.py` 再怎么改都拿不到。**
+dump 里声优走的是**两跳**：`subject-characters`（作品→角色）+
+`person-characters`（角色→声优）。第 13 节 tag 二轮清洗时用过这条路径 ——
+当时正是因为只查 `subject-persons`，把中井和哉、坂本真綾 全漏了。
+
+⇒ 要补声优得：`subject-characters ⋈ person-characters` 两跳聚合 →
+按角色重要度（主角/配角）截断 → 并进 `staff` 列的 `role='声优'` →
+重跑 `build_staff_vectors.py`（词表和 `sparsevec(N)` 的维度都会变，
+**sql/006 的列宽和 staffvec.DIM 必须同步改**）。
+
+📌 **为什么这条值得记**：第 5 周评测若发现 staff 那一路贡献不明显，
+**这是第一个该查的原因** —— 而不是急着调 γ 权重。
+「喜欢花泽香菜配的角色」是真实且常见的口味维度，现在整个抹掉了。
+
+📌 **美术（美術監督）已明确不做**（2026-08-14 Kevin 定）。
+（实测 dump 里还有十几个未映射的岗位码，美术监督大概率在其中，
+所以这是「不做」而不是「做不了」—— 将来改主意的话是映射问题不是抓取问题。）
 
 ### ⬜ 推荐结果要加热度权重 —— 但**必须等 baseline 跑完再加**（第 5 周后）
 

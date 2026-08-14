@@ -147,6 +147,25 @@ def test_recommend_shape_and_order(client, answers):
         assert isinstance(x["reasons"], list)
 
 
+def test_recommend_fusion_weights(client, answers):
+    """P1 融合权重。⚠️ 这是第 5 周跑四条 baseline 的入口，必须可用。"""
+    body = {"answers": answers, "top_k": 5}
+    tag = client.post(f"{API}/recommend",
+                      json={**body, "w_tag": 1, "w_emb": 0, "w_staff": 0}).json()["items"]
+    emb = client.post(f"{API}/recommend",
+                      json={**body, "w_tag": 0, "w_emb": 1, "w_staff": 0}).json()["items"]
+    assert tag and emb
+    # 两条 baseline 必须真的不同 —— 相同说明权重没被传下去
+    assert [x["subject_id"] for x in tag] != [x["subject_id"] for x in emb]
+
+    # ⚠️ 部分指定会组合出谁也没想要的权重（另外两个取默认值），必须拒绝
+    assert client.post(f"{API}/recommend",
+                       json={**body, "w_tag": 1}).status_code == 422
+    assert client.post(f"{API}/recommend",
+                       json={**body, "w_tag": 0, "w_emb": 0,
+                             "w_staff": 0}).status_code == 422
+
+
 def test_recommend_min_score_floor(client, answers):
     """默认下限应挡住低分作品；显式关闭后允许出现。"""
     body = {"answers": answers, "top_k": 30, "rank_by": "match"}

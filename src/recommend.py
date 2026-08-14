@@ -25,7 +25,7 @@ from typing import Literal
 import numpy as np
 import psycopg
 
-from src import series, tagvec
+from src import tagvec
 
 # 加权方式跟着向量计算走，定义在 tagvec 里 —— 两处各定义一份迟早漂移
 Weighting = tagvec.Weighting
@@ -93,6 +93,47 @@ MIN_SCORE = 3.5
 DEFAULT_POOL_FACTOR = 10
 DEFAULT_POOL_MIN = 100
 
+# P1 融合的三个向量空间的维度。必须与 sql/002/003/006 的列宽一致。
+EMB_DIM = 1024
+STAFF_DIM = 1933
+
+
+@dataclass(frozen=True)
+class Weights:
+    """三路相似度的融合权重。**只在这里定义一次**，SQL 侧读同一个类。
+
+    ⚠️ 权重不必和为 1 —— `_cosines()` 会按实际参与的路数归一化。
+       这很重要：某一路没有信息时（如用户评过的作品全无 staff 数据）
+       它会被跳过，剩下两路重新归一化，而不是让结果整体缩水。
+
+    ⬜ **默认值是占位，不是调优结果。** 第 5 周的评测要扫这三个数。
+       现在的取值依据只有量出来的性质：
+         · tag   稠密、总是发声，但天花板已量到（平均 3.8 非零维 / 308）
+         · emb   稠密、总是发声，救回了 131 部零 tag 向量的作品
+         · staff 只有 **16.6%** 的作品发声，但发声时精度很高（京阿尼、上美影）
+       ⇒ staff 是「命中就加分」的加成信号，权重必须小；emb 信息量最大。
+
+    ⚠️ **第 10 节的四条 baseline 靠这个类构造**，不要给它们额外开代码路径：
+         tag 模型       = Weights(tag=1, emb=0, staff=0)
+         embedding 模型 = Weights(tag=0, emb=1, staff=0)
+       ⚠️ 前者必须与 P1 之前的行为**逐位一致** —— tests/test_parity.py 锁死。
+    """
+
+    tag: float = 0.3
+    emb: float = 0.6
+    staff: float = 0.1
+
+    def __post_init__(self) -> None:
+        if min(self.tag, self.emb, self.staff) < 0:
+            raise ValueError("融合权重不能为负")
+        if self.tag + self.emb + self.staff <= 0:
+            raise ValueError("三个权重不能全为 0")
+
+
+DEFAULT_WEIGHTS = Weights()
+# P1 之前的行为：纯 tag。第 5 周的 tag baseline 与向后兼容测试都用它。
+TAG_ONLY = Weights(tag=1.0, emb=0.0, staff=0.0)
+
 
 @dataclass(frozen=True)
 class Rating:
@@ -126,6 +167,21 @@ class Catalog:
     ids: np.ndarray            # (n,) subject_id
     vocab: list[str]           # (d,) 维度名，供解释推荐理由用
     mat: np.ndarray            # (n, d) float32，**行已 L2 归一化**
+    # P1 融合用的另外两个空间。**行同样已 L2 归一化，无数据的行全零。**
+    # ⚠️ 三者维度不同、语义不同，**绝不能拼接成一个矩阵**：拼接等于强行让
+    #    tag 的 308 维和 embedding 的 1024 维在同一个余弦里按维数比例分权重，
+    #    而我们要的是显式可调、第 5 周可扫描的权重。所以是「三个余弦加权和」
+    #    而不是「一个大向量的余弦」。
+    emb: np.ndarray            # (n, 1024) summary 的 Qwen3-Embedding
+    staff: np.ndarray          # (n, 1933) staff/studio 的 idf 向量（dense 存放）
+    # (n,) 系列根，不是续作则等于自身。
+    # ⚠️ **必须来自库里的 series_root 列，不能读 data/interim/series_root.json。**
+    #    那个文件不入 git（data/interim/* 只放行 tag_vocab.json），新 clone 上根本不存在，
+    #    而 series.load(required=False) 缺文件时返回空映射 ——
+    #    表现是 numpy 侧**静默停止折叠**，而 SQL 侧照常折叠，两条路径就此分叉。
+    #    2026-08-14 实测：把该文件移走后 tests/test_parity.py 立刻失败。
+    #    questionnaire 早已因同样的理由改成读库列（commit 0c16ba4），这里是漏网的。
+    series_root: np.ndarray
     year: np.ndarray           # (n,) air_year
     # (n,) 年*100+月。「当季新番」是本项目的核心场景（每季 50–80 部里挑），
     # 只有年粒度做不了「最近 1–2 季」。air_date 为空时退化成 年*100+0，
@@ -195,7 +251,8 @@ def build_catalog(conn: psycopg.Connection,
             SELECT subject_id, COALESCE(name_cn, name), air_year, nsfw, fav_done,
                    COALESCE(EXTRACT(MONTH FROM air_date), 0)::int,
                    COALESCE(score, 0)::float, COALESCE(score_count, 0)::int,
-                   air_date, tag_vec, tags, meta_tags
+                   air_date, tag_vec, tags, meta_tags, vec, staff_vec,
+                   COALESCE(series_root, subject_id)
             FROM anime_profile
             ORDER BY subject_id
         """)
@@ -205,13 +262,25 @@ def build_catalog(conn: psycopg.Connection,
     ids, years, nsfws, dones, names, yms = [], [], [], [], [], []
     scores, votes, ords = [], [], []
     mat = np.zeros((len(rows), len(vlist)), dtype=np.float32)
+    emb = np.zeros((len(rows), EMB_DIM), dtype=np.float32)
+    stf = np.zeros((len(rows), STAFF_DIM), dtype=np.float32)
     missing = 0
-    for i, (sid, nm, yr, nsfw, done, mon, sc, vt, adate, vec, _t, _m) in enumerate(rows):
+    sroots = []
+    for i, (sid, nm, yr, nsfw, done, mon, sc, vt, adate, vec, _t, _m,
+            evec, svec, sroot) in enumerate(rows):
+        sroots.append(sroot)
         if vec is not None:
             v = vec.to_numpy() if hasattr(vec, "to_numpy") else np.asarray(vec)
             mat[i] = v.astype(np.float32)
         else:
             missing += 1          # 零向量作品，tag_vec 存 NULL，保持整行为零
+        # ⚠️ `.astype(np.float32)` 不能省：halfvec 的 to_numpy() 返回 **float16**，
+        #    直接累加会掉精度；sparsevec 返回 float32。两者都不是 numpy 数组，
+        #    `np.asarray()` 作用其上得到的是 dtype=object 的标量，不报错但全错。
+        if evec is not None:
+            emb[i] = evec.to_numpy().astype(np.float32)
+        if svec is not None:
+            stf[i] = svec.to_numpy().astype(np.float32)
         ids.append(sid)
         years.append(yr)
         yms.append((yr or 0) * 100 + (mon or 0))
@@ -231,7 +300,8 @@ def build_catalog(conn: psycopg.Connection,
             "anime_profile.tag_vec 整列为空 —— 先跑 "
             "scripts/build_tag_vectors.py。（否则打分会静默返回空结果）")
 
-    return Catalog(ids=np.array(ids), vocab=vlist, mat=mat,
+    return Catalog(ids=np.array(ids), vocab=vlist, mat=mat, emb=emb, staff=stf,
+                   series_root=np.array(sroots),
                    year=np.array([y if y is not None else 0 for y in years]),
                    ym=np.array(yms), air_ord=np.array(ords),
                    nsfw=np.array(nsfws, dtype=bool),
@@ -312,10 +382,26 @@ def preference_vector(cat: Catalog, ratings: "list[Rating | tuple]",
     n 大时 μ 收敛到用户自己的均值（保住去除打分习惯的本意）。
     这是标准的贝叶斯收缩，不是为了绕过边界情况打的补丁。
     """
+    rows, w = _rating_weights(cat, ratings,
+                              prior_mean=prior_mean, prior_weight=prior_weight)
+    if rows is None:
+        return np.zeros(cat.mat.shape[1], dtype=np.float32)
+    return (cat.mat[rows] * w).sum(axis=0)
+
+
+def _rating_weights(cat: Catalog, ratings: "list[Rating | tuple]", *,
+                    prior_mean: float = PRIOR_MEAN,
+                    prior_weight: float = PRIOR_WEIGHT):
+    """(行号, 权重列向量) —— 三个向量空间**共用**同一套权重。
+
+    ⚠️ μ 必须只算一次、三个空间共用。若各空间各算各的 μ，同一条评分在
+       tag 空间是「喜欢」、在 embedding 空间可能变成「不喜欢」，融合出来的
+       东西没有意义。μ 是**用户打分习惯**的性质，与向量空间无关。
+    """
     rs = [Rating.coerce(x) for x in ratings]
     rs = [r for r in rs if cat.index_of(r.subject_id) is not None]
     if not rs:
-        return np.zeros(cat.mat.shape[1], dtype=np.float32)
+        return None, None
 
     # 均值也按置信度加权 —— 否则一堆低置信的「不感兴趣」会把 μ 整个拉低，
     # 使得所有真实评分都变成正权重，等于没做 centering。
@@ -326,7 +412,41 @@ def preference_vector(cat: Catalog, ratings: "list[Rating | tuple]",
     rows = [cat.index_of(r.subject_id) for r in rs]
     w = np.array([r.confidence * (r.score - mu) for r in rs],
                  dtype=np.float32)[:, None]
-    return (cat.mat[rows] * w).sum(axis=0)
+    return rows, w
+
+
+def _cosines(cat: Catalog, ratings: "list[Rating | tuple]",
+             weights: "Weights") -> "np.ndarray | None":
+    """三路余弦的加权和 —— P1 融合的核心。返回 (n,)，None 表示无有效信号。
+
+    ⚠️ **每一路各自除以自己的偏好向量模长**，得到各自的余弦 [-1,1]，
+       再按权重相加。不能先把三个偏好向量拼起来再算一次余弦 ——
+       那样各路的实际权重会变成「维数×模长」的隐式函数，既不可控也不可扫描。
+
+    ⚠️ **某一路的偏好向量为零时整项跳过**（而不是当成 0 相似度）。
+       例如用户评过的作品全都没有 staff 数据，此时 staff 一路没有任何信息，
+       让它贡献 0 会**稀释**另外两路的分数 —— 而且是对所有作品一视同仁地稀释，
+       等于凭空降低整体匹配度。跳过并把权重归一化回 1 才是正确的。
+    """
+    rows, w = _rating_weights(cat, ratings)
+    if rows is None:
+        return None
+
+    total, acc = 0.0, None
+    for mat, wt in ((cat.mat, weights.tag), (cat.emb, weights.emb),
+                    (cat.staff, weights.staff)):
+        if wt <= 0:
+            continue
+        pref = (mat[rows] * w).sum(axis=0)
+        norm = float(np.linalg.norm(pref))
+        if norm == 0:                 # 这一路没有信息，跳过而不是贡献 0
+            continue
+        sims = mat @ (pref / norm)
+        acc = sims * wt if acc is None else acc + sims * wt
+        total += wt
+    if acc is None or total == 0:
+        return None
+    return acc / total                # 归一化回 [-1,1]，量纲与单路余弦一致
 
 
 def score(cat: Catalog,
@@ -340,6 +460,7 @@ def score(cat: Catalog,
           fold_series: bool = True,
           rank_by: RankBy = "blend",
           blend_alpha: float = DEFAULT_ALPHA,
+          weights: "Weights | None" = None,
           top_k: int = 20) -> list[Recommendation]:
     """无状态打分。返回按 `rank_score` 降序的 Recommendation 列表。
 
@@ -352,19 +473,27 @@ def score(cat: Catalog,
        而 `match` 在 quality/blend 模式下会出现「大小交错」—— 那是预期的。
        消费方**直接按返回顺序展示**即可，不需要也不应该重排。
     """
-    pref = preference_vector(cat, ratings)
-    n = np.linalg.norm(pref)
-    if n == 0:
+    wts = weights or DEFAULT_WEIGHTS
+    sims = _cosines(cat, ratings, wts)
+    if sims is None:
         return []
-    sims = cat.mat @ (pref / n)
 
     # ⚠️ 零向量作品必须排除。它们与任何偏好向量的余弦都是 0，而偏好向量
     #    整体为负时（用户对问卷里多数作品选了「不感兴趣」），0 反而**高于**
     #    所有负相关作品，于是信息量为零的作品会排到最前面 —— 实测「全部
     #    不感兴趣」时 Top5 全是虫虫危机、隐形墨水这类没有 tag 的条目。
     #    tag 模型本就无法为它们打分，放进候选是不诚实的。
-    #    这 142 部（多为欧美动画与国产老动画）要等第 3 周的 embedding。
-    keep = cat.mat.any(axis=1)
+    #
+    # ⚠️ **P1 之后判据从「tag 向量非零」改成「参与的任一路非零」。**
+    #    那 142 部零 tag 向量的作品里有 131 部已经有 embedding 了 ——
+    #    只要 emb 权重 > 0，它们就是可以被诚实打分的，不该再排除。
+    #    ⚠️ 但必须只看**权重 > 0** 的路：跑 tag baseline（emb 权重为 0）时，
+    #       若因为「它有 embedding」而放行，那条 baseline 的候选池就
+    #       与 P1 之前不一致，NDCG 失去可比性（第 10 节要求四条线口径相同）。
+    keep = np.zeros(len(cat.ids), dtype=bool)
+    for mat, wt in ((cat.mat, wts.tag), (cat.emb, wts.emb), (cat.staff, wts.staff)):
+        if wt > 0:
+            keep |= mat.any(axis=1)
     if not include_nsfw:
         keep &= ~cat.nsfw                          # 第 13 节：入库保留、默认过滤
     if min_score is not None:
@@ -462,8 +591,11 @@ def score(cat: Catalog,
     # 系列去重：同一系列只出一条，且换成该系列里用户还没作答过的最早一部。
     # 实测「厨力全开」档案的 6 条推荐只覆盖 3 个系列 —— 一人之下 ×3、
     # 东京喰种 ×2，而且推的全是续作。给没看过第一季的人推第六季毫无意义。
-    smap = series.load(required=False)
-    root_of = {int(s): smap.get(int(s), int(s)) for s in cat.ids}
+    # ⚠️ 读 cat.series_root（来自库列），**不读 data/interim/series_root.json**。
+    #    那个文件不入 git，新 clone 上不存在，而 series.load(required=False)
+    #    缺文件时静默返回空映射 → numpy 侧不折叠、SQL 侧照常折叠，两条路径分叉。
+    #    2026-08-14 实测：移走该文件后 test_parity.py 立刻失败。
+    root_of = {int(s): int(r) for s, r in zip(cat.ids, cat.series_root, strict=True)}
     members: dict[int, list[int]] = {}
     for pos, sid in enumerate(cat.ids):
         members.setdefault(root_of[int(sid)], []).append(pos)
