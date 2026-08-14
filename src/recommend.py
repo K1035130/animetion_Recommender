@@ -19,7 +19,9 @@ tag_rules 的 normalize()+classify()，形态/地区会被自动分流掉。
 """
 
 import datetime
+import hashlib
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -231,8 +233,34 @@ class Recommendation:
     rank_score: float
 
 
+#: 本地 Catalog 缓存。⚠️ **不是优化，是配额保护。**
+#  Neon 免费层的网络传输是 5 GB/月，而 build_catalog() 单次 ~36 MB（二进制）。
+#  开发时每轮 pytest 触发一次、第 5 周 leave-one-out 会反复构建 ——
+#  2026-08-14 一天跑掉 2.68 GB 就是这么来的。
+#  缓存命中后网络开销为 **0**。
+#  ⚠️ 键里必须含**列的内容指纹**（build_meta 的三个 fingerprint + 行数），
+#     否则重灌向量后会读到陈旧矩阵，而打分不报错、只是静默用旧数据。
+CATALOG_CACHE = (Path(__file__).resolve().parent.parent
+                 / "data" / "interim" / "catalog_cache")
+
+
+def _catalog_key(conn: psycopg.Connection) -> str:
+    """库内容的指纹。任一向量列重灌过，键就会变。"""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT count(*), count(tag_vec), count(vec), count(staff_vec)
+              FROM anime_profile
+        """)
+        counts = cur.fetchone()
+        cur.execute("SELECT key, value->>'fingerprint' FROM build_meta ORDER BY key")
+        fps = cur.fetchall()
+    raw = repr((counts, fps))
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
 def build_catalog(conn: psycopg.Connection,
-                  weighting: Weighting = "logtf-idf") -> Catalog:
+                  weighting: Weighting = "logtf-idf",
+                  *, use_cache: bool = True) -> Catalog:
     """从库里拉出全部作品与预计算好的 tag 向量，装配成内存矩阵。
 
     ⚠️ **向量不在这里算，直接读 anime_profile.tag_vec。**（2026-08-12 改）
@@ -246,7 +274,28 @@ def build_catalog(conn: psycopg.Connection,
 
     ⚠️ binary 模式（第 5 周 ablation 用）仍然现算 —— 库里只存 logtf-idf 一种。
     """
-    with conn.cursor() as cur:
+    # ⚠️ binary 模式（ablation）现算，且依赖 tags/meta_tags，不走缓存
+    cache_file = None
+    if use_cache and weighting == "logtf-idf":
+        cache_file = CATALOG_CACHE / f"{_catalog_key(conn)}.npz"
+        if cache_file.exists():
+            z = np.load(cache_file, allow_pickle=True)
+            return Catalog(
+                ids=z["ids"], vocab=list(z["vocab"]), mat=z["mat"],
+                emb=z["emb"], staff=z["staff"], series_root=z["series_root"],
+                year=z["year"], ym=z["ym"], air_ord=z["air_ord"],
+                nsfw=z["nsfw"], done=z["done"], name=list(z["name"]),
+                bgm_score=z["bgm_score"], votes=z["votes"], wr=z["wr"])
+
+    # ⚠️ **必须用 binary=True。** 默认的文本格式会把向量列膨胀 6 倍：
+    #    实测 `vec` 列二进制 21 MB / 文本 **132 MB**，单次 build_catalog()
+    #    因此从 ~36 MB 变成 ~150 MB。
+    #    ⚠️ 这不是性能问题而是**配额问题** —— Neon 免费层的网络传输是
+    #       5 GB/月，而这个函数在开发和评测时会被反复调用（每轮 pytest 一次、
+    #       第 5 周 leave-one-out 更频繁）。2026-08-14 一天之内跑掉 2.68 GB，
+    #       就是因为 P1 把 1024 维的 `vec` 加进了这个查询而格式仍是文本。
+    #    实测耗时也从 7.8s 降到约 2s。
+    with conn.cursor(binary=True) as cur:
         cur.execute("""
             SELECT subject_id, COALESCE(name_cn, name), air_year, nsfw, fav_done,
                    COALESCE(EXTRACT(MONTH FROM air_date), 0)::int,
@@ -300,7 +349,7 @@ def build_catalog(conn: psycopg.Connection,
             "anime_profile.tag_vec 整列为空 —— 先跑 "
             "scripts/build_tag_vectors.py。（否则打分会静默返回空结果）")
 
-    return Catalog(ids=np.array(ids), vocab=vlist, mat=mat, emb=emb, staff=stf,
+    cat = Catalog(ids=np.array(ids), vocab=vlist, mat=mat, emb=emb, staff=stf,
                    series_root=np.array(sroots),
                    year=np.array([y if y is not None else 0 for y in years]),
                    ym=np.array(yms), air_ord=np.array(ords),
@@ -310,6 +359,16 @@ def build_catalog(conn: psycopg.Connection,
                    votes=np.array(votes), wr=_weighted_rating(
                        np.array(scores, dtype=np.float32),
                        np.array(votes, dtype=np.float32)))
+
+    if cache_file is not None:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            cache_file, ids=cat.ids, vocab=np.array(cat.vocab), mat=cat.mat,
+            emb=cat.emb, staff=cat.staff, series_root=cat.series_root,
+            year=cat.year, ym=cat.ym, air_ord=cat.air_ord, nsfw=cat.nsfw,
+            done=cat.done, name=np.array(cat.name, dtype=object),
+            bgm_score=cat.bgm_score, votes=cat.votes, wr=cat.wr)
+    return cat
 
 
 def _weighted_rating(score: np.ndarray, votes: np.ndarray) -> np.ndarray:
