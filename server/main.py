@@ -45,7 +45,14 @@ _lock = threading.Lock()
 _pool: ConnectionPool | None = None
 # 问卷选题只取决于库内容与几个参数，整份缓存。模块级变量在同一个函数
 # 实例（容器）内跨请求存活；容器被回收就重建，不影响正确性。
+# ⚠️ 缓存的是**候选序列**不是「前 n 题」—— 多次作答要按 per-user 的排除集
+#    往下顺延，把排除集放进缓存键会让键空间爆炸。
 _questions: dict[tuple, list[schemas.QuestionItem]] = {}
+
+# 候选序列缓存多少条。⚠️ 决定了多次作答最多能撑几轮：600 条 ÷ 30 题 = 20 轮，
+#    而实测第 6 轮（位次 151-180）的中位热度仍有 18,462，够用了。
+#    再大没意义 —— 位次越靠后越冷门，用户没看过就问不出信息。
+_POOL_CACHE = 600
 
 
 def _get_pool() -> ConnectionPool:
@@ -135,13 +142,27 @@ def get_questionnaire(
     include_nsfw: bool = False,
     fold_sequels: bool = True,
     experience: schemas.Experience = "veteran",
+    exclude: str = Query(default="", description="已评分的 subject_id，逗号分隔"),
 ) -> schemas.QuestionnaireResponse:
-    """选题。第 9 节要求「超发」：要 10 条有效评分就展示 25–30 部。"""
-    key = (n, include_nsfw, fold_sequels, experience)
+    """选题。第 9 节要求「超发」：要 10 条有效评分就展示 25–30 部。
+
+    `exclude` 支持**多次作答**：把已评分的 id 传进来，跳过它们继续往下取题。
+    ⚠️ 游客传 localStorage 里的，注册用户传 `user_rating` 里的 —— 服务端不区分
+       （第 2 节架构铁律）。
+    """
+    try:
+        skip = {int(x) for x in exclude.split(",") if x.strip()}
+    except ValueError:
+        raise HTTPException(422, "exclude 必须是逗号分隔的整数") from None
+
+    # ⚠️ **缓存的是「候选序列」而不是「前 n 题」。** 排除集是 per-user 的，
+    #    放进缓存键会让键空间爆炸；而候选序列只由这三个参数决定，可以复用。
+    #    顺带把 n 从键里去掉了 —— 原先每个 n 各占一个条目，纯属浪费。
+    key = (include_nsfw, fold_sequels, experience)
     if key not in _questions:
         with _conn() as c:
             items = questionnaire.select_items(
-                c, n=n, include_nsfw=include_nsfw,
+                c, n=_POOL_CACHE, include_nsfw=include_nsfw,
                 fold_sequels=fold_sequels, experience=experience,
             )
         _questions[key] = [
@@ -151,7 +172,7 @@ def get_questionnaire(
             )
             for it in items
         ]
-    items = _questions[key]
+    items = [q for q in _questions[key] if q.subject_id not in skip][:n]
     return schemas.QuestionnaireResponse(
         items=items, experience=experience, total=len(items)
     )

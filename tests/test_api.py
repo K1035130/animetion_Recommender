@@ -73,6 +73,35 @@ def test_questionnaire_folds_and_orders(client, db_conn):
         "中位热度过低，MMR 的 λ 可能偏小，问卷会问到用户没看过的冷门作"
 
 
+def test_questionnaire_second_round(client):
+    """多次作答：把第一轮的题传进 exclude，应拿到不重复且仍连续的下一批。"""
+    first = client.get(f"{API}/questionnaire", params={"n": 30}).json()["items"]
+    ids1 = [i["subject_id"] for i in first]
+
+    second = client.get(f"{API}/questionnaire", params={
+        "n": 30, "exclude": ",".join(map(str, ids1))}).json()["items"]
+    ids2 = [i["subject_id"] for i in second]
+
+    assert len(ids2) == 30, "第二轮题目不足 —— 候选序列缓存太短"
+    assert not (set(ids1) & set(ids2)), "第二轮出现了第一轮问过的作品"
+
+    # ⚠️ 第二轮不是「随便往下顺延」：MMR 贪心序的第 31 位本就是
+    #    「已选前 30 位的前提下信息增量最大的那一部」，所以位次必须严格接续。
+    assert ids2 == [i["subject_id"] for i in
+                    client.get(f"{API}/questionnaire", params={"n": 60}
+                               ).json()["items"][30:]]
+
+    # 多轮之后仍应是用户可能看过的作品，不能退化成冷门番
+    assert sorted(i["done"] for i in second)[15] > 3_000
+
+    # 排除集不该污染缓存：不带 exclude 再问一次，结果应与第一轮完全一致
+    again = client.get(f"{API}/questionnaire", params={"n": 30}).json()["items"]
+    assert [i["subject_id"] for i in again] == ids1
+
+    assert client.get(f"{API}/questionnaire",
+                      params={"exclude": "1,abc"}).status_code == 422
+
+
 def test_recommend_shape_and_order(client, answers):
     b = client.post(f"{API}/recommend", json={"answers": answers, "top_k": 10}).json()
     # skip 不产生记录

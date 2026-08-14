@@ -1,7 +1,16 @@
-"""问卷选题 v0：纯热度 + 续作折叠。
+"""问卷选题：MMR 多样性序 + 续作折叠 + 跳过已评分（支持多次作答）。
 
-第 9 节的完整方案（聚类选代表 + 信息增益动态选题）排在第 5–6 周。
-v0 先用纯热度，但**必须处理续作**，否则问卷质量会明显受损。
+⚠️ **2026-08-14 从「纯热度」改为 MMR。** 纯热度选出的 30 题两两余弦均值
+   0.4552，比随机抽 30 部（0.3627）**还冗余** —— 热门作品扎堆在校园/恋爱/日常，
+   问 30 题拿不到 30 题的信息量。MMR 把这个数压到 0.3781 而中位热度几乎不掉
+   （44,146 → 41,040）。原计划的 k-means 聚类被实测否掉，详见
+   sql/005_mmr_rank.sql 与 CLAUDE.md 第 9 节顶部的标注。
+
+位次由 scripts/build_clusters.py 离线算好写进 `anime_profile.mmr_rank`。
+⚠️ 必须离线算：MMR 要拉全池 4,439 条向量做 N 轮矩阵乘，正是 serverless 禁止的事。
+
+第 9 节的信息增益动态选题排在第 6 周 —— 它与本模块**串联不替代**：
+MMR 序充当候选池，IG 在池内动态挑下一题。
 
 用户的作答选项（2026-08-11 定）：
     看过 → 1–10 分
@@ -19,6 +28,7 @@ v0 先用纯热度，但**必须处理续作**，否则问卷质量会明显受�
 """
 
 import datetime
+from collections.abc import Collection
 from dataclasses import dataclass
 
 import psycopg
@@ -69,8 +79,9 @@ class Item:
 def select_items(conn: psycopg.Connection, n: int = 30, *,
                  include_nsfw: bool = False,
                  fold_sequels: bool = True,
-                 experience: str = "veteran") -> list[Item]:
-    """按热度选 n 部，续作折叠成系列第一部。
+                 experience: str = "veteran",
+                 exclude: Collection[int] = ()) -> list[Item]:
+    """按 mmr_rank（多样性序）选 n 部，续作折叠成系列第一部。
 
     折叠而非丢弃：系列第一部通常热度更高、更适合当问卷题目
     （问「你看过进击的巨人吗」远比问「你看过进击的巨人第三季Part.2吗」有效）。
@@ -78,6 +89,27 @@ def select_items(conn: psycopg.Connection, n: int = 30, *,
     ⚠️ 根节点不限形态。候选池限制在 TV+WEB 的理由是「剧场版/OVA 多为续作」，
        而根节点按定义就不是续作，这条理由对它不成立 —— 攻壳机动队(1995 剧场版)
        是整个系列的入口，完全适合作为问卷题目。
+
+    `exclude` —— 已有评分记录的 subject_id，用于**多次作答**：答过一轮之后
+    再答，跳过已评分的，继续往下取题。
+
+    ⚠️ **这个参数保持了第 2 节的架构铁律**：调用方传入，函数不关心它来自
+       游客的 localStorage 还是注册用户的 `user_rating` 表。与
+       `score(catalog, ratings, ...)` 同一条纪律 —— 第 6 周加账号只是换数据源。
+
+    ⚠️ **判据是「该条目自己有没有评分」，不在系列内传递。**
+       用户给《JoJo 第三部》打过分，不代表看过第一部 —— 这类每季可独立观看的
+       作品跳着看很常见。问卷的目的是扩充用户的资料库，只要根节点本身没评分
+       就该问。（按系列传递会静默少掉大量可问的题。）
+
+    ⚠️ **「没看过」(skip) 不进 exclude。** `to_rating()` 对 skip 返回 None、
+       不产生评分记录，所以它天然不在排除集里、下轮会再出现 —— 这是有意的：
+       用户当时没看过，过一阵可能就看了。**不需要为此再维护一个「已作答」集合。**
+
+    💡 多次作答之所以成立，是因为 `mmr_rank` 存的是**全池 4,439 条的完整贪心序**
+       而不是只有前 30。MMR 的第 31 位本就是「已选前 30 位的前提下信息增量最大的
+       那一部」，所以第二轮天然就是「补充第一轮之外的信息」，不是随便往下顺延。
+       实测热度衰减很平缓：第 1 轮中位 41,040，第 6 轮仍有 18,462。
     """
     if experience not in EXPERIENCE:
         raise ValueError(f"未知资历 {experience!r}，可选 {list(EXPERIENCE)}")
@@ -104,6 +136,7 @@ def select_items(conn: psycopg.Connection, n: int = 30, *,
     #    最终排序才换成 mmr_rank。
     rank_of = {r[0]: r[7] for r in rows if r[7] is not None}
 
+    skip = frozenset(exclude)
     picked: dict[int, Item] = {}
     for sid, name, year, done, form, nsfw, sroot, _rank in rows:
         if not include_nsfw and nsfw:
@@ -111,7 +144,7 @@ def select_items(conn: psycopg.Connection, n: int = 30, *,
         if form not in POOL_FORMS:
             continue
         root = sroot if fold_sequels else sid
-        if root in picked:
+        if root in picked or root in skip:
             continue
         r = meta.get(root)
         if r is None:                      # 根不在候选集里（极少），退回本作
