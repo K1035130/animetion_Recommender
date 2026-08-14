@@ -41,7 +41,7 @@
 问卷支持多次作答 · P1 三路融合（tag + embedding + staff/studio）。
 
 `animetion-recommender.vercel.app` —— 前端 + API 同一个 Vercel 项目、同源。
-库占用 **85 MB / 500 MB**（第 3 周灌入 `vec` 后从 58 MB 增长）。
+库占用 **86 MB / 500 MB**（第 3 周灌入 `vec` + `staff_vec` 后从 58 MB 增长）。
 测试 **28 项**（18 项打分一致性 + 10 项接口）。
 
 | 周 | 内容 | 状态 |
@@ -382,7 +382,7 @@ per-user 的排除在内存里过滤 —— 排除集放进缓存键会让键空
               └────────────────────┬────────────────────────────┘
                                    │ 写
                               ┌────▼────┐
-                              │  Neon   │  85 MB / 500 MB
+                              │  Neon   │  86 MB / 500 MB
                               │Postgres │  向量全部预先算好
                               └────┬────┘
                                    │ 读
@@ -517,6 +517,19 @@ psycopg.OperationalError: consuming input failed: SSL connection has been closed
 所以「迭代成本」不再是反对全程 API 的理由 —— 它反而进一步支持了 A.7 的决定。
 
 #### 缓存层设计（仍然必做，但理由变了）
+
+📌 **实现位置**（✅ 2026-08-14 已落地）：
+
+| 文件 | 职责 |
+|---|---|
+| [src/embed.py](src/embed.py) | **模型的唯一定义处**：锁死的 `MODEL`/`DIM`/`QUERY_INSTRUCT`、指纹、`embed_documents` / `embed_query`、错误分类与退避 |
+| [src/embed_cache.py](src/embed_cache.py) | SQLite 缓存，键 = `hash(MODEL + DIM + text)` |
+| [scripts/build_embeddings.py](scripts/build_embeddings.py) | 编排：查缓存 → 只请求未命中 → 按 token 节流 → 写 `vec` |
+
+⚠️ **`src/embed.py` 在 `src/` 不在 `scripts/`**，因为它有两个调用方：
+离线建库和第 4 周的线上查询编码，而 `.vercelignore` 排掉了 `scripts/`。
+⚠️ **httpx 目前只在 `etl` 组**，第 4 周 `server/` 一旦 import 它，
+线上就会 `ModuleNotFoundError` —— 那时必须把 httpx 挪进主依赖组。
 
 ⚠️ **缓存层的论据从「迭代速度」收缩到「可复现性」。** 后者没有被上面的数字削弱
 分毫 —— ¥16 额度和宽松限额都保护不了你免受「厂商在同一个模型名下换模型/
