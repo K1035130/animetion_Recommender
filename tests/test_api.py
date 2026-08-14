@@ -102,6 +102,24 @@ def test_questionnaire_second_round(client):
                       params={"exclude": "1,abc"}).status_code == 422
 
 
+def test_questionnaire_survives_cache_exhaustion(client):
+    """排除数超过候选序列缓存时，必须退回查库而不是静默返回空问卷。
+
+    ⚠️ 缓存只有 _POOL_CACHE 条，库里却有 4,439 条可问。不做兜底的话，
+       答满缓存的用户会拿到 200 + total=0，看不出还有几千部可问 —— 静默失败。
+    """
+    from server.main import _POOL_CACHE, _questions
+
+    client.get(f"{API}/questionnaire", params={"n": 1})       # 触发缓存填充
+    pool = [q.subject_id for q in next(iter(_questions.values()))]
+    assert len(pool) == _POOL_CACHE
+
+    got = client.get(f"{API}/questionnaire", params={
+        "n": 30, "exclude": ",".join(map(str, pool))}).json()["items"]
+    assert len(got) == 30, "缓存耗尽后没有退回查库"
+    assert not ({i["subject_id"] for i in got} & set(pool)), "兜底路径漏了排除集"
+
+
 def test_recommend_shape_and_order(client, answers):
     b = client.post(f"{API}/recommend", json={"answers": answers, "top_k": 10}).json()
     # skip 不产生记录

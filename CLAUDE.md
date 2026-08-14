@@ -39,7 +39,7 @@
 
 `animetion-recommender.vercel.app` —— 前端 + API 同一个 Vercel 项目、同源。
 库占用 **85 MB / 500 MB**（第 3 周灌入 `vec` 后从 58 MB 增长）。
-测试 **21 项**（13 项打分一致性 + 8 项接口）。
+测试 **22 项**（13 项打分一致性 + 9 项接口）。
 
 | 周 | 内容 | 状态 |
 |---|---|---|
@@ -934,7 +934,7 @@ uv run python scripts/build_embeddings.py    # ⚠️ 需要 .env 的 SILICONFLO
                                              #    约 12 分钟 / ¥0.19（缓存命中则秒完成）
 uv run --group ml python scripts/build_clusters.py   # mmr_rank + cluster_id，依赖上一步
 psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
-uv run pytest tests/ -q                      # 验收：21 项测试应全绿
+uv run pytest tests/ -q                      # 验收：22 项测试应全绿
 ```
 
 ⚠️ **`SILICONFLOW_API_KEY` 是新机器唯一需要人工去申请的东西**（见 .env.example）。

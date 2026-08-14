@@ -173,6 +173,24 @@ def get_questionnaire(
             for it in items
         ]
     items = [q for q in _questions[key] if q.subject_id not in skip][:n]
+
+    # ⚠️ 缓存只有 _POOL_CACHE 条，而库里有 4,439 条可问。答满缓存的用户
+    #    会拿到**空问卷** —— 200 + total=0，没有任何提示，而实际上还有几千部
+    #    可问。这是静默失败，所以缓存耗尽时退回查库（只有答过 ~20 轮才会触发）。
+    if len(items) < n:
+        with _conn() as c:
+            fresh = questionnaire.select_items(
+                c, n=len(skip) + n, include_nsfw=include_nsfw,
+                fold_sequels=fold_sequels, experience=experience, exclude=skip,
+            )
+        items = [
+            schemas.QuestionItem(
+                subject_id=it.subject_id, name=it.name, year=it.year,
+                done=it.done, form=it.form, replaced_from=it.replaced_from,
+            )
+            for it in fresh
+        ][:n]
+
     return schemas.QuestionnaireResponse(
         items=items, experience=experience, total=len(items)
     )
