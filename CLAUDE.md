@@ -33,18 +33,19 @@
 
 # 第一部分 · 现状与下一步
 
-## 📍 当前进度（更新于 2026-08-13）
+## 📍 当前进度（更新于 2026-08-14）
 
-**第 1–2 周全部完工并已上线。下一步是第 3 周 embedding。**
+**第 1–2 周完工并已上线；第 3 周 embedding 建库已完成，下一步是 P1 融合与聚类。**
 
 `animetion-recommender.vercel.app` —— 前端 + API 同一个 Vercel 项目、同源。
-库占用 **58 MB / 500 MB**。测试 **20 项**（13 项打分一致性 + 7 项接口）。
+库占用 **85 MB / 500 MB**（第 3 周灌入 `vec` 后从 58 MB 增长）。
+测试 **20 项**（13 项打分一致性 + 7 项接口）。
 
 | 周 | 内容 | 状态 |
 |---|---|---|
 | 1 | 数据层：dump → 候选集 → 灌库 → tag 清洗 | ✅ |
 | 2 | P0 推荐 + 选题 + 续作折叠 + API + pgvector + 前端 v0 + 部署 | ✅ |
-| **3** | **Qwen3-Embedding + P1 融合 staff/studio + 内容簇** | ⬜ **← 从这里继续** |
+| **3** | Qwen3-Embedding 建库 ✅ · **P1 融合 staff/studio + 内容簇** ⬜ | 🔶 **← 从这里继续** |
 | 4 | 萌娘百科语料 + HyDE + 混合检索 | ⬜ |
 | **5** | **离线评测（核心卖点，不可压缩）** | ⬜ |
 | 6 | 信息增益选题 + 账号系统 + 季度同步 | ⬜ |
@@ -301,7 +302,7 @@ PCA 降到 30–50 维，N 从 30 起试，用 silhouette 定。
               └────────────────────┬────────────────────────────┘
                                    │ 写
                               ┌────▼────┐
-                              │  Neon   │  58 MB / 500 MB
+                              │  Neon   │  85 MB / 500 MB
                               │Postgres │  向量全部预先算好
                               └────┬────┘
                                    │ 读
@@ -634,6 +635,29 @@ numpy 评测图省事直接读缓存文件，它拿到 fp32 而线上 SQL 拿到
 **`test_parity.py` 会开始飘** —— 而且飘得很小，容易被当成浮点误差放过去。
 **numpy 那条路必须也从库里读。**
 
+✅ 已实测这条不变式成立：抽查 300 部，**库内 halfvec 与缓存 fp32 的余弦
+最低 0.99999988**，写库路径无损。
+
+#### ⚠️ 读回来的类型：`vector` 和 `halfvec` 行为不同（P1 接入时会踩）
+
+```
+tag_vec (vector)  → pgvector.Vector      对象
+vec     (halfvec) → pgvector.HalfVector  对象
+```
+
+⚠️ **两者都不是 numpy 数组**，`np.asarray()` 直接作用在它们身上得到的是
+`dtype=object, shape=()` —— 不报错，但后面的矩阵运算全错。
+⚠️ **而且 `HalfVector.to_numpy()` 返回的是 float16**，直接拿去做累加会掉精度。
+
+正确写法就是 [src/recommend.py](src/recommend.py) 里现成的那句：
+
+```python
+v = vec.to_numpy() if hasattr(vec, "to_numpy") else np.asarray(vec)
+mat[i] = v.astype(np.float32)          # ⚠️ .astype 不能省
+```
+
+P1 把 `vec` 接进 `build_catalog()` 时照抄这个模式。
+
 #### ⚠️ P1 融合必须分开存两列，不能预融合
 
 P1 要把 tag（308 维）+ embedding（1024 维）+ staff/studio 融合成偏好信号。
@@ -851,15 +875,25 @@ uv sync --group etl          # ⚠️ 必须带 --group etl：脚本要用 httpx
 psql < sql/001_init.sql
 psql < sql/002_tag_vec.sql                   # ⚠️ 别漏：没有 tag_vec 列，最后一步会直接报错
 psql < sql/003_vec_halfvec.sql               # vec: vector(1024) → halfvec(1024)。幂等
+psql < sql/004_build_meta.sql                # ⚠️ 别漏：build_embeddings.py 会前置检查它
 uv run python scripts/build_id_map.py        # 需要联网，会下 bangumi-data
 uv run python scripts/load_profiles.py
 uv run python scripts/backfill_staff.py
 uv run python scripts/backfill_anilist.py    # 需要联网，约 125 次请求
 uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py   # 依赖上一步；打分链路的前置
+uv run python scripts/build_embeddings.py    # ⚠️ 需要 .env 的 SILICONFLOW_API_KEY
+                                             #    约 12 分钟 / ¥0.19（缓存命中则秒完成）
 psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
 uv run pytest tests/ -q                      # 验收：20 项测试应全绿
 ```
+
+⚠️ **`SILICONFLOW_API_KEY` 是新机器唯一需要人工去申请的东西**（见 .env.example）。
+没有它 `build_embeddings.py` 会立刻报错退出 —— 前置检查在花钱之前。
+
+💡 **`data/interim/embed_cache/` 不入 git**（50 MB），所以换机器要重新花 ¥0.19 请求一次。
+⚠️ 但**如果你手上有旧机器的缓存文件，拷过去就是零成本重建，且 bit-identical** ——
+这是全程 API 方案下唯一能保证「两台机器建出同一个库」的办法。
 
 ⚠️ **最后两步不是可选的。** 跳过 VACUUM 会让库虚涨一倍（实测 58 → 116 MB），
 误判预算吃紧；跳过 pytest 就没人发现 `tag_vec` 是不是漏跑或跑歪了 ——
@@ -1374,7 +1408,7 @@ chunk 上又省得不够。这是「折中」的典型失败形态：两头不�
 按每条 chunk 约 **2,400 字节**（512 维 halfvec 1,024 B + HNSW 索引摊销）算：
 
 ```
-可用于 chunk 的空间 ≈ 450 − 81.5(第3周末) − 10(用户表) = 358 MB
+可用于 chunk 的空间 ≈ 450 − 85(第3周末实测) − 10(用户表) = 355 MB
                     ÷ 2,400 字节/条
                     ≈ 15 万条
 ```
