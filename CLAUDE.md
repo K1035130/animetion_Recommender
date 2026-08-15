@@ -246,13 +246,32 @@ per-user 的排除在内存里过滤 —— 排除集放进缓存键会让键空
 
 ### 四个前置动作（都是「越晚做代价越大」）
 
-**0. 把 httpx 挪进主依赖组** —— ⬜ **必须最先做，否则线上必挂**
-现在 httpx 只在 `etl` 组，而 `.vercelignore` 排掉了 `scripts/`。
-第 4 周 `server/` 一旦 import [src/embed.py](src/embed.py) 去编码查询，
-线上就是 `ModuleNotFoundError` —— 而**本地一切正常**，因为开发机装了 etl 组。
-⚠️ 与「连接池不放 lifespan」是同一类故障：本地好好的，上线就挂。
-校验方式照 B 节那条：`uv sync --no-dev --no-group api --no-group etl --no-group ml`
-后跑 `uv run --no-sync python -c "import server.main"`。
+**0. 把 httpx 挪进主依赖组** —— ✅ **已完成（2026-08-15）**
+`.vercelignore` 只排 `scripts/` **不排 `src/`**，所以 [src/embed.py](src/embed.py)
+早就随 `src/` 上线了，只是没人 import 它 —— Python 的 import 是惰性的，
+不被 import 就不会执行里面的 `import httpx`。**一颗惰性炸弹。**
+引爆点在第 4 周 `server/` 引用它去编码查询：那是**模块级 import**，
+`api/index.py: from server.main import app` 整条链断掉 → ASGI app 构建不出来
+→ `/health` `/questionnaire` `/recommend` **全部 500**。
+⚠️ **一个第 4 周的新功能会把第 2 周就上线的推荐一起打死**，
+而开发机装了 etl 组，本地和测试全绿 —— 与「连接池不放 lifespan」
+「recommend.py 读不入 git 的 series_root.json」同族：本地好好的，上线就挂。
+
+**实测（隔离环境，未动开发机 .venv）**：
+```
+uv sync --no-dev --no-group api --no-group etl --no-group ml   → 23 个包
+  import server.main   ✅ 不回归
+  from src import embed ✅ 第 4 周要走的那条 import
+反向验证：卸掉 httpx 后 from src import embed
+  → ModuleNotFoundError: No module named 'httpx'    ← 故障是真的
+```
+净增 4 个纯 Python 小包（httpx/httpcore/h11/certifi，几 MB），
+anyio/idna/typing-extensions 已随 fastapi→starlette 进来了。
+
+💡 **顺带修掉一个没预料到的隐患**：`fastapi.testclient.TestClient` **自身依赖 httpx**。
+改之前若按 D 节那条光跑 `uv sync`（不带 `--group etl`）再跑 pytest，
+`test_api.py` 那 10 项会直接挂在 TestClient 导入上。现在 httpx 在主依赖组，
+**任何装法都有它**。
 
 **1. 给 embedding 请求加并发** —— ⬜ 8–16 路
 第 3 周实测每批（32 条）往返 **2.2 秒且串行**，profile 340 批跑了 11 分 44 秒。
@@ -610,8 +629,9 @@ psycopg.OperationalError: consuming input failed: SSL connection has been closed
 
 ⚠️ **`src/embed.py` 在 `src/` 不在 `scripts/`**，因为它有两个调用方：
 离线建库和第 4 周的线上查询编码，而 `.vercelignore` 排掉了 `scripts/`。
-⚠️ **httpx 目前只在 `etl` 组**，第 4 周 `server/` 一旦 import 它，
-线上就会 `ModuleNotFoundError` —— 那时必须把 httpx 挪进主依赖组。
+✅ **httpx 已挪进主依赖组（2026-08-15）**，所以 `server/` 可以放心 import
+本模块。原先它只在 `etl` 组，而 `.vercelignore` 不排 `src/` ——
+文件早已上线却没人 import，是颗惰性炸弹。详见第 4 周动作清单第 0 条。
 
 ⚠️ **缓存层的论据从「迭代速度」收缩到「可复现性」。** 后者没有被上面的数字削弱
 分毫 —— ¥16 额度和宽松限额都保护不了你免受「厂商在同一个模型名下换模型/
@@ -966,8 +986,8 @@ questionnaire 早已因同样理由改成读库列（commit 0c16ba4），`recomm
 
 | 组 | 内容 | 上线 |
 |---|---|---|
-| **主依赖** | fastapi / psycopg[binary] / psycopg-pool / pgvector / numpy / jieba / dotenv / orjson | ✅ **19 个包** |
-| `etl` | bgm-tv-wiki / httpx / tqdm | ❌ `scripts/` 专用 |
+| **主依赖** | fastapi / psycopg[binary] / psycopg-pool / pgvector / numpy / jieba / dotenv / orjson / **httpx** | ✅ **23 个包** |
+| `etl` | bgm-tv-wiki / tqdm | ❌ `scripts/` 专用 |
 | `api` | uvicorn / argon2 / pyjwt | ❌ 本地跑服务器 + 第 6 周认证 |
 | `ml` | scikit-learn | ❌ 第 3 周聚类 + 第 5 周评测 |
 
@@ -1079,7 +1099,8 @@ DB 往返已经便宜到可以忽略。
 ⚠️ **换机器 / 重新 clone 后的启动顺序**（`data/interim/*` 除 tag 词表外都不入 git）：
 
 ```
-uv sync --group etl          # ⚠️ 必须带 --group etl：脚本要用 httpx/tqdm/bgm-tv-wiki
+uv sync --group etl          # ⚠️ 必须带 --group etl：脚本要用 tqdm/bgm-tv-wiki
+                             #    （httpx 在主依赖组，任何装法都有）
 psql < sql/001_init.sql
 psql < sql/002_tag_vec.sql                   # ⚠️ 别漏：没有 tag_vec 列，最后一步会直接报错
 psql < sql/003_vec_halfvec.sql               # vec: vector(1024) → halfvec(1024)。幂等
@@ -1116,7 +1137,7 @@ uv run pytest tests/ -q                      # 验收：28 项测试应全绿
 
 ```bash
 uv sync                                       # 只装运行时依赖（= 线上那一组）
-uv sync --group etl                           # scripts/ 要用：httpx/tqdm/bgm-tv-wiki
+uv sync --group etl                           # scripts/ 要用：tqdm/bgm-tv-wiki
 uv sync --group api                           # 本地跑 uvicorn
 uv run ruff check src/ scripts/ server/ tests/
 uv run pytest tests/ -q                       # 改过任一条打分路径后必跑

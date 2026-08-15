@@ -63,13 +63,18 @@ nearest neighbours of *Havoc in Heaven* went from modern web-novel adaptations
 That before/after pair is a reproducible case, not a lone NDCG number, which is
 what week 5 is meant to produce.
 
-⚠️ **Two things to know before week 4.** `httpx` currently lives in the `etl`
-dependency group, and `.vercelignore` drops `scripts/` — the moment `server/`
-imports [src/embed.py](src/embed.py) to encode a query, production raises
-`ModuleNotFoundError` while everything still works locally. And chunk loading
-must go in batches with a plain `VACUUM`, never `VACUUM FULL`: it rewrites the
-whole table, and on Neon that WAL counts against the storage quota — where going
-over suspends the project rather than billing for it.
+⚠️ **Chunk loading must go in batches with a plain `VACUUM`, never `VACUUM FULL`.**
+It rewrites the whole table, and on Neon that WAL counts against the storage
+quota — where going over suspends the project rather than billing for it.
+
+✅ The other week-4 prerequisite is already done: `httpx` moved from the `etl`
+group into the main dependencies on 2026-08-15. `.vercelignore` drops `scripts/`
+but not `src/`, so [src/embed.py](src/embed.py) was already shipping to
+production — nothing imported it, and Python resolves imports lazily, so it sat
+there inert. The moment `server/` imports it to encode a query, that
+module-level `import httpx` takes the whole ASGI app down with it, 500ing
+`/recommend` and `/health` alongside the new feature — and only in production,
+since a dev machine has the `etl` group installed.
 
 ---
 
@@ -92,7 +97,7 @@ over suspends the project rather than billing for it.
 
 ```bash
 uv sync                       # runtime deps only — what the deployed app needs
-uv sync --group etl           # + bgm-tv-wiki / httpx / tqdm — needed by scripts/
+uv sync --group etl           # + bgm-tv-wiki / tqdm — needed by scripts/
 uv sync --group api --group etl --group dev   # everything, for development
 ```
 
@@ -329,12 +334,16 @@ Neon 免费层占用 **110 MB / 500 MB**（控制台口径，含保留的历史�
 这种可复现的前后对照，比一个孤立的 NDCG 数字更能说明问题，
 而这正是第 5 周要产出的东西。
 
-⚠️ **第 4 周动手前有两件事要知道。** 一是 `httpx` 目前只在 `etl` 依赖组，
-而 `.vercelignore` 排掉了 `scripts/` —— `server/` 一旦 import
-[src/embed.py](src/embed.py) 去编码查询，线上就是 `ModuleNotFoundError`，
-**而本地一切正常**。二是灌 chunk 必须分批 + 每批后跑普通 `VACUUM`，
-**绝不能用 `VACUUM FULL`**：它重写整张表，而在 Neon 上这些 WAL 会计入存储配额，
+⚠️ **第 4 周动手前要知道：灌 chunk 必须分批 + 每批后跑普通 `VACUUM`，
+绝不能用 `VACUUM FULL`。** 它重写整张表，而在 Neon 上这些 WAL 会计入存储配额，
 **超限是挂起项目而不是计费**。
+
+✅ 另一个前置已经做完：`httpx` 于 2026-08-15 从 `etl` 组挪进主依赖组。
+`.vercelignore` 排掉 `scripts/` 但**不排 `src/`**，所以
+[src/embed.py](src/embed.py) 其实早就随 `src/` 上线了 —— 只是没人 import 它，
+而 Python 的 import 是惰性的，于是它一直静静躺着。等 `server/` 引用它去编码查询，
+那句**模块级** `import httpx` 会把整个 ASGI app 一起带走，新功能没上线成、
+`/recommend` 和 `/health` 先跟着 500 —— 而且只在线上错，因为开发机装了 `etl` 组。
 
 ## 技术栈
 
@@ -353,7 +362,7 @@ Neon 免费层占用 **110 MB / 500 MB**（控制台口径，含保留的历史�
 
 ```bash
 uv sync                       # 只装运行时依赖 —— 线上跑的就是这一组
-uv sync --group etl           # + bgm-tv-wiki / httpx / tqdm，scripts/ 要用
+uv sync --group etl           # + bgm-tv-wiki / tqdm，scripts/ 要用
 uv sync --group api --group etl --group dev   # 开发全量
 ```
 

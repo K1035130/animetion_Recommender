@@ -5,10 +5,13 @@
    而 .vercelignore 排掉了 scripts/，线上要用的东西必须在 src/。
    放一份两边用 —— 与 tag 向量只在 src/tagvec.py 定义一次是同一条纪律。
 
-⚠️ **httpx 目前只在 pyproject 的 etl 组里，主依赖组没有 HTTP 客户端。**
-   第 3 周纯离线不受影响；但第 4 周 server/ 一旦 import 本模块，
-   线上就会 ModuleNotFoundError —— 与首次部署缺 fastapi 是同一类故障。
-   ⬜ 那时必须把 httpx 挪进主依赖组。
+✅ **httpx 已在主依赖组（2026-08-15 从 etl 组挪上来），本模块可以被 server/ import。**
+   挪之前的隐患：本文件早已随 src/ 上线（.vercelignore 只排 scripts/），
+   但没有任何模块 import 它，靠 Python 惰性 import 侥幸无事。
+   一旦 server/ 引用，炸的是模块级 import → ASGI app 整个构建不出来
+   → /health /questionnaire /recommend 全部 500，与首次部署缺 fastapi 同类。
+   ⚠️ 反向验证过：从线上那套精确依赖里卸掉 httpx，`from src import embed`
+      确实抛 ModuleNotFoundError；装上后 import 正常。
 
 实测行为（2026-08-14，scripts/probe_embedding_api.py，详见 CLAUDE.md A.7）：
 
