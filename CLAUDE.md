@@ -33,7 +33,7 @@
 
 # 第一部分 · 现状与下一步
 
-## 📍 当前进度（更新于 2026-08-14）
+## 📍 当前进度（更新于 2026-08-15）
 
 **第 1–3 周全部完工。下一步是第 4 周：萌娘百科语料 + HyDE + 混合检索。**
 
@@ -54,24 +54,34 @@
 | **5** | **离线评测（核心卖点，不可压缩）** | ⬜ |
 | 6 | 信息增益选题 + 账号系统 + 季度同步 | ⬜ |
 
-⚠️ **唯一未经实测的环节：带前端的部署配置。** 上一次验证过的部署是纯 API
-（`/(.*)` 全转发给函数）。加前端后 `vercel.json` 变成
-`buildCommand` + `outputDirectory` + 只转发 `/api/*`，**这套组合还没真跑过一次**。
-首次部署要盯构建日志：根目录没有 `package.json`，若 Vercel 的 install 阶段
-因此报错，就在面板把 Install Command 设成空。
+✅ **带前端的部署配置已实测通过（2026-08-15）** —— 此前这里挂着「唯一未经实测的
+环节」，现已消除。`buildCommand` + `outputDirectory` + 只转发 `/api/*` 这套组合
+线上验证：根路径返回 Vite 构建产物（`/assets/index-*.js` 带 hash），
+`/api/health` 返回 `catalog_size=11453 · with_tag_vec=11311 ·
+dict_fingerprint=6a1cbbe1bc4f446d`。根目录没有 `package.json` 并未让 Vercel 的
+install 阶段报错，**不需要把 Install Command 设成空**。
 
-## ⬜ 下一步：第 3 周动作清单（2026-08-14 定）
+⬜ **小缺口：`/health` 只报 `with_tag_vec`。** 第 3 周之后打分链路多了 `vec` 和
+`staff_vec` 两列，但健康检查看不到它们的非空行数 —— C 节那句「跳过 pytest
+就没人发现向量是不是漏跑了，`/health` 也能看出来」现在只对 tag 那一路成立。
+加两个字段是几行的事，下次动 `server/main.py` 时顺手补。
+
+## ✅ 第 3 周动作清单（2026-08-14 定，2026-08-15 全部完工）
+
+> 📌 **保留是因为论证过程有用**（为什么否决 k-means、为什么必须存 sparsevec、
+> 为什么三路分开算余弦），**不是待办**。第 6 条是唯一剩下的，且标记为可选。
+> 下一步看本节末尾的「⬜ 下一步：第 4 周动作清单」。
 
 按依赖顺序。前两步是「越晚做代价越大」的前置动作。
 
-**0. 改列类型 `vector(1024)` → `halfvec(1024)`** —— ✅ SQL 已写好，待执行
+**0. 改列类型 `vector(1024)` → `halfvec(1024)`** —— ✅ **已执行**
 省 23.5 MB（47 → 23.5 MB）。⚠️ **必须在灌数据之前跑**：现在列全 NULL，改类型
 是一条 ALTER；灌完 11,453 条再改要重灌。
 [sql/003_vec_halfvec.sql](sql/003_vec_halfvec.sql)，幂等，已在事务里试跑+回滚验证过。
 ⚠️ 里面记了一条 parity 纪律：fp16 相对精度约 1e-3，**远大于** `test_parity.py` 的
 `SWAP_TOL=1e-4` —— 所以两条打分路径必须都从库里读，不能一条读库一条读缓存。
 
-**1. 摸清 embedding API 的行为** —— ✅ 脚本已写好，待填 key 后运行
+**1. 摸清 embedding API 的行为** —— ✅ **已跑完，结果见 A.7 末尾的探测结果表**
 [scripts/probe_embedding_api.py](scripts/probe_embedding_api.py)，
 `uv run --group etl python scripts/probe_embedding_api.py`，约 ¥0.001。
 不是「本地 vs API 比对」（那个方案已废弃），测的是唯一那条路径自己的行为：
@@ -81,9 +91,14 @@
 实测相邻 id 往往是同系列（`OFFSET 5000` 取到的是奶油柠檬第十三/十四部分），
 拿同系列当反例必然假红。
 
-**2. 建 embedding 缓存层**（见 A.7）
-`hash(text + model + dim)` → npy/parquet，本地磁盘，不进 Neon。
-⚠️ 这不是优化项，是第 4 周能否迭代 chunk 切分策略的前提。
+**2. 建 embedding 缓存层**（见 A.7）—— ✅ **已完成**
+[src/embed_cache.py](src/embed_cache.py)，SQLite，键 = `hash(MODEL + DIM + text)`，
+落在 `data/interim/embed_cache/`（已被现有忽略规则覆盖，不进 git 也不进 Neon）。
+⚠️ **它的理由在实测后变了**：原写「是第 4 周迭代 chunk 切分策略的前提」，
+但实测 API 一次全量重建只要 ~27 分钟 / ¥1.92，迭代提速不再是主要理由。
+真正的理由是**可复现性 —— 而且它是唯一来源**：API 用连续批处理，
+同一条文本重发拿不回同一批数字（余弦 0.99987），只有从缓存重放才是精确的。
+💡 第 3 周已经兑现过一次价值：写库阶段炸了之后重跑，100% 命中、零成本零耗时。
 
 **3. 编码 summary → `anime_profile.vec`** —— ✅ **已完成（2026-08-14）**
 
@@ -217,9 +232,73 @@ per-user 的排除在内存里过滤 —— 排除集放进缓存键会让键空
 孤独摇滚/猫和老鼠/Fate/Zero/EVA… → 进击的巨人/芙莉莲/JOJO/四月是你的谎言… →
 魔法少女小圆/化物语/命运石之门/紫罗兰永恒花园…
 
-**6.（可选）统计全库 tag 共现矩阵**
+**6.（可选）统计全库 tag 共现矩阵** —— ⬜ **唯一没做的一条，仍然可选**
 看 `轻小说改`+`小说改`、`异世界`+`穿越`、`后宫`+`校园` 的 PMI 有多高。
 ⚠️ **只统计不调权重** —— 改权重会污染第 5 周 baseline 的口径。
+
+---
+
+## ⬜ 下一步：第 4 周动作清单（2026-08-15 定）
+
+**萌娘百科语料 + HyDE + 混合检索。** 这是**请求路径上第一次出现模型调用**
+（前三周的流程 A 全程零模型），也是第一次往库里灌十万量级的行 ——
+两件事都会撞上此前只在文档里推演过的约束。
+
+### 四个前置动作（都是「越晚做代价越大」）
+
+**0. 把 httpx 挪进主依赖组** —— ⬜ **必须最先做，否则线上必挂**
+现在 httpx 只在 `etl` 组，而 `.vercelignore` 排掉了 `scripts/`。
+第 4 周 `server/` 一旦 import [src/embed.py](src/embed.py) 去编码查询，
+线上就是 `ModuleNotFoundError` —— 而**本地一切正常**，因为开发机装了 etl 组。
+⚠️ 与「连接池不放 lifespan」是同一类故障：本地好好的，上线就挂。
+校验方式照 B 节那条：`uv sync --no-dev --no-group api --no-group etl --no-group ml`
+后跑 `uv run --no-sync python -c "import server.main"`。
+
+**1. 给 embedding 请求加并发** —— ⬜ 8–16 路
+第 3 周实测每批（32 条）往返 **2.2 秒且串行**，profile 340 批跑了 11 分 44 秒。
+10 万 chunk 是 3,125 批 ≈ **115 分钟**。RPM 2,000（≈33 req/s）离用满还差两个
+数量级，**并发是免费的加速**，能压到十几分钟。
+⚠️ SQLite 缓存的写入要串行化。
+
+**2. 灌库脚本做成三段式** —— ⬜ 读库 → 长耗时 API → 写库，每段各开各的连接
+第 3 周已经踩过：握着 `db.connect()` 跑完 11 分钟的 API 阶段，写库时
+`SSL connection has been closed unexpectedly` —— **Neon 是 serverless，
+空闲连接会被回收**。chunk 阶段可能跑一两小时，必然再撞上。
+[scripts/build_embeddings.py](scripts/build_embeddings.py) 的写法照抄。
+
+**3. 定切分粒度前先算天花板** —— ⬜
+⚠️ **维度已定死，唯一还能把存储撑爆的变量是 chunk 条数。**
+按每条 ~2,400 字节（halfvec(512) 1,024 B + HNSW 摊销）：可用空间 ≈
+450 − 110 − 10 = 330 MB ÷ 2,400 ≈ **13.7 万条天花板，计划 9 万，余量 52%**。
+把 chunk 从 400 字改成 200 字，条数直接翻倍 —— **这条红线要在调切分策略时随时对照**。
+
+### 主线三步
+
+**4. 抓萌娘百科**（批次 2：~2,000 部系列条目 → ~3 万 chunk）
+MediaWiki API，礼貌速率 1 req/s。
+⚠️ **剧透靠现成的 `heimu` CSS class 离线打标，不是运行时让 LLM 判断** ——
+第 15 节原则 2，离线更可靠也更省。
+
+**5. 切 chunk → 编码 → 灌 `plot_chunk`**（`halfvec(512)` + HNSW）
+⚠️ **分批灌 + 每批后跑普通 `VACUUM`，不要 `VACUUM FULL`。** 它重写整张表、
+产生等于表大小的 WAL，而在 Neon 上 **WAL 进存储计量** —— 第 3 周两次
+VACUUM FULL 就贡献了约 150 MB。库到 324 MB 时全表重写还可能直接顶穿上限，
+**而 Neon 超限是挂起项目不是计费**。
+⚠️ 正文**不进 Neon**，只存 `content_ref` 指向 R2/静态 JSON。
+⚠️ 查询向量是 1024 维，搜 chunk 时客户端截断到 512 再归一化（MRL 合法，
+已实测客户端截断 vs 服务端截断 cos = 1.000000）。缓存**永远存 1024**。
+
+**6. HyDE 查询改写 + BM25/向量混合检索**（流程 B）
+BM25 那条腿第 1 周就建好了（`search_tsv` + jieba 预分词，词典指纹已在启动时校验）。
+⚠️ **LLM 可以 fallback，embedding 绝对不行**（A.8）—— 换 embedding 模型
+不会报错，会返回一个排好序的噪声列表。配额真断了的降级方向是**退回纯 BM25**。
+⚠️ 查询词必须走**同一套 jieba + 同一份词典**，否则和库里对不上、召回直接崩。
+
+### 顺带留意
+
+⚠️ **Neon 还有一条独立配额：网络传输 5 GB/月。** 第 3 周一天跑掉 2.68 GB，
+靠 `binary=True` + npz 本地缓存压住的。第 4 周离线路径的传输量会更大，
+**这条配额的压力全部来自离线路径，线上单次响应才 4.6 KB。**
 
 ---
 
@@ -356,19 +435,21 @@ per-user 的排除在内存里过滤 —— 排除集放进缓存键会让键空
        └─ build_tag_vectors.py → tag_vec(308)
            ⚠️ 三个回填脚本各管各的列，绝不交叉 UPDATE（详见 C 节）
 
-【第 3 周 · ⬜ 下一步】
-   summary ──[Embedding]──► anime_profile.vec（改 halfvec(1024)）
-   vec ──[PCA → k-means]──► cluster_id → 供问卷选题
-   staff/studio ──► P1 融合进偏好向量
+【第 3 周 · ✅ 完成】
+   summary ──[Embedding API]──► anime_profile.vec  halfvec(1024)，10,864 条
+       └─ 途中落 SQLite 缓存 data/interim/embed_cache/（可复现性的唯一来源）
+   vec ──[MMR]──► mmr_rank → 供问卷选题   ⚠️ 不是 PCA→k-means，那个方案被实测否决
+       └─[PCA → k-means]──► cluster_id    留作第 5 周冷启动曲线的对照线
+   staff/studio ──► staff_vec sparsevec(1933) ──► P1 三路融合
 
-【第 4 周 · ⬜】
+【第 4 周 · ⬜ 下一步】
    萌娘百科 ──抓取──► 切 chunk ──[Embedding]──► plot_chunk
                                     正文 ──► R2
 
 【第 5 周 · ⬜ 核心】
    离线评测：leave-one-out / NDCG@10 / 四条 baseline / 冷启动曲线
    ⚠️ 走 numpy 路径（SQL 往返做不到 10⁵~10⁶ 次打分）
-   ⚠️ 与 SQL 路径由 tests/test_parity.py 13 项锁死等价
+   ⚠️ 与 SQL 路径由 tests/test_parity.py 18 项锁死等价
 
 【第 6 周 · ⬜】
    GitHub Actions 季度增量同步（走 Bangumi API 而非 dump）

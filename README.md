@@ -8,8 +8,9 @@ A preference-questionnaire-driven anime recommender. Users rate shows they've se
 
 ## Status
 
-**Weeks 1–2 are complete and live** at `animetion-recommender.vercel.app` —
-frontend and API in one Vercel project, same origin. Next up: week 3, embeddings.
+**Weeks 1–3 are complete and live** at `animetion-recommender.vercel.app` —
+frontend and API in one Vercel project, same origin. Next up: week 4 — Moegirl
+corpus, HyDE, hybrid retrieval.
 
 | Step | Status |
 |---|---|
@@ -25,8 +26,15 @@ frontend and API in one Vercel project, same origin. Next up: week 3, embeddings
 | Scoring pushed into Postgres (pgvector) | ✅ [src/recommend_sql.py](src/recommend_sql.py) |
 | Deployed to Vercel | ✅ live, all endpoints verified |
 | Frontend v0 | ✅ [web/](web/) — questionnaire + results, ratings in localStorage |
+| Qwen3 embeddings over every summary | ✅ **10,864 / 11,453** vectors · ¥0.19 · 11m44s |
+| Local embedding cache (reproducibility) | ✅ [src/embed_cache.py](src/embed_cache.py) — the API is not per-request deterministic |
+| Questionnaire diversity (MMR, not k-means) | ✅ redundancy 0.4552 → 0.3781 · [scripts/build_clusters.py](scripts/build_clusters.py) |
+| Retaking the questionnaire | ✅ `?exclude=` — backend only, frontend not wired |
+| P1: fusing tag + embedding + staff/studio | ✅ [src/staffvec.py](src/staffvec.py) · `sparsevec(1933)` in 0.47 MB |
 
-Database **58 MB / 500 MB** on Neon's free tier · **20 tests** (13 scoring-parity, 7 API).
+Database **110 MB / 500 MB** on Neon's free tier (console figure — it counts
+retained history; `pg_database_size()` reports 86 MB) ·
+**28 tests** (18 scoring-parity, 10 API).
 
 ---
 
@@ -36,8 +44,8 @@ Database **58 MB / 500 MB** on Neon's free tier · **20 tests** (13 scoring-pari
 |---|---|---|
 | 1 | Data layer: dump → candidate set → load → tag cleaning | ✅ |
 | 2 | P0 scoring, questionnaire, sequel folding, API, pgvector, frontend v0, deploy | ✅ |
-| **3** | **Qwen3 embeddings · P1 fusing staff/studio · content clusters** | ⬜ next |
-| 4 | Moegirl corpus · HyDE · hybrid retrieval | ⬜ |
+| 3 | Qwen3 embeddings · P1 fusing staff/studio · questionnaire diversity | ✅ |
+| **4** | **Moegirl corpus · HyDE · hybrid retrieval** | ⬜ next |
 | **5** | **Offline evaluation — the point of the project** | ⬜ |
 | 6 | Information-gain question selection · accounts · quarterly sync | ⬜ |
 
@@ -45,11 +53,23 @@ Week 5 is the part that makes this a portfolio piece rather than a demo:
 leave-one-out on Bangumi's public collection data, NDCG@10 and P@10 against four
 baselines, and a cold-start curve over question count. It is not compressible.
 
-⚠️ **One thing is still unverified: the deployment config *with* the frontend.**
-The last verified deploy was API-only. Adding the frontend changed `vercel.json`
-to a build command plus an `/api/*`-only rewrite, and that combination has not
-run once. Watch the first build log — there is no `package.json` at the repo
-root, so if Vercel's install step trips over that, blank out the Install Command.
+Week 3 also settled the premise the project was pitched on. 142 titles had an
+all-zero tag vector — mostly Western animation and older Chinese productions,
+whose official genre tags are far sparser — so tag cosine could **never** retrieve
+them. Embeddings recovered **131 of them (92%)**, leaving 11. Concretely, the
+nearest neighbours of *Havoc in Heaven* went from modern web-novel adaptations
+(its only tags being `玄幻` + `小说改`) to *The Golden Monkey Defeats the Demon*,
+*Journey to the West*, and *Ginseng Fruit* — all Shanghai Animation Film Studio.
+That before/after pair is a reproducible case, not a lone NDCG number, which is
+what week 5 is meant to produce.
+
+⚠️ **Two things to know before week 4.** `httpx` currently lives in the `etl`
+dependency group, and `.vercelignore` drops `scripts/` — the moment `server/`
+imports [src/embed.py](src/embed.py) to encode a query, production raises
+`ModuleNotFoundError` while everything still works locally. And chunk loading
+must go in batches with a plain `VACUUM`, never `VACUUM FULL`: it rewrites the
+whole table, and on Neon that WAL counts against the storage quota — where going
+over suspends the project rather than billing for it.
 
 ---
 
@@ -118,6 +138,10 @@ The archive is ~410 MB compressed, ~1.8 GB extracted.
 uv sync --group etl                          # scripts/ need this group
 psql < sql/001_init.sql
 psql < sql/002_tag_vec.sql                   # don't skip: adds tag_vec / series_root
+psql < sql/003_vec_halfvec.sql               # vec: vector(1024) → halfvec(1024). Idempotent
+psql < sql/004_build_meta.sql                # don't skip: build_embeddings.py preflights on it
+psql < sql/005_mmr_rank.sql                  # diversity ordering for questionnaire items
+psql < sql/006_staff_vec.sql                 # staff/studio vector column for P1
 
 uv run python scripts/build_id_map.py        # network; downloads bangumi-data
 uv run python scripts/load_profiles.py
@@ -125,12 +149,18 @@ uv run python scripts/backfill_staff.py
 uv run python scripts/backfill_anilist.py    # network; ~125 requests
 uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py   # depends on the step above
+uv run python scripts/build_embeddings.py    # needs SILICONFLOW_API_KEY in .env
+                                             # ~12 min / ¥0.19 (instant on a cache hit)
+uv run python scripts/build_staff_vectors.py # staff_vec + data/interim/staff_vocab.json
+uv run --group ml python scripts/build_clusters.py   # mmr_rank + cluster_id; needs vec
 
 psql -c 'VACUUM FULL anime_profile'          # reclaim MVCC bloat from the bulk UPDATEs
-uv run pytest tests/ -q                      # acceptance: all 20 tests must pass
+uv run pytest tests/ -q                      # acceptance: all 28 tests must pass
 ```
 
 Every script is idempotent and safe to re-run. **The last two steps are not optional** — skipping `VACUUM FULL` inflates the database to roughly double its real size, and skipping the tests means nobody notices if `tag_vec` was never populated: scoring then returns an empty list *silently*. `GET /health` reports `with_tag_vec` for the same reason.
+
+`SILICONFLOW_API_KEY` is the one thing a fresh machine needs a human to go and get (see `.env.example`); `build_embeddings.py` fails fast without it, before spending anything. The embedding cache under `data/interim/embed_cache/` is not in git (~50 MB), so a new machine pays the ¥0.19 again — **but copying that directory over from an old machine makes the rebuild free and bit-identical**, which is the only way to get two machines to build the same library when the encoder is a remote API.
 
 ### 5. Run it
 
@@ -250,8 +280,8 @@ The second one is not redundant. It immediately caught a missing tie-break in th
 
 ## 当前进度
 
-**第 1–2 周全部完工并已上线** —— `animetion-recommender.vercel.app`，
-前端与 API 同一个 Vercel 项目、同源。下一步是第 3 周 embedding。
+**第 1–3 周全部完工并已上线** —— `animetion-recommender.vercel.app`，
+前端与 API 同一个 Vercel 项目、同源。下一步是第 4 周：萌娘百科语料 + HyDE + 混合检索。
 
 | 步骤 | 状态 |
 |---|---|
@@ -267,8 +297,14 @@ The second one is not redundant. It immediately caught a missing tie-break in th
 | 打分推进 Postgres（pgvector） | ✅ [src/recommend_sql.py](src/recommend_sql.py) |
 | 部署到 Vercel | ✅ 已上线，四个接口实测通过 |
 | 前端 v0 | ✅ [web/](web/) —— 问卷 + 推荐结果，评分存 localStorage |
+| Qwen3 embedding 全库编码 | ✅ **10,864 / 11,453** 条 · ¥0.19 · 11 分 44 秒 |
+| Embedding 本地缓存（可复现性） | ✅ [src/embed_cache.py](src/embed_cache.py) —— API 并非逐请求确定 |
+| 问卷选题多样化（MMR，非 k-means） | ✅ 冗余 0.4552 → 0.3781 · [scripts/build_clusters.py](scripts/build_clusters.py) |
+| 问卷多次作答 | ✅ `?exclude=` —— 后端就绪，前端未接 |
+| P1：tag + embedding + staff/studio 三路融合 | ✅ [src/staffvec.py](src/staffvec.py) · `sparsevec(1933)` 仅占 0.47 MB |
 
-Neon 免费层占用 **58 MB / 500 MB** · 测试 **20 项**（13 项打分一致性 + 7 项接口）。
+Neon 免费层占用 **110 MB / 500 MB**（控制台口径，含保留的历史；
+`pg_database_size()` 报 86 MB）· 测试 **28 项**（18 项打分一致性 + 10 项接口）。
 
 ## 路线图
 
@@ -276,18 +312,29 @@ Neon 免费层占用 **58 MB / 500 MB** · 测试 **20 项**（13 项打分一�
 |---|---|---|
 | 1 | 数据层：dump → 候选集 → 灌库 → tag 清洗 | ✅ |
 | 2 | P0 打分、问卷、续作折叠、API、pgvector、前端 v0、部署 | ✅ |
-| **3** | **Qwen3 embedding · P1 融合 staff/studio · 内容簇** | ⬜ 下一步 |
-| 4 | 萌娘百科语料 · HyDE · 混合检索 | ⬜ |
+| 3 | Qwen3 embedding · P1 融合 staff/studio · 问卷选题多样化 | ✅ |
+| **4** | **萌娘百科语料 · HyDE · 混合检索** | ⬜ 下一步 |
 | **5** | **离线评测 —— 这个项目的核心** | ⬜ |
 | 6 | 信息增益选题 · 账号系统 · 季度同步 | ⬜ |
 
 第 5 周是让这个项目区别于 demo 的部分：Bangumi 公开收藏数据上做 leave-one-out、
 四条 baseline 的 NDCG@10 与 P@10、以及按题目数展开的冷启动曲线。**不可压缩。**
 
-⚠️ **有一件事仍未实测：带前端的部署配置。** 上次验证过的是纯 API 部署。
-加前端后 `vercel.json` 换成了 buildCommand + 只转发 `/api/*`，这套组合还没跑过。
-首次部署盯着构建日志 —— 仓库根目录没有 `package.json`，
-若 Vercel 的 install 阶段因此报错，把面板里的 Install Command 清空。
+第 3 周还顺带验证了立项时的那个假设。有 142 部作品的 tag 向量**全为零** ——
+以欧美动画和国产老动画为主，官方题材标签对非日本作品明显更稀疏 ——
+它们在 tag 余弦下**永远无法被召回**。embedding 救回了其中 **131 部（92%）**，
+只剩 11 部。具体到一个案例：《大闹天宫》的最近邻从《修罗武神》《长生界》
+这类现代网文改（它的 tag 只有 `玄幻` + `小说改`），变成了
+《金猴降妖》(0.79)、《西游记》(0.78)、《人参果》(0.73) —— 全是上美影的西游题材。
+这种可复现的前后对照，比一个孤立的 NDCG 数字更能说明问题，
+而这正是第 5 周要产出的东西。
+
+⚠️ **第 4 周动手前有两件事要知道。** 一是 `httpx` 目前只在 `etl` 依赖组，
+而 `.vercelignore` 排掉了 `scripts/` —— `server/` 一旦 import
+[src/embed.py](src/embed.py) 去编码查询，线上就是 `ModuleNotFoundError`，
+**而本地一切正常**。二是灌 chunk 必须分批 + 每批后跑普通 `VACUUM`，
+**绝不能用 `VACUUM FULL`**：它重写整张表，而在 Neon 上这些 WAL 会计入存储配额，
+**超限是挂起项目而不是计费**。
 
 ## 技术栈
 
@@ -346,6 +393,10 @@ python -c "import zipfile; zipfile.ZipFile('data/raw/dump.zip').extractall('data
 uv sync --group etl                          # scripts/ 要这一组
 psql < sql/001_init.sql
 psql < sql/002_tag_vec.sql                   # 别漏：加 tag_vec / series_root 两列
+psql < sql/003_vec_halfvec.sql               # vec: vector(1024) → halfvec(1024)，幂等
+psql < sql/004_build_meta.sql                # 别漏：build_embeddings.py 会前置检查它
+psql < sql/005_mmr_rank.sql                  # 问卷选题的多样性排序列
+psql < sql/006_staff_vec.sql                 # P1 的 staff/studio 向量列
 
 uv run python scripts/build_id_map.py        # 需要联网，会下 bangumi-data
 uv run python scripts/load_profiles.py
@@ -353,12 +404,18 @@ uv run python scripts/backfill_staff.py
 uv run python scripts/backfill_anilist.py    # 需要联网，约 125 次请求
 uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py   # 依赖上一步
+uv run python scripts/build_embeddings.py    # 需要 .env 里的 SILICONFLOW_API_KEY
+                                             # 约 12 分钟 / ¥0.19（缓存命中则秒完成）
+uv run python scripts/build_staff_vectors.py # staff_vec + data/interim/staff_vocab.json
+uv run --group ml python scripts/build_clusters.py   # mmr_rank + cluster_id，依赖 vec
 
 psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
-uv run pytest tests/ -q                      # 验收：20 项测试应全绿
+uv run pytest tests/ -q                      # 验收：28 项测试应全绿
 ```
 
 脚本都幂等，可重复执行。**最后两步不是可选的** —— 跳过 VACUUM 会让库虚涨一倍；跳过 pytest 就没人发现 `tag_vec` 是否漏跑，而它没跑的话打分**静默返回空列表**，不报错。`GET /health` 的 `with_tag_vec` 字段也是为此存在。
+
+⚠️ **`SILICONFLOW_API_KEY` 是新机器唯一需要人工去申请的东西**（见 `.env.example`），没有它 `build_embeddings.py` 会在花钱之前就报错退出。`data/interim/embed_cache/` 不入 git（约 50 MB），所以换机器要重新花 ¥0.19；**但如果手上有旧机器的缓存文件，拷过去就是零成本重建且 bit-identical** —— 编码器是远程 API 时，这是唯一能保证两台机器建出同一个库的办法。
 
 ### 5. 跑起来
 
