@@ -17,22 +17,40 @@
 跑法：
     uv run --group etl python scripts/build_embeddings.py --limit 50   # 先小样本
     uv run --group etl python scripts/build_embeddings.py              # 再全量
+    uv run --group etl python scripts/build_embeddings.py -c 12        # 想更快
     psql -c 'VACUUM FULL anime_profile'                                # ⚠️ 别漏
 
-⚠️ **先跑 --limit 50 看一遍**（第 15 节原则 5）。全量约 2 分钟 / ¥0.14，
+⚠️ **先跑 --limit 50 看一遍**（第 15 节原则 5）。全量 ¥0.14，
    不贵，但字段理解错了的话小样本几秒就能发现。
 
-成本与耗时（A.7 实测）：11,453 部里非空 summary 约 10,864 条 ≈ 200 万 token
-≈ ¥0.14 ≈ 2 分钟（TPM=1,000,000 是唯一瓶颈，RPM=2,000 不是）。
+成本与耗时：11,453 部里非空 summary 约 10,864 条 ≈ 200 万 token ≈ ¥0.14。
+
+⚠️ **瓶颈换过两次，别照抄旧数字：**
+
+     串行时代（~2026-08-14）  批数 × 单批往返   340 批 × 2.2s = 11 分 44 秒（实测）
+     并发之后（2026-08-15）   TokenBudget       2.81M 估算 token ÷ 800k/min ≈ 3.5 分钟
+
+   A.7 按 TPM 估的「2 分钟」当时是错的（那时串行，真实 11 分 44 秒）；
+   加了 8 路并发之后请求延迟不再是瓶颈（实测 1.44 → 0.29 s/批，**提速 4.9×**），
+   于是 TPM 预算重新成为约束 —— 这次它才是对的。
+
+⚠️ **所以再加路数没用**：8 路已经够把延迟压到预算线以下，
+   再多只是更早撞上 TokenBudget 然后干等。要更快得先动 TOKENS_PER_MIN，
+   而那是限流条款不是我们能调的。
+⚠️ 成本一分不变 —— 并发只是把等待重叠，token 总量不受影响。
+
 ⚠️ 重跑时命中缓存的部分不花钱也不花时间。
 """
 
 from __future__ import annotations
 
 import argparse
+import random
 import sys
+import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -52,25 +70,65 @@ TOKENS_PER_MIN = 800_000
 # 高估只会多等一会儿，低估会撞限流 —— 不对称，所以往高了估。
 TOKENS_PER_CHAR = 1.0
 
+# 并发路数。⚠️ **并发在这里几乎是免费的**：RPM 2,000（≈33 req/s）离用满差两个
+# 数量级，而 TPM 由 TokenBudget 管着 —— 并发只是把等待重叠，总 token 不变，不更贵。
+#
+# 2026-08-15 实测（256 条 / 8 批，临时缓存）：
+#     1 路   11.5s   1.44 s/批
+#     8 路    2.3s   0.29 s/批     → 4.9×
+#
+# ⚠️ **默认 8 不是随便取的：再往上加基本没有收益。** 8 路已经把请求延迟压到
+#    TokenBudget 的放行速度以下，瓶颈已经从「等 API 返回」换成「等预算」，
+#    加到 16 只是更早撞预算然后干等。
+DEFAULT_CONCURRENCY = 8
+
+# ⚠️ 上限不是性能考虑，是**别把公共服务当压测目标**。
+MAX_CONCURRENCY = 16
+
+# ⚠️ 非 TTY（重定向到日志文件）时必须压低刷新频率 —— 与 scripts/fetch_moegirl.py
+#    同一条理由（CLAUDE.md E.7c）：tqdm 在非 TTY 下每次刷新都**追加**一段输出，
+#    而 set_postfix_str 每次调用都触发刷新，几百批能刷出几千行。
+TTY = sys.stderr.isatty()
+BAR_INTERVAL = 0.5 if TTY else 30.0
+
+
+def make_bar(total: int, desc: str, unit: str) -> tqdm:
+    return tqdm(total=total, desc=desc, unit=unit, ascii=True, ncols=78,
+                mininterval=BAR_INTERVAL)
+
 
 class TokenBudget:
-    """按 token 的滑动窗口节流。"""
+    """按 token 的滑动窗口节流。**线程安全** —— 所有并发路共用同一份预算。
+
+    ⚠️ 共用是必须的：每路各持一份 TOKENS_PER_MIN 的预算，8 路就是 8 倍超发，
+       等于没有节流。
+    """
 
     def __init__(self, per_min: int = TOKENS_PER_MIN) -> None:
         self.per_min = per_min
         self.window: deque[tuple[float, int]] = deque()
+        self._lock = threading.Lock()
 
     def take(self, tokens: int) -> None:
-        now = time.monotonic()
-        while self.window and now - self.window[0][0] > 60.0:
-            self.window.popleft()
-        used = sum(t for _, t in self.window)
-        if used + tokens > self.per_min and self.window:
-            sleep = 60.0 - (now - self.window[0][0])
-            if sleep > 0:
-                time.sleep(sleep)
-            return self.take(tokens)
-        self.window.append((now, tokens))
+        """预约 tokens 的额度，不够就等到够为止。
+
+        ⚠️ **绝不能持锁 sleep。** 那会让所有线程排在锁上等，整个池退化成串行
+           —— 表现是「加了并发但一点没变快」，而且不报任何错。
+           锁只保护 window 的读改写，睡在锁外面。
+        """
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self.window and now - self.window[0][0] > 60.0:
+                    self.window.popleft()
+                used = sum(t for _, t in self.window)
+                if not self.window or used + tokens <= self.per_min:
+                    self.window.append((now, tokens))
+                    return
+                sleep = 60.0 - (now - self.window[0][0])
+            # ⚠️ jitter：不加的话所有线程会在同一时刻醒来抢同一份额度，
+            #    形成同步的惊群 —— 一个抢到，其余全部空转再睡，反复如此。
+            time.sleep(max(sleep, 0.0) + random.uniform(0, 0.25))
 
 
 def fetch_rows(conn, limit: int | None) -> list[tuple[int, str]]:
@@ -93,7 +151,64 @@ def fetch_rows(conn, limit: int | None) -> list[tuple[int, str]]:
         return cur.fetchall()
 
 
-def resolve_vectors(rows: list[tuple[int, str]]) -> dict[int, np.ndarray]:
+def run_batches(cache, hit: dict[str, np.ndarray],
+                batches: list[list[str]], concurrency: int) -> None:
+    """并发请求 API，结果就地写进 cache 和 hit。
+
+    ⚠️ **SQLite 的写入全部发生在主线程** —— 工作线程只负责发请求、返回向量，
+       落盘由主线程在消费 future 时做。串行化因此是**构造上的**，不靠锁：
+       sqlite3 的连接默认 check_same_thread=True，跨线程用会直接抛异常；
+       就算关掉那个开关，多线程并发 commit 也会撞 `database is locked`。
+
+    ⚠️ **并发不改变批次组成，只改变发出顺序。** batches 是对排好序的 miss
+       固定切片得到的，与路数无关；而缓存键是「模型+维度+文本」，跟批次无关。
+       ⇒ 换个并发数重跑，缓存命中情况完全一致，可复现性不受影响。
+    """
+    key = embed.api_key()
+    budget = TokenBudget()
+    stop = threading.Event()
+
+    def work(batch: list[str]) -> np.ndarray | None:
+        # ⚠️ 两处都要查 stop：等预算可能一等就是几十秒，
+        #    期间别的线程可能已经因额度耗尽喊停了。
+        if stop.is_set():
+            return None
+        budget.take(int(sum(len(t) for t in batch) * TOKENS_PER_CHAR))
+        if stop.is_set():
+            return None
+        return embed.embed_documents(batch, key)
+
+    bar = make_bar(len(batches), f"请求 API ×{concurrency}", "批")
+    done = 0
+    pool = ThreadPoolExecutor(max_workers=concurrency)
+    futures = {pool.submit(work, b): b for b in batches}
+    try:
+        for fut in as_completed(futures):
+            batch = futures[fut]
+            vecs = fut.result()          # 工作线程里的异常在这里重新抛出
+            if vecs is None:             # 被 stop 掐掉的
+                continue
+            # ⚠️ 每批立刻落缓存并提交 —— 续传的粒度就是提交的粒度。
+            #    攒到最后一次性写，中途挂掉就等于没跑。
+            embed_cache.put_many(cache, list(zip(batch, vecs, strict=True)))
+            hit.update(dict(zip(batch, vecs, strict=True)))
+            done += len(batch)
+            bar.update(1)
+            bar.set_postfix_str(f"{done:,} 条", refresh=False)
+    except BaseException:
+        # ⚠️ QuotaExhausted 或 Ctrl-C：**立刻停发**，不要让排队中的几百批继续打。
+        #    cancel_futures 清掉还没开跑的，stop 让已出队的空转返回。
+        stop.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        bar.close()
+        pool.shutdown(wait=True)
+        embed.close_client()             # 长耗时阶段结束，放掉连接池
+
+
+def resolve_vectors(rows: list[tuple[int, str]],
+                    concurrency: int = DEFAULT_CONCURRENCY) -> dict[int, np.ndarray]:
     """按 subject_id 拿到向量：先查缓存，未命中的才请求 API。"""
     # ⚠️ 先按文本去重再请求 —— 缓存是按文本键的，同一段文本请求两次是白花钱。
     uniq = sorted({text for _, text in rows})
@@ -108,18 +223,11 @@ def resolve_vectors(rows: list[tuple[int, str]]) -> dict[int, np.ndarray]:
 
         if miss:
             est_tokens = int(sum(len(t) for t in miss) * TOKENS_PER_CHAR)
-            print(f"预计 ≈ {est_tokens:,} token ≈ ¥{est_tokens / 1e6 * 0.07:.3f}")
-
-            key = embed.api_key()
-            budget = TokenBudget()
-            for i in tqdm(range(0, len(miss), embed.MAX_BATCH), desc="请求 API"):
-                batch = miss[i:i + embed.MAX_BATCH]
-                budget.take(int(sum(len(t) for t in batch) * TOKENS_PER_CHAR))
-                vecs = embed.embed_documents(batch, key)
-                # ⚠️ 每批立刻落缓存并提交 —— 续传的粒度就是提交的粒度。
-                #    攒到最后一次性写，中途挂掉就等于没跑。
-                embed_cache.put_many(cache, list(zip(batch, vecs, strict=True)))
-                hit.update(dict(zip(batch, vecs, strict=True)))
+            batches = [miss[i:i + embed.MAX_BATCH]
+                       for i in range(0, len(miss), embed.MAX_BATCH)]
+            print(f"预计 ≈ {est_tokens:,} token ≈ ¥{est_tokens / 1e6 * 0.07:.3f}"
+                  f"，{len(batches)} 批 / {concurrency} 路并发")
+            run_batches(cache, hit, batches, concurrency)
     finally:
         cache.close()
 
@@ -179,7 +287,14 @@ def record_meta(conn, rows: int) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--limit", type=int, help="只处理前 N 部（小样本试跑）")
+    ap.add_argument("-c", "--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                    help=f"并发路数（1–{MAX_CONCURRENCY}，默认 {DEFAULT_CONCURRENCY}）")
     args = ap.parse_args()
+
+    if not 1 <= args.concurrency <= MAX_CONCURRENCY:
+        print(f"✗ --concurrency 应在 1–{MAX_CONCURRENCY} 之间，收到 {args.concurrency}",
+              file=sys.stderr)
+        return 1
 
     # ⚠️ **三段式：读 → 请求 API → 写，每段各开各的连接。**
     #    2026-08-14 实测教训：原先是「开一个连接从头用到尾」，结果 API 阶段
@@ -219,7 +334,18 @@ def main() -> int:
         return 1
 
     # ── 第 2 段：请求 API（耗时最长，期间**不持有** DB 连接）──────
-    vectors = resolve_vectors(rows)
+    try:
+        vectors = resolve_vectors(rows, args.concurrency)
+    except embed.QuotaExhausted as e:
+        # ⚠️ 额度耗尽/鉴权失败不是「重试一下」能解决的（A.8），直接停。
+        #    已经编码好的都已逐批落进缓存 —— 补上额度后重跑是零成本续传。
+        print(f"\n✗ {e}", file=sys.stderr)
+        print("  已编码的部分都在缓存里，补额度后重跑即可续传（命中的不重新花钱）",
+              file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n已中断。编码好的批次都已落缓存，重跑从断点继续。", file=sys.stderr)
+        return 130
 
     # ── 第 3 段：重新连库写入 ───────────────────────────────────
     with db.connect() as conn:

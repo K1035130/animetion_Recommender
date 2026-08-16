@@ -29,6 +29,7 @@ import hashlib
 import json
 import os
 import random
+import threading
 import time
 
 import httpx
@@ -74,6 +75,42 @@ MAX_BATCH = 32
 # 无上限重试会变成永久空转（A.8：额度耗尽是停止条件，不是重试条件）。
 MAX_RETRIES = 5
 TIMEOUT = 60.0
+
+
+# ============================================================
+# 共享连接池
+# ============================================================
+# ⚠️ **不要用 httpx.post() 这个便捷函数发请求。** 它每次调用都新建一个
+#    Client、握一次 TLS、然后立刻丢掉。串行时只是浪费；**并发时是主要开销** ——
+#    第 4 周 chunk 阶段是 8–16 路并发，跨国链路上 TLS 握手与请求本身同量级。
+#
+# httpx.Client 本身是线程安全的，连接池在多线程间复用正是它的设计意图。
+# ⚠️ **惰性创建，不在模块级直接构造** —— 本模块会被 server/ import，
+#    而线上是 serverless：import 时就建连接池等于给每次冷启动加一笔开销，
+#    而那条路径（编码单条查询）根本用不上池化。
+_client: httpx.Client | None = None
+_client_lock = threading.Lock()
+
+
+def _get_client() -> httpx.Client:
+    global _client
+    with _client_lock:
+        if _client is None:
+            _client = httpx.Client(
+                timeout=TIMEOUT,
+                # 上限给得比实际并发宽 —— 它只是防失控的护栏，不是调优参数。
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=32),
+            )
+        return _client
+
+
+def close_client() -> None:
+    """释放连接池。长耗时的离线阶段结束后调用；线上常驻不必调。"""
+    global _client
+    with _client_lock:
+        if _client is not None:
+            _client.close()
+            _client = None
 
 
 class EmbedError(RuntimeError):
@@ -130,11 +167,10 @@ def _post(texts: list[str], key: str) -> np.ndarray:
        硅基流动「额度耗尽」具体返回哪个码未实测确认，但只要它是 4xx，
        这条默认规则就会正确地停下来而不是空转。
     """
-    r = httpx.post(
+    r = _get_client().post(
         BASE_URL,
         json={"model": MODEL, "input": texts, "encoding_format": "float"},
         headers={"Authorization": f"Bearer {key}"},
-        timeout=TIMEOUT,
     )
 
     if r.status_code == 200:
@@ -175,6 +211,10 @@ def embed_documents(texts: list[str], key: str | None = None) -> np.ndarray:
 
     返回 (n, DIM) 的 float32。⚠️ 返回原值不降精度 —— 缓存要存 fp32（A.9），
     转 fp16 是写库那一步的事。
+
+    ⚠️ **可并发调用**（共享 Client 是线程安全的），但**节流是调用方的事** ——
+       本函数不认识 TPM，8 路一起打进来它照发不误。
+       按 token 的滑动窗口在 scripts/build_embeddings.py 的 TokenBudget 里。
     """
     if not texts:
         return np.empty((0, DIM), dtype=np.float32)
