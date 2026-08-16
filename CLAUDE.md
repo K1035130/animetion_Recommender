@@ -33,16 +33,16 @@
 
 # 第一部分 · 现状与下一步
 
-## 📍 当前进度（更新于 2026-08-15）
+## 📍 当前进度（更新于 2026-08-16）
 
-**第 1–3 周全部完工。下一步是第 4 周：萌娘百科语料 + HyDE + 混合检索。**
+**语料层已完工并入库。下一步是角色语料（阶段 03）或直接做检索层（阶段 05）。**
 
 第 3 周产出：Qwen3-Embedding 建库（10,864 部）· 问卷选题改 MMR 多样性序 ·
 问卷支持多次作答 · P1 三路融合（tag + embedding + staff/studio）。
 
 `animetion-recommender.vercel.app` —— 前端 + API 同一个 Vercel 项目、同源。
-库占用 **110 MB / 500 MB**（Neon 控制台口径；`pg_database_size()` 报 86 MB，
-差值是保留的历史，见第 5 节）。
+库占用 **274 MB**（`pg_database_size()`；Neon 控制台口径更高，见第 5 节）。
+`plot_chunk` **20,127 条** · 覆盖系列根 2,510 个。
 测试 **28 项**（18 项打分一致性 + 10 项接口）。
 
 | 周 | 内容 | 状态 |
@@ -50,9 +50,27 @@
 | 1 | 数据层：dump → 候选集 → 灌库 → tag 清洗 | ✅ |
 | 2 | P0 推荐 + 选题 + 续作折叠 + API + pgvector + 前端 v0 + 部署 | ✅ |
 | 3 | Embedding 建库 ✅ · 问卷选题多样化(MMR) ✅ · P1 融合 staff/studio ✅ | ✅ |
-| **4** | 萌娘百科语料 ✅ · **HyDE + 混合检索** | 🔄 **← 语料已就位，下一步 sql/007** |
+| **4** | 萌娘语料 ✅ · **建表+灌库 ✅** · 标题补救 ✅ · **HyDE + 混合检索 ⬜** | 🔄 **← 下一步在这** |
 | **5** | **离线评测（核心卖点，不可压缩）** | ⬜ |
 | 6 | 信息增益选题 + 账号系统 + 季度同步 | ⬜ |
+
+### 2026-08-16 这一天做完的（详见 F 节）
+
+```
+阶段 01  sql/007 建三张表（正文进库 · 不建 HNSW · halfvec(1024)）
+阶段 02  灌 19,526 chunk  ≤¥0.28
+阶段 04a 标题补救 → +601 chunk、+229 条映射
+         覆盖作品 36.1% → 40.7% · 热度加权 78.8% → 83.3%
+前置     embedding 并发 8 路，实测 1.44 → 0.29 s/批（4.9×）
+```
+
+⬜ **下一步二选一：**
+- **阶段 03**：灌 dump 的 66,871 条角色简介（¥0.46，**零抓取**），
+  顺手填 `alias` 空了三周的角色行 —— 性价比最高的一步
+- **阶段 05**：HyDE + 混合检索（第 4 周主线的剩余部分）
+
+📌 **完整的六阶段计划（含实测数字、DDL、检索层设计）**在
+[docs 之外的一份 artifact](https://claude.ai/code/artifact/a69a6f1a-22b3-40c6-b3e2-6a01bdb7bf3a)。
 
 ✅ **带前端的部署配置已实测通过（2026-08-15）** —— 此前这里挂着「唯一未经实测的
 环节」，现已消除。`buildCommand` + `outputDirectory` + 只转发 `/api/*` 这套组合
@@ -1112,6 +1130,8 @@ DB 往返已经便宜到可以忽略。
 | [scripts/build_tag_vectors.py](scripts/build_tag_vectors.py) | `tag_vec` / `series_root` 两列。⚠️ 改过词表/tag_rules/tagvec 后**必须重跑**，否则打分读到旧向量 |
 | [scripts/fetch_moegirl.py](scripts/fetch_moegirl.py) | 抓萌娘百科 → `data/raw/moegirl/*.html.gz`（**只抓不解析**）。幂等、可断点续跑。⚠️ 7 秒/请求，全量约 3.9 小时，见 E.1 |
 | [scripts/parse_moegirl.py](scripts/parse_moegirl.py) | 解析上一步的 HTML → `data/interim/moegirl_chunks.jsonl`。**不写数据库** —— 切分粒度要由它的实际产出来定，见 E.4 |
+| [scripts/build_plot_chunks.py](scripts/build_plot_chunks.py) | `moegirl_page` / `plot_chunk` / `plot_chunk_scope` 三张表 + `build_meta['plot_chunk']`。幂等，靠 md5 比对跳过未变化的行（F.4 ①） |
+| [scripts/rescue_moegirl_titles.py](scripts/rescue_moegirl_titles.py) | 补救标题解析漏掉的系列。⚠️ **三步走**：解析（联网）→ 人工过一眼 → `--from-file --apply-b` 应用。中间那步不能省，见 F.3 |
 
 前三者都幂等，可任意顺序重跑。已实测：重跑不改行数、不洗掉别的脚本填的列。
 
@@ -1137,6 +1157,21 @@ uv run python scripts/build_embeddings.py    # ⚠️ 需要 .env 的 SILICONFLO
 uv run python scripts/build_staff_vectors.py # staff_vec + data/interim/staff_vocab.json
 uv run --group ml python scripts/build_clusters.py   # mmr_rank + cluster_id，依赖 vec
 psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
+
+# ── 第 4 周语料层 ──────────────────────────────────────────
+psql < sql/007_plot_chunk.sql                # plot_chunk 三张表
+uv run --group etl python scripts/fetch_moegirl.py    # ⚠️ 约 4 小时（7 秒/请求，别调低）
+uv run --group etl python scripts/parse_moegirl.py    # 纯本地
+uv run --group etl python scripts/build_plot_chunks.py  # ≈5 分钟 / ¥0.28
+#   ⚠️ 换机器后 moegirl_titles.json 不入 git，标题解析会重跑，
+#      而 rescue 的三条候选规则不在 fetch_moegirl 里 —— 见 F.5
+uv run --group etl python scripts/rescue_moegirl_titles.py              # 解析，只报告
+uv run --group etl python scripts/rescue_moegirl_titles.py --merge-titles
+uv run --group etl python scripts/fetch_moegirl.py --reuse-titles       # 只抓新条目
+uv run --group etl python scripts/parse_moegirl.py
+uv run --group etl python scripts/build_plot_chunks.py
+uv run --group etl python scripts/rescue_moegirl_titles.py --from-file --apply-b
+
 uv run pytest tests/ -q                      # 验收：28 项测试应全绿
 ```
 
@@ -1427,6 +1462,117 @@ bar.write(...)                            # 失败信息用它，print 会冲散
 ⇒ **不能靠"读起来通不通顺"判断解析对错。** 同类的还有：
 「太短」阈值把开篇最重要的那句摘要（76 字）删了 ——
 **短不等于没用，没用的是碎片**，所以改成「一节只有这一条时放宽下限到 40 字」。
+
+---
+
+## F. plot_chunk 语料层（2026-08-16 完工）
+
+> 三张表 + 20,127 条 chunk 已入库。本节记**推翻了原设计的三处**、
+> 实测数字、以及这一天抓到的四个 bug。
+> 📌 建表的完整注释在 [sql/007_plot_chunk.sql](sql/007_plot_chunk.sql)，那里是唯一事实来源。
+
+### F.1 三处推翻原设计，理由都是实测
+
+| 决定 | 推翻了 | 依据 |
+|---|---|---|
+| **正文进 Neon**，不走 R2 | 「正文不进 Neon，只存 content_ref」 | 正文实测仅 **10.5 MB**（原计划 10 万 chunk，实际 19,526）。且 **BM25 那条腿需要正文在 Postgres**，tsvector 本身就 17 MB，只灌 tsvector 省不下什么 |
+| **不建 HNSW** | 「halfvec(512) + HNSW」 | 限定单系列只扫 **7 条（0.1 ms）**；最坏的跨作品全表暴力实测外推 **77 ms**，在必然含 LLM 调用的请求里是噪声。省 28–56 MB，且近似检索会漏召回。⚠️ 可逆：一条 CREATE INDEX |
+| **halfvec(1024)** 而非 512 | 第 5 节的维度表 | 512 的理由是「chunk 层放不下」，前提没了。⚠️ 决定性理由不是存储而是**少一步变换**：512 要在每次查询时客户端截断+重新归一化，且必须与建库逐位一致 —— 与 jieba 词典漂移同族的静默风险 |
+
+⚠️ **`plot_chunk_scope` 的键是 `chunk_id` 不是 `pageid`。** 原设计按 pageid 只要
+2,281 行、很省，但**覆盖不了 dump 角色简介**（那批没有 pageid）。按 chunk 建映射
+实测同量级（≈22,946 行 / 几 MB），却让所有来源共用一条 JOIN。
+
+### F.2 实测数字
+
+```
+灌库        19,526 → 20,127 chunk · 2,301 页 · 正文 404 万字
+存储        库 274 MB · plot_chunk 185 MB（heap 42 + TOAST 121 + 索引 15）
+检索        限定系列 0.175 ms，走 scope 的 PK 索引 + chunk 主键，无顺序扫描
+覆盖        作品 40.7% · 按热度加权 83.3%
+成本        ≤¥0.28 + ¥0.009（增量）
+```
+
+⚠️ **`halfvec(1024)` 是 2,048 字节，超过 2 KB 的 TOAST 阈值，整列存到行外。**
+所以 `pg_relation_size` 看不到向量，要用 `pg_total_relation_size` —— 一度以为
+"向量 40 MB 的估算错了"，其实只是没算 TOAST。
+
+### F.3 标题补救（阶段 04a）：一个 `☆` 引出的整条线
+
+触发案例：**《银河特急 银河☆地铁》热度排名第 844**（远在抓取范围内）却零语料。
+九个候选写法只有一个存在：
+
+```
+✗ 银河特急 银河☆地铁     ← Bangumi name_cn（当初拿它去查的）
+✅ 银河特急 银河地铁       ← 萌娘实际标题
+```
+
+⇒ [scripts/rescue_moegirl_titles.py](scripts/rescue_moegirl_titles.py)：补三条候选生成规则，
+重解析 → 229 条映射 → B 类 159 条零抓取建映射 + 69 个新条目抓回来。
+
+**四条规则,每条都是被实测逼出来的:**
+
+| 规则 | 起因 |
+|---|---|
+| 全角/半角标点归一 | `Re：从零开始…` 的正确写法是半角冒号，**而该页早就抓下来了**（pageid 137706）—— 截断是绕路 |
+| 括号内容提取 | `IS〈无限斯特拉托斯〉` → 《无限斯特拉托斯》，比截出「IS」可靠 |
+| **比例守卫 ≥30%** | 「Re」只占原标题 10% → 拦下；「约会大作战 赤黑新章」占 77% → 放行 |
+| 守卫**只管截断** | 前缀/后缀剥离本来就精确，不受影响 |
+
+⚠️ **拦下的那条如果放过去会怎样**：`Re：从零开始的异世界生活` 在 `：` 处截断成
+「Re」，而萌娘的「Re」条目**重定向到《哲学》**。三个系列会拿哲学条目回答问题，
+**不报错、看起来完全正常** —— A.8 说的那类故障。
+⇒ **纪律：解析与应用必须分成两步，中间人工过一眼。** `--from-file` 模式就是为此。
+
+⚠️ **两个判据我试过并废弃了，别再捡回来：**
+- **「结果 ≥4 字」** —— 把 `幸运星 OVA → 幸运星` 一起杀了。**中文三字标题极常见**
+  （幸运星/航海王/咲日和）。长度是错的判据，比例才是。
+- **「匹配到的标题与原名的字符重合度」** —— 它把 16 条**正确**映射标成可疑：
+  `IS→无限斯特拉托斯` `晨曦公主→拂晓的尤娜` `NEKOPARA→猫娘乐园` 重合度全是 0.00。
+  **重合度低恰恰说明萌娘用了不同译名，那正是重定向在正确工作。**
+
+### F.4 这一天抓到的四个 bug
+
+**① 全表 upsert 的浪费**（实测发现，非预防性）
+
+```
+只新增 601 条，却 UPDATE 了 19,767 行
+heap 21→42 MB · TOAST 60→121 MB   翻倍
+```
+每次 UPDATE 重写整行，连带重写行外的 halfvec。已加 md5 比对跳过，**重跑现在写 0 条**。
+⚠️ 阶段 03 是 66,871 行，同样的浪费会大三倍。
+
+**② `build_meta` 记成 `rows: 0`** —— 加跳过逻辑后 `write_chunks` 返回的是
+「本次写了几条」。**不报错，只是指纹行显示 rows=0，看着像没灌成功而库里是满的。**
+与 E.7c 那条「统计输出把条目总数写死」同族。
+
+**③ 剧透门控确定会漏** —— 见第四部分的待办条目。已接受，前端加提醒。
+
+**④ 表格判据误杀长剧情框** —— 判据 `单元格≤4 AND 均≥60字` 的 AND 条件把
+「行多列少」的剧情框判成数据表。吉尔伽美什页的〈第七特异点〉10 格 / 4,070 字 /
+均 407 字被丢。系列页影响 **≈0.9%**，**角色页影响大得多**（812 KB 只出 38 chunk）。
+⚠️ 试过的修法「改判列数≤2」**已被测量否决**：救回的全是导航模板，散文占比 1%。
+要用句号密度做正面判据，需单独一轮测量。⬜ **阶段 06（抓角色页）之前必须解决。**
+
+### F.5 ⚠️ 换机器时的陷阱
+
+`data/interim/moegirl_titles.json` **不入 git**，而它现在含了 rescue 补进去的
+70 条映射。换机器重跑 `fetch_moegirl.py` 会重新解析标题，而
+**新的三条候选规则在 `rescue_moegirl_titles.py` 里，不在 `fetch_moegirl.py` 里** ——
+不会自动带上。
+⇒ 要么把规则并进 `fetch_moegirl.py` 的 `load_candidates()`，要么记住换机器后
+补跑一次 rescue。**这是「不入 git 的文件参与链路」那个老问题的新变种。**
+
+### F.6 礼貌速率的账
+
+```
+标题解析   50 个/请求 × 7 秒间隔，全程串行无并发
+抓取       7 秒间隔 + 服务端 ~2 秒 = 实测 8.99 秒/页
+UA         animetion-recommender/0.1 (+github 链接; 项目说明; 联系邮箱)
+```
+
+⚠️ **别把 embedding 的 8 路并发和萌娘搞混** —— 那是打硅基流动的付费 API
+（RPM 上限 2,000），萌娘这边从头到尾单线程。
 
 ---
 
