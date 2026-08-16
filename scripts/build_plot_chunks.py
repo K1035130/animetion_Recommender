@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -174,7 +175,34 @@ def write_pages(conn, pages) -> None:
     print(f"moegirl_page：{len(pages)} 页")
 
 
+def existing_digests(conn) -> dict[tuple[int, int], str]:
+    """库里已有 chunk 的 (pageid, chunk_no) → md5(text)。
+
+    ⚠️ **用来跳过没变的行，这不是可选优化。** 2026-08-16 实测教训：
+       增量灌库只新增了 601 条，脚本却把全部 20,127 行都 upsert 了一遍
+       （n_tup_upd = 19,767），结果 heap 21→42 MB、TOAST 60→121 MB **翻倍** ——
+       因为每次 UPDATE 都重写整行，连带重写行外的 halfvec（2 KB，全在 TOAST 里）。
+       空间经 VACUUM 后可复用、不会无限涨，但那是白烧 Neon 的存储与 WAL。
+       ⚠️ 阶段 03 是 66,871 行，同样的浪费会大三倍。
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT pageid, chunk_no, md5(text) FROM plot_chunk
+             WHERE source = 'moegirl' AND vec IS NOT NULL AND search_tsv IS NOT NULL
+        """)
+        return {(r[0], r[1]): r[2] for r in cur.fetchall()}
+
+
 def write_chunks(conn, chunks, vectors: dict[str, np.ndarray]) -> int:
+    have = existing_digests(conn)
+    todo = [r for r in chunks
+            if have.get((r["pageid"], r["chunk_no"]))
+            != hashlib.md5(r["text"].encode("utf-8")).hexdigest()]
+    skipped = len(chunks) - len(todo)
+    if skipped:
+        print(f"跳过 {skipped:,} 条未变化的（只写 {len(todo):,} 条）")
+    chunks = todo
+
     missing = 0
     bar = make_bar(len(chunks), "写 plot_chunk", "条")
     with conn.cursor() as cur:
@@ -280,11 +308,16 @@ def main() -> int:
     # ── 第 3 段：重新连库写入 ───────────────────────────────
     with db.connect() as conn:
         write_pages(conn, pages)
-        n = write_chunks(conn, chunks, vectors)
+        write_chunks(conn, chunks, vectors)
         n_scope = write_scope(conn, scope)
         print(f"plot_chunk_scope：新增 {n_scope:,} 行")
         if not args.limit:
-            record_meta(conn, n, len(pages))
+            # ⚠️ 记**语料总量**，不是本次写入量。加了跳过逻辑之后
+            #    write_chunks 返回的是「这次写了几条」，增量重跑时是 0 ——
+            #    拿它去写 build_meta 会让指纹行显示 rows=0，
+            #    看着像"没灌成功"，实际库里是满的。
+            #    与 E.7c 记的「统计输出把条目总数写死」同类：不报错，只是数字错。
+            record_meta(conn, len(chunks), len(pages))
 
         with conn.cursor() as cur:
             cur.execute("""

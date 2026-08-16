@@ -82,8 +82,9 @@ API = f"https://{HOST}/api.php"
 REST = f"https://{HOST}/rest.php/v1/page"
 
 # ⚠️ 诚实的 UA：项目名 + 用途 + 联系方式。见文件顶部的合规说明。
-UA = ("animetion-recommender/0.1 (anime recommender, portfolio project; "
-      "contact hukaiwen20@gmail.com)")
+UA = ("animetion-recommender/0.1 "
+      "(+https://github.com/K1035130/animetion_Recommender; "
+      "anime recommender, portfolio project; contact kevin1035130@outlook.com)")
 
 # 礼貌速率（秒）。设计定的是 1 req/s，实测服务端 cache MISS 自身就要 ~2.9 s。
 # ⚠️ **2026-08-15 Kevin 定：进一步放慢，全量跑 4 小时左右即可。**
