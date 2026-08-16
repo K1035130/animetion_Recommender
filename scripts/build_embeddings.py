@@ -207,11 +207,18 @@ def run_batches(cache, hit: dict[str, np.ndarray],
         embed.close_client()             # 长耗时阶段结束，放掉连接池
 
 
-def resolve_vectors(rows: list[tuple[int, str]],
-                    concurrency: int = DEFAULT_CONCURRENCY) -> dict[int, np.ndarray]:
-    """按 subject_id 拿到向量：先查缓存，未命中的才请求 API。"""
+def resolve_texts(texts: list[str],
+                  concurrency: int = DEFAULT_CONCURRENCY) -> dict[str, np.ndarray]:
+    """文本 → 向量：先查缓存，未命中的才请求 API。
+
+    ⚠️ **这一层按文本键，不认识 subject_id** —— 因为它有第二个调用方
+       （scripts/build_plot_chunks.py 灌的是 chunk，没有 subject_id）。
+       把缓存查询、去重、节流、并发都收在这里，两个脚本就不可能用不同的速率
+       打同一个 API。分叉了不会报错，只会偶发限流 —— 那种 bug 最难查。
+    """
     # ⚠️ 先按文本去重再请求 —— 缓存是按文本键的，同一段文本请求两次是白花钱。
-    uniq = sorted({text for _, text in rows})
+    #    chunk 语料里实测有 12 条完全重复的文本，profile 那边有 128 条。
+    uniq = sorted(set(texts))
 
     cache = embed_cache.connect()
     try:
@@ -231,6 +238,13 @@ def resolve_vectors(rows: list[tuple[int, str]],
     finally:
         cache.close()
 
+    return hit
+
+
+def resolve_vectors(rows: list[tuple[int, str]],
+                    concurrency: int = DEFAULT_CONCURRENCY) -> dict[int, np.ndarray]:
+    """按 subject_id 拿到向量。只是 resolve_texts 的一层键映射。"""
+    hit = resolve_texts([text for _, text in rows], concurrency)
     return {sid: hit[text] for sid, text in rows if text in hit}
 
 
