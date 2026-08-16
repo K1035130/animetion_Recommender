@@ -31,9 +31,10 @@ corpus, HyDE, hybrid retrieval.
 | Questionnaire diversity (MMR, not k-means) | ✅ redundancy 0.4552 → 0.3781 · [scripts/build_clusters.py](scripts/build_clusters.py) |
 | Retaking the questionnaire | ✅ `?exclude=` — backend only, frontend not wired |
 | P1: fusing tag + embedding + staff/studio | ✅ [src/staffvec.py](src/staffvec.py) · `sparsevec(1933)` in 0.47 MB |
+| Moegirl corpus (week 4, batch 2) | ✅ **2,233 pages → 19,526 chunks** · [scripts/fetch_moegirl.py](scripts/fetch_moegirl.py) + [scripts/parse_moegirl.py](scripts/parse_moegirl.py) |
 
-Database **110 MB / 500 MB** on Neon's free tier (console figure — it counts
-retained history; `pg_database_size()` reports 86 MB) ·
+Database **110 MB**, now on a paid Neon plan (storage is billed per GB rather
+than capped, so it is no longer a constraint — see CLAUDE.md §5) ·
 **28 tests** (18 scoring-parity, 10 API).
 
 ---
@@ -45,7 +46,7 @@ retained history; `pg_database_size()` reports 86 MB) ·
 | 1 | Data layer: dump → candidate set → load → tag cleaning | ✅ |
 | 2 | P0 scoring, questionnaire, sequel folding, API, pgvector, frontend v0, deploy | ✅ |
 | 3 | Qwen3 embeddings · P1 fusing staff/studio · questionnaire diversity | ✅ |
-| **4** | **Moegirl corpus · HyDE · hybrid retrieval** | ⬜ next |
+| **4** | Moegirl corpus ✅ · **HyDE · hybrid retrieval** | 🔄 in progress |
 | **5** | **Offline evaluation — the point of the project** | ⬜ |
 | 6 | Information-gain question selection · accounts · quarterly sync | ⬜ |
 
@@ -63,9 +64,11 @@ nearest neighbours of *Havoc in Heaven* went from modern web-novel adaptations
 That before/after pair is a reproducible case, not a lone NDCG number, which is
 what week 5 is meant to produce.
 
-⚠️ **Chunk loading must go in batches with a plain `VACUUM`, never `VACUUM FULL`.**
-It rewrites the whole table, and on Neon that WAL counts against the storage
-quota — where going over suspends the project rather than billing for it.
+⚠️ **Chunk loading should go in batches with a plain `VACUUM`, not `VACUUM FULL`.**
+It rewrites the whole table, and on Neon that WAL is billed as instant-restore
+storage. Since the paid upgrade this is a cost note rather than the hard cliff it
+used to be — going over no longer suspends the project. The real cost variable is
+now compute ($0.105/CU-hour, capped at 0.5 CU), not storage.
 
 ✅ The other week-4 prerequisite is already done: `httpx` moved from the `etl`
 group into the main dependencies on 2026-08-15. `.vercelignore` drops `scripts/`
@@ -97,7 +100,7 @@ since a dev machine has the `etl` group installed.
 
 ```bash
 uv sync                       # runtime deps only — what the deployed app needs
-uv sync --group etl           # + bgm-tv-wiki / tqdm — needed by scripts/
+uv sync --group etl           # + bgm-tv-wiki / tqdm / lxml — needed by scripts/
 uv sync --group api --group etl --group dev   # everything, for development
 ```
 
@@ -140,7 +143,7 @@ The archive is ~410 MB compressed, ~1.8 GB extracted.
 ### 4. Build the database, in this order
 
 ```bash
-uv sync --group etl                          # scripts/ need this group
+uv sync --group etl                          # scripts/ need this group (lxml, tqdm, ...)
 psql < sql/001_init.sql
 psql < sql/002_tag_vec.sql                   # don't skip: adds tag_vec / series_root
 psql < sql/003_vec_halfvec.sql               # vec: vector(1024) → halfvec(1024). Idempotent
@@ -307,9 +310,10 @@ The second one is not redundant. It immediately caught a missing tie-break in th
 | 问卷选题多样化（MMR，非 k-means） | ✅ 冗余 0.4552 → 0.3781 · [scripts/build_clusters.py](scripts/build_clusters.py) |
 | 问卷多次作答 | ✅ `?exclude=` —— 后端就绪，前端未接 |
 | P1：tag + embedding + staff/studio 三路融合 | ✅ [src/staffvec.py](src/staffvec.py) · `sparsevec(1933)` 仅占 0.47 MB |
+| 萌娘百科语料（第 4 周批次 2） | ✅ **2,233 个条目 → 19,526 chunk** · [scripts/fetch_moegirl.py](scripts/fetch_moegirl.py) + [scripts/parse_moegirl.py](scripts/parse_moegirl.py) |
 
-Neon 免费层占用 **110 MB / 500 MB**（控制台口径，含保留的历史；
-`pg_database_size()` 报 86 MB）· 测试 **28 项**（18 项打分一致性 + 10 项接口）。
+Neon 占用 **110 MB**，已升级付费计划（存储按 GB 计费而非封顶，不再是约束，见 CLAUDE.md 第 5 节）·
+测试 **28 项**（18 项打分一致性 + 10 项接口）。
 
 ## 路线图
 
@@ -318,7 +322,7 @@ Neon 免费层占用 **110 MB / 500 MB**（控制台口径，含保留的历史�
 | 1 | 数据层：dump → 候选集 → 灌库 → tag 清洗 | ✅ |
 | 2 | P0 打分、问卷、续作折叠、API、pgvector、前端 v0、部署 | ✅ |
 | 3 | Qwen3 embedding · P1 融合 staff/studio · 问卷选题多样化 | ✅ |
-| **4** | **萌娘百科语料 · HyDE · 混合检索** | ⬜ 下一步 |
+| **4** | 萌娘百科语料 ✅ · **HyDE · 混合检索** | 🔄 进行中 |
 | **5** | **离线评测 —— 这个项目的核心** | ⬜ |
 | 6 | 信息增益选题 · 账号系统 · 季度同步 | ⬜ |
 
@@ -334,9 +338,10 @@ Neon 免费层占用 **110 MB / 500 MB**（控制台口径，含保留的历史�
 这种可复现的前后对照，比一个孤立的 NDCG 数字更能说明问题，
 而这正是第 5 周要产出的东西。
 
-⚠️ **第 4 周动手前要知道：灌 chunk 必须分批 + 每批后跑普通 `VACUUM`，
-绝不能用 `VACUUM FULL`。** 它重写整张表，而在 Neon 上这些 WAL 会计入存储配额，
-**超限是挂起项目而不是计费**。
+⚠️ **灌 chunk 建议分批 + 每批后跑普通 `VACUUM`，不要 `VACUUM FULL`。**
+它重写整张表，而在 Neon 上这些 WAL 计入 instant-restore 存储。
+升级付费后这只是成本提示，不再是硬悬崖 —— 超限不会挂起项目了。
+**真正的成本变量已变成 compute（$0.105/CU-小时，上限压到 0.5 CU），不是存储。**
 
 ✅ 另一个前置已经做完：`httpx` 于 2026-08-15 从 `etl` 组挪进主依赖组。
 `.vercelignore` 排掉 `scripts/` 但**不排 `src/`**，所以
@@ -362,7 +367,7 @@ Neon 免费层占用 **110 MB / 500 MB**（控制台口径，含保留的历史�
 
 ```bash
 uv sync                       # 只装运行时依赖 —— 线上跑的就是这一组
-uv sync --group etl           # + bgm-tv-wiki / tqdm，scripts/ 要用
+uv sync --group etl           # + bgm-tv-wiki / tqdm / lxml，scripts/ 要用
 uv sync --group api --group etl --group dev   # 开发全量
 ```
 

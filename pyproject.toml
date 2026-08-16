@@ -57,6 +57,11 @@ etl = [
     #    它带 55 MB 的 polars-runtime-32，是首次部署把依赖装歪时最扎眼的那一项。
     # Bangumi 官方 wiki 语法解析器（无向后兼容承诺，靠 uv.lock 锁死）
     "bgm-tv-wiki>=0.0.6",
+    # 解析萌娘百科的 Parsoid HTML（scripts/parse_moegirl.py）。
+    # ⚠️ 那份 HTML 的 <section data-mw-section-id> 最大嵌套 3 层，正则抽会静默漏内容
+    #    —— 这是最坏的一类 bug（不报错，但语料少一块，第 5 周才发现）。
+    # ⚠️ 只在 etl 组，**不进主依赖组**：解析是纯离线的，线上不碰 HTML。
+    "lxml>=5.3",
     # 📌 httpx 已挪进主依赖组（2026-08-15），这里不再重复声明 ——
     #    backfill_anilist.py / build_id_map.py / probe_embedding_api.py 照常能用，
     #    主依赖组本来就装。理由见上面主依赖组里那段注释（src/embed.py 要上线）。
