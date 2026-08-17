@@ -37,10 +37,17 @@ PROMPT_VERSION = "v1"
 
 SEP = re.compile(r"<<<\s*(\d+)\s*>>>")
 
-# 单批条数。⚠️ 越大越省 prompt 开销，但**一批失败就整批重来**，
-#    且超过 max_tokens 会被截断。25 是实测能稳定对齐的规模。
-BATCH = 25
+# ⚠️ **按字符预算分批，不用固定条数。** 首版写死 25 条，在角色简介（均 130 字）
+#    上工作正常，换到作品简介（均 265 字）立刻崩：25×265=6,625 字源文本，
+#    译文约 4,400 token > MAX_TOKENS，**输出被截断 → 每批只回来 1 条**（实测 2/50）。
+#    ⚠️ 而截断**不报错** —— 表现为"模型漏译"，很容易误判成模型质量问题。
+#    按字符预算则两个语料通用：角色简介约 15 条/批，作品简介约 7 条/批。
+BATCH_CHARS = 2000
 MAX_TOKENS = 3000
+
+# 单批条数上限。字符预算之外再加一道 —— 防止一批塞进几百条超短文本，
+# 那样 <<<N>>> 的编号本身就会占掉大量 token。
+BATCH_MAX_ITEMS = 20
 
 TIMEOUT = 420.0        # ⚠️ 为 MT 的冷启动留的，别调小
 MAX_RETRIES = 4
@@ -144,6 +151,22 @@ def translate_batch(texts: list[str], key: str | None = None) -> dict[str, str]:
     body = "\n".join(f"<<<{i + 1}>>>\n{t}" for i, t in enumerate(texts))
     got = _parse(_post_with_retry(PROMPT + body, k), len(texts))
     return {texts[i - 1]: v for i, v in got.items()}
+
+
+def make_batches(texts: list[str]) -> list[list[str]]:
+    """按字符预算切批。⚠️ 单条超预算的自成一批 —— 不能丢，也不能硬拼。"""
+    out: list[list[str]] = []
+    cur: list[str] = []
+    n = 0
+    for t in texts:
+        if cur and (n + len(t) > BATCH_CHARS or len(cur) >= BATCH_MAX_ITEMS):
+            out.append(cur)
+            cur, n = [], 0
+        cur.append(t)
+        n += len(t)
+    if cur:
+        out.append(cur)
+    return out
 
 
 def warm_up(key: str | None = None) -> float:
