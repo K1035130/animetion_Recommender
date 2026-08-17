@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import candidates, db, tag_rules
+from src import candidates, db, langclean, tag_rules
 from src.textproc import dict_fingerprint, keep_tags, norm_name, tokenize
 
 BATCH = 500
@@ -200,7 +200,11 @@ def build_row(rec: dict, stats: Counter) -> dict[str, Any]:
         "subject_id": rec["id"],
         "name": rec.get("name") or "",
         "name_cn": (rec.get("name_cn") or "").strip() or None,
-        "summary": (rec.get("summary") or "").strip() or None,
+        # ⚠️ 走 langclean 剥掉「[简介原文] + 日文」的尾巴。**必须在这里做而不是
+        #    事后 UPDATE** —— 本脚本每次重跑都从 dump 重写 summary，
+        #    一次性 UPDATE 会被下一次重跑静默覆盖回日文（见 src/langclean.py 顶部）。
+        "summary": langclean.strip_jp_tail(
+            (rec.get("summary") or "").strip()) or None,
         "air_date": air_date,
         "air_year": candidates.parse_year(rec),
         "form": candidates.form_of(rec),

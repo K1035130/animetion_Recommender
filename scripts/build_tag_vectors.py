@@ -66,8 +66,11 @@ def main() -> None:
 
     with conn.cursor() as cur:
         cur.executemany(
-            "UPDATE anime_profile SET tag_vec = %s, series_root = %s "
-            "WHERE subject_id = %s",
+            # ⚠️ updated_at 必须设：src/recommend.py 的 npz 缓存键靠 max(updated_at)
+            #    发现"就地改值"。不设的话重跑本脚本后 numpy 路径仍读旧矩阵，
+            #    而且不报错 —— 2026-08-17 已经这么栽过一次（test_parity 12 项红）。
+            "UPDATE anime_profile SET tag_vec = %s, series_root = %s, "
+            "updated_at = now() WHERE subject_id = %s",
             payload,
         )
     conn.commit()

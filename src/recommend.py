@@ -245,10 +245,29 @@ CATALOG_CACHE = (Path(__file__).resolve().parent.parent
 
 
 def _catalog_key(conn: psycopg.Connection) -> str:
-    """库内容的指纹。任一向量列重灌过，键就会变。"""
+    """库内容的指纹。任一向量列重灌或**就地改值**，键都会变。
+
+    ⚠️ **`max(updated_at)` 不是可选项，2026-08-17 踩过。**
+       原先的键只有「行数 + build_meta 指纹」，它能发现"重灌"（行数变），
+       **发现不了"就地改值"** —— 那天剥离日文尾巴时定向 UPDATE 了 475 行的
+       `vec`，行数仍是 10,864、模型指纹仍是同一个，于是键不变、npz 命中旧矩阵：
+       **numpy 路径读旧向量、SQL 路径读新向量 → test_parity 12 项全红。**
+       正是本函数注释早就警告过的「静默用旧数据」，只是当时的实现没覆盖这条路径。
+
+    ⚠️ **代价**：+1 ms（实测 64 → 65 ms）。
+       试过更彻底的 `md5(string_agg(vec::text))`，能精确检测任何改动，
+       但实测 **933 ms** —— 而缓存命中的全程才 0.65 s，本末倒置，已否决。
+
+    ⚠️ **这条依赖「所有写入方都维护 updated_at」这个不变式。**
+       为此给 build_tag_vectors.py / build_staff_vectors.py 补了 `updated_at = now()`。
+       **将来新增写 anime_profile 的脚本，必须一并设它**，否则这个洞又开了。
+       （`mmr_rank` / `cluster_id` 不在 catalog 里，build_clusters.py 故意不设 ——
+         设了只会造成无谓的缓存失效。）
+    """
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT count(*), count(tag_vec), count(vec), count(staff_vec)
+            SELECT count(*), count(tag_vec), count(vec), count(staff_vec),
+                   max(updated_at)
               FROM anime_profile
         """)
         counts = cur.fetchone()

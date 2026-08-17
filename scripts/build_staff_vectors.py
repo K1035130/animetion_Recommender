@@ -89,11 +89,15 @@ def main() -> int:
         with conn.cursor() as cur:
             # 先整列清空：词表口径变化后，上一轮有向量而这轮无特征的作品
             # 会留下陈旧向量，而打分不会报错、只会静默失准。
-            cur.execute("UPDATE anime_profile SET staff_vec = NULL "
+            # ⚠️ updated_at 必须设：src/recommend.py 的 npz 缓存键靠 max(updated_at)
+            #    发现"就地改值"。不设的话重跑本脚本后 numpy 路径仍读旧矩阵，
+            #    而且不报错 —— 2026-08-17 已经这么栽过一次（test_parity 12 项红）。
+            cur.execute("UPDATE anime_profile SET staff_vec = NULL, updated_at = now() "
                         "WHERE staff_vec IS NOT NULL")
             for i in range(0, len(payload), 500):
                 cur.executemany(
-                    "UPDATE anime_profile SET staff_vec = %s WHERE subject_id = %s",
+                    "UPDATE anime_profile SET staff_vec = %s, updated_at = now() "
+                    "WHERE subject_id = %s",
                     payload[i:i + 500])
             cur.execute("""
                 INSERT INTO build_meta (key, value, updated_at)
