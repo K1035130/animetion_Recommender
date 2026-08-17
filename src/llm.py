@@ -1,0 +1,336 @@
+"""LLM 客户端 —— HyDE 查询改写 + 剧情问答生成（流程 B / C）。
+
+⚠️ **本模块与 src/embed.py 结构相似，但有三处刻意相反，别照抄错了**（CLAUDE.md A.8）：
+
+  ┌────────────┬──────────────────────────┬──────────────────────────────┐
+  │            │ embed.py                 │ 本模块                        │
+  ├────────────┼──────────────────────────┼──────────────────────────────┤
+  │ 换模型      │ ❌ **硬锁**。换 = 库里向量  │ ✅ **允许 fallback**。输出是    │
+  │            │    全作废，且不报错        │    一段用完即弃的文本          │
+  │ 指纹       │ 进 build_meta，读向量前校验 │ 只用于**记录**实际服务方        │
+  │ 失败时     │ 停下，绝不降级             │ 顺链路往下试；全挂则由调用方     │
+  │            │                          │    退回纯 BM25                │
+  └────────────┴──────────────────────────┴──────────────────────────────┘
+
+  判据（A.8）：**看这个调用的输出是不是「相对于某个语料库的坐标」。**
+  embedding 是，所以锁死；LLM 输出是自然语言，用完即弃，所以可换。
+
+⚠️ **但第 5 周评测时 LLM 也要锁死**（A.8 纪律 4）——
+   fallback 只允许出现在线上演示路径。评测入口一律传 `allow_fallback=False`，
+   否则同一份评测跑两次可能落在不同模型上，数字不可复现。
+
+⚠️ **为什么在 src/ 而不是 scripts/**：线上要用（server/ 的检索端点），
+   而 .vercelignore 排掉了 scripts/。与 embed.py 同一条理由。
+   httpx 已在主依赖组，本模块可被 server/ 安全 import。
+
+⬜ **模型未定（2026-08-16）。** 填 PRIMARY / FALLBACKS 两个常量即可，
+   本模块的其余部分不用改。选型注意事项见 PRIMARY 上方的注释。
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import random
+import threading
+import time
+from dataclasses import dataclass
+
+import httpx
+from dotenv import load_dotenv
+
+# 429/5xx 的退避重试。⚠️ 必须有上限 —— 额度耗尽若表现为 429，
+# 无上限重试会变成永久空转（与 embed.py 同一条理由）。
+MAX_RETRIES = 3
+TIMEOUT = 120.0          # ⚠️ 比 embedding 的 60s 长：生成几百 token 本来就慢
+
+# 生成参数。⚠️ **temperature 默认 0** —— 第 5 周评测要可复现，
+#    而 HyDE 的随机性不带来任何收益（它只是把查询改写成文档口吻）。
+#    真要多样性应该在检索层做（RRF 融合多路），不是靠采样抖动。
+TEMPERATURE = 0.0
+MAX_TOKENS_HYDE = 400
+MAX_TOKENS_ANSWER = 800
+
+
+# ============================================================
+# 供应商配置
+# ============================================================
+@dataclass(frozen=True)
+class Provider:
+    """一个可用的 LLM 端点。
+
+    ⚠️ 做成结构体而不是几个裸常量，是因为 **fallback 可能跨厂商** ——
+       换厂商要同时换 base_url / model / api key，三者必须绑在一起。
+       只留一个 MODEL 常量的话，加第二个供应商时整个函数签名都要改。
+    """
+
+    name: str                 # 人类可读的标识，进日志和 descriptor()
+    base_url: str             # OpenAI 兼容的 /chat/completions 全路径
+    model: str                # 厂商侧的模型 id
+    key_env: str = "SILICONFLOW_API_KEY"
+
+
+# ⬜ **待定（2026-08-16，Kevin 研究中）。** 填之前请求会直接报错，不会静默降级。
+#
+# 选型时值得对照的几点：
+#   · 硅基流动是**已有的路**：SILICONFLOW_API_KEY 已在 .env、余额已充、
+#     base_url 同域名，加进来零额外配置。默认首选它。
+#   · 真正烧配额的是**问答生成**不是 HyDE（A.8）：HyDE 约 200 token/次，
+#     而问答每次要生成几百 token 的回答，高一两个数量级。
+#     ⇒ 挑模型时按「问答质量」权衡，HyDE 那点量随便哪个都够。
+#   · fallback 链**按质量降序排**，不是按价格 —— 它是故障时的兜底，
+#     不是省钱手段。真要省钱应该换主力，不是靠 fallback 分流。
+#   · ⚠️ 中文能力是硬需求：语料全是中文，HyDE 要产出中文假想简介。
+#
+# 形状示例（把 name/model 换成实际选定的即可）：
+#   PRIMARY = Provider(
+#       name="siliconflow/<model>",
+#       base_url="https://api.siliconflow.cn/v1/chat/completions",
+#       model="<厂商侧模型 id>",
+#   )
+PRIMARY: Provider | None = None
+
+# ⬜ 待定。按质量降序。空元组 = 不降级，主力挂了就直接报错
+#    （调用方据此退回纯 BM25 —— 那才是 A.8 认可的降级方向）。
+FALLBACKS: tuple[Provider, ...] = ()
+
+
+class LLMError(RuntimeError):
+    """LLM 请求失败。"""
+
+
+class QuotaExhausted(LLMError):
+    """额度耗尽 / 鉴权失败 / 模型名不对 —— **对当前供应商不要重试**，
+    但**可以换下一个供应商**（这点与 embed.py 相反）。"""
+
+
+class NotConfigured(LLMError):
+    """PRIMARY 还没填。⚠️ 显式报错而不是静默返回空串 ——
+    静默失败会让 HyDE 退化成「用原查询检索」，效果变差但不报错，
+    正是本项目反复吃亏的那类故障。"""
+
+
+def chain(allow_fallback: bool = True) -> list[Provider]:
+    """本次调用可用的供应商，按优先级。"""
+    if PRIMARY is None:
+        raise NotConfigured(
+            "src/llm.py 的 PRIMARY 还没填 —— 见该常量上方的选型注释")
+    return [PRIMARY, *FALLBACKS] if allow_fallback else [PRIMARY]
+
+
+def descriptor(served_by: Provider) -> dict:
+    """记录**实际**服务方，写进评测日志。
+
+    ⚠️ 与 embed.fingerprint() 的用途不同：那个是**校验**（读向量前比对，
+       不符就拒绝）；这个纯粹是**记录**，因为 LLM 换了不会让已有数据失效。
+       但第 5 周报告必须写清「这批数字是哪个模型跑的」，否则不可复现。
+    """
+    payload = json.dumps(
+        {"provider": served_by.name, "model": served_by.model,
+         "temperature": TEMPERATURE},
+        sort_keys=True, ensure_ascii=False,
+    )
+    return {
+        "provider": served_by.name,
+        "model": served_by.model,
+        "temperature": TEMPERATURE,
+        "fingerprint": hashlib.sha256(payload.encode()).hexdigest()[:16],
+    }
+
+
+# ============================================================
+# 共享连接池
+# ============================================================
+# ⚠️ 与 embed.py 各持一个 Client，**不共用**。两者的超时差一倍
+# （生成 120s vs 编码 60s），而 httpx 的 timeout 是 Client 级的。
+# 且 fallback 可能指向别的厂商，连接池按 host 复用，混在一起没有收益。
+#
+# ⚠️ 惰性创建，不在模块级构造 —— 线上是 serverless，import 时建池
+#    等于给每次冷启动加一笔开销。与 embed.py 同一条理由。
+_client: httpx.Client | None = None
+_client_lock = threading.Lock()
+
+
+def _get_client() -> httpx.Client:
+    global _client
+    with _client_lock:
+        if _client is None:
+            _client = httpx.Client(
+                timeout=TIMEOUT,
+                limits=httpx.Limits(max_connections=16, max_keepalive_connections=16),
+            )
+        return _client
+
+
+def close_client() -> None:
+    """释放连接池。长耗时的离线阶段结束后调用；线上常驻不必调。"""
+    global _client
+    with _client_lock:
+        if _client is not None:
+            _client.close()
+            _client = None
+
+
+def api_key(p: Provider) -> str:
+    load_dotenv()
+    key = os.environ.get(p.key_env, "").strip()
+    if not key:
+        raise QuotaExhausted(f"缺少环境变量 {p.key_env}（供应商 {p.name}）")
+    return key
+
+
+def _post(p: Provider, messages: list[dict], max_tokens: int) -> str:
+    """向单个供应商发一次请求。
+
+    ⚠️ **错误分类与 embed.py 一致：4xx 不重试（429 除外），5xx 重试。**
+       区别只在于「不重试」在这里意味着**换下一个供应商**，而不是彻底停下。
+    """
+    r = _get_client().post(
+        p.base_url,
+        json={
+            "model": p.model,
+            "messages": messages,
+            "temperature": TEMPERATURE,
+            "max_tokens": max_tokens,
+            "stream": False,
+        },
+        headers={"Authorization": f"Bearer {api_key(p)}"},
+    )
+
+    if r.status_code == 200:
+        body = r.json()
+        try:
+            text = body["choices"][0]["message"]["content"]
+        except (KeyError, IndexError) as e:
+            raise LLMError(f"{p.name} 返回结构异常：{str(body)[:300]}") from e
+        # ⚠️ 空回复要当失败处理，不能当成"模型认为无话可说" ——
+        #    静默返回空串会让上游 HyDE 退化成用原查询检索。
+        if not (text or "").strip():
+            raise LLMError(f"{p.name} 返回空内容")
+        return text.strip()
+
+    detail = r.text[:400]
+    if r.status_code == 429:
+        raise LLMError(f"{p.name} 429 限流：{detail}")
+    if 400 <= r.status_code < 500:
+        raise QuotaExhausted(f"{p.name} HTTP {r.status_code}（不重试该供应商）：{detail}")
+    raise LLMError(f"{p.name} HTTP {r.status_code}：{detail}")
+
+
+def _post_with_retry(p: Provider, messages: list[dict], max_tokens: int) -> str:
+    """对**单个**供应商做退避重试。跨供应商的切换在 complete() 里。"""
+    delay = 1.0
+    last: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            return _post(p, messages, max_tokens)
+        except QuotaExhausted:
+            raise                       # 该供应商没救了，交给 complete() 换下一个
+        except (LLMError, httpx.HTTPError) as e:
+            last = e
+            if attempt == MAX_RETRIES - 1:
+                break
+            time.sleep(delay + random.uniform(0, delay * 0.3))
+            delay *= 2
+    raise LLMError(f"{p.name} 重试 {MAX_RETRIES} 次仍失败：{last}")
+
+
+def complete(
+    messages: list[dict],
+    *,
+    max_tokens: int = MAX_TOKENS_ANSWER,
+    allow_fallback: bool = True,
+) -> tuple[str, Provider]:
+    """跑一次对话补全，返回 (文本, 实际服务的供应商)。
+
+    ⚠️ **返回 Provider 不是多余的。** 第 5 周评测必须记录数字出自哪个模型；
+       线上排查「今天回答质量怎么变差了」也要靠它 —— fallback 是静默发生的，
+       不记录就查不出来。
+
+    ⚠️ `allow_fallback=False` 用于**评测入口**（A.8 纪律 4）。
+    """
+    errors: list[str] = []
+    for p in chain(allow_fallback):
+        try:
+            return _post_with_retry(p, messages, max_tokens), p
+        except LLMError as e:
+            errors.append(str(e))
+            continue
+    raise LLMError(
+        "所有供应商均失败，调用方应退回纯 BM25（A.8）：\n  " + "\n  ".join(errors))
+
+
+# ============================================================
+# 两个任务入口
+# ============================================================
+# ⚠️ 拆成独立函数而不是让调用方自己拼 messages，理由与 embed.py 把
+#    embed_documents / embed_query 分开一样：**让用错的写法写不出来**。
+#    prompt 是检索质量的一部分，散在调用点就没法统一调、也没法做 ablation。
+
+# ⬜ 措辞待第 4 周实测调整。⚠️ 调它会改变 HyDE 产出，进而改变检索结果 ——
+#    第 5 周评测期间**不要动**，否则前后数字不可比。
+HYDE_SYSTEM = (
+    "你是动画资料库的检索助手。用户会给出一句模糊的找番需求，"
+    "你要写出一段**假想的动画简介**，就像它真的存在于资料库里一样。\n"
+    "要求：\n"
+    "1. 只写简介正文，不要解释、不要加标题、不要用列表\n"
+    "2. 150–250 字，第三人称，与百科条目的口吻一致\n"
+    "3. 具体化：写出题材、设定、人物关系、基调，而不是复述用户的话\n"
+    "4. 不要编造具体作品名、人名、公司名"
+)
+
+ANSWER_SYSTEM = (
+    "你是动画剧情问答助手。**只能依据给出的资料回答**。\n"
+    "要求：\n"
+    "1. 资料里没有的内容，明确说「资料中没有提到」，不要用你自己的知识补充\n"
+    "2. 回答简洁，直接说结论\n"
+    "3. 资料条目前的【】里是角色名或章节名，可用于指代"
+)
+
+
+def hyde(query: str, *, allow_fallback: bool = True) -> tuple[str, Provider]:
+    """把用户查询改写成一段假想的动画简介（流程 B 的第一步）。
+
+    ⚠️ **本函数只产出文本，不负责编码** —— 怎么把它变成向量是检索层的事。
+       这不是洁癖：**「假想文档该走 embed_documents 还是 embed_query」
+       目前没有定论**，而 Qwen3 是非对称编码（两者 cos 仅 0.797，A.7 实测）。
+       ⬜ 这是阶段 05 要实测的一个开关，把决定权留在检索层才能做 A/B。
+    """
+    return complete(
+        [{"role": "system", "content": HYDE_SYSTEM},
+         {"role": "user", "content": query}],
+        max_tokens=MAX_TOKENS_HYDE,
+        allow_fallback=allow_fallback,
+    )
+
+
+def answer(
+    question: str,
+    chunks: list[tuple[str | None, str]],
+    *,
+    allow_fallback: bool = True,
+) -> tuple[str, Provider]:
+    """基于检索到的 chunk 生成回答（流程 C 的最后一步）。
+
+    chunks: [(section, text)] —— section 是角色名或章节名，可能为 None。
+            ⚠️ 阶段 03 之后 69,996 条角色 chunk 的 section 已填成角色名，
+               所以「艾伦的母亲」这种无主语的简介在 prompt 里能归属到人（F.7b ①②）。
+
+    ⚠️ **chunks 为空时不要调用本函数。** G.4 状态③ 明确要求短路 ——
+       检索为空还把问题丢给 LLM，它会用训练记忆流畅答出来，
+       绕过整条 RAG 链路：没有出处、没有剧透门控、可能是幻觉。
+       这里加断言把它变成硬错误，而不是靠调用方自觉。
+    """
+    if not chunks:
+        raise ValueError(
+            "chunks 为空 —— 应由调用方短路返回「没有资料」，不要调 LLM（G.4 状态③）")
+
+    body = "\n\n".join(
+        f"【{sec}】{text}" if sec else text for sec, text in chunks)
+    return complete(
+        [{"role": "system", "content": ANSWER_SYSTEM},
+         {"role": "user", "content": f"资料：\n{body}\n\n问题：{question}"}],
+        max_tokens=MAX_TOKENS_ANSWER,
+        allow_fallback=allow_fallback,
+    )
