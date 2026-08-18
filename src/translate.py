@@ -190,6 +190,12 @@ def _hiragana_ratio(t: str) -> float:
     return sum("぀" <= c <= "ゟ" for c in t) / len(t) if t else 0.0
 
 
+def _kana_ratio(t: str) -> float:
+    """平假名 + 片假名。⚠️ 与 langclean.kana_ratio 同义，这里保持本地实现是
+    为了不让 translate 依赖 langclean —— 两者当前互不引用，别引入耦合。"""
+    return sum("぀" <= c <= "ヿ" for c in t) / len(t) if t else 0.0
+
+
 def looks_untranslated(src: str, dst: str) -> bool:
     """译文其实还是日文？—— 拦下来当作没翻，交给别的模型重试。
 
@@ -218,8 +224,14 @@ def looks_untranslated(src: str, dst: str) -> bool:
         return True
     if _hiragana_ratio(dst) > 0.20:
         return True
-    return (len(src) > 40
-            and difflib.SequenceMatcher(None, src, dst).ratio() > 0.8)
+    sim = difflib.SequenceMatcher(None, src, dst).ratio()
+    # ⚠️ 短文本原先直接跳过相似度检查（`len(src) > 40`），于是
+    #    「未放送エピソード全2話を収録！」这类**几乎全是汉字+片假名**的短句
+    #    回声漏了过去 —— 平假名只有 0.07，两条判据都够不着（实测 54 条）。
+    #    ⇒ 短文本也查，但额外要求输出**仍被判为日文**，
+    #      免得误伤「只保留了标题」的合格短译文
+    #      （`《Fate/Zero》BD-BOX 特典影像…` 相似度高但确实译了）。
+    return sim > 0.8 and (len(src) > 40 or _kana_ratio(dst) > 0.20)
 
 
 def translate_batch(texts: list[str], key: str | None = None,
