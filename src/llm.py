@@ -89,11 +89,36 @@ class Provider:
 #       base_url="https://api.siliconflow.cn/v1/chat/completions",
 #       model="<厂商侧模型 id>",
 #   )
-PRIMARY: Provider | None = None
+# ✅ 已定（2026-08-18）。选型依据见 CLAUDE.md 的 G.5b / G.5e。
+#
+# ⚠️ **判据是「拿到 chunk 后能不能正确作答」，不是延迟排名。** 实测三道题
+#    （答案在 chunk 里 1 道、本人 chunk 未被召回 2 道），Qwen3-14B 三题全对：
+#    该答的答出来、答案不在资料里的老实说没有。
+PRIMARY: Provider | None = Provider(
+    name="siliconflow/Qwen3-14B",
+    base_url="https://api.siliconflow.cn/v1/chat/completions",
+    model="Qwen/Qwen3-14B",
+)
 
-# ⬜ 待定。按质量降序。空元组 = 不降级，主力挂了就直接报错
-#    （调用方据此退回纯 BM25 —— 那才是 A.8 认可的降级方向）。
-FALLBACKS: tuple[Provider, ...] = ()
+# 按质量降序。空元组 = 不降级，主力挂了就直接报错
+# （调用方据此退回纯 BM25 —— 那才是 A.8 认可的降级方向）。
+#
+# ⚠️ **`tencent/Hunyuan-A13B-Instruct` 曾是第一顺位候选，实测后剔除。**
+#    它在 G.5b 的延迟排名里是最快的（1.3s，比 Qwen3-14B 快一倍），
+#    但问答实测三题里错两题，且其中一题是**最坏的错法**：
+#      问「冈部伦太郎有什么特别的能力」→ 检索召回的是**菲利斯**的 chunk
+#      （"自称只要注视对方眼睛就知道内心想法"）→ 它把那段能力**安到了冈部头上**
+#    ⚠️ 同题 Qwen3-14B 与 GLM-4.5-Air 都回答"资料中没有提到"，**那才是对的**。
+#    ⇒ 张冠李戴比拒答危险得多：用户看不出来，而且它绕过了 G.4 状态③ 的短路设计。
+#    📌 **教训：fallback 必须按问答质量选，不能按延迟选** —— 它是故障时顶上来的，
+#       顶上来之后答错比慢更糟。
+FALLBACKS: tuple[Provider, ...] = (
+    Provider(
+        name="siliconflow/GLM-4.5-Air",
+        base_url="https://api.siliconflow.cn/v1/chat/completions",
+        model="zai-org/GLM-4.5-Air",
+    ),
+)
 
 
 class LLMError(RuntimeError):
