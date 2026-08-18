@@ -63,7 +63,7 @@ from parse_moegirl import chunk_blocks
 from pgvector import HalfVector
 from psycopg.types.json import Json
 
-from src import db, embed, langclean
+from src import db, embed, langclean, translate_store
 from src.textproc import dict_fingerprint, norm_name, tokenize
 
 DUMP = Path(__file__).resolve().parent.parent / "data" / "raw" / "dump"
@@ -203,7 +203,11 @@ def load_corpus(root: dict[int, int], limit: int | None):
             #    切完再剥的话，日文会自成一条 chunk 而不是尾巴，剥不掉。
             #    也**必须在这里而不是事后 UPDATE**：本脚本从 dump 重读文本，
             #    一次性 UPDATE 会被下次重跑覆盖回去（见 src/langclean.py 顶部）。
-            summary = langclean.strip_jp_tail((d.get("summary") or "").strip())
+            # ⚠️ **顺序固定：剥离 → 换译文 → 切块。** 三者都不能调换：
+            #    · 剥离在前，因为译文缓存的键是剥离后的文本
+            #    · 换译文在切块前，因为翻译的单位是整条简介而不是 chunk
+            summary = translate_store.to_chinese(
+                langclean.strip_jp_tail((d.get("summary") or "").strip()))
             if not summary:
                 n_nosum += 1
                 continue

@@ -33,7 +33,7 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import candidates, db, langclean, tag_rules
+from src import candidates, db, langclean, tag_rules, translate_store
 from src.textproc import dict_fingerprint, keep_tags, norm_name, tokenize
 
 BATCH = 500
@@ -203,8 +203,11 @@ def build_row(rec: dict, stats: Counter) -> dict[str, Any]:
         # ⚠️ 走 langclean 剥掉「[简介原文] + 日文」的尾巴。**必须在这里做而不是
         #    事后 UPDATE** —— 本脚本每次重跑都从 dump 重写 summary，
         #    一次性 UPDATE 会被下一次重跑静默覆盖回日文（见 src/langclean.py 顶部）。
-        "summary": langclean.strip_jp_tail(
-            (rec.get("summary") or "").strip()) or None,
+        # ⚠️ **顺序固定：先剥离、再换译文。** 缓存的键是剥离之后的文本
+        #    （translate_corpus.py 从库里取的就是剥好的），顺序反了必然
+        #    全部未命中 —— 而那不报错，只是日文原样留在库里。
+        "summary": translate_store.to_chinese(
+            langclean.strip_jp_tail((rec.get("summary") or "").strip())) or None,
         "air_date": air_date,
         "air_year": candidates.parse_year(rec),
         "form": candidates.form_of(rec),

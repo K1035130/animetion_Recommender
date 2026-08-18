@@ -68,6 +68,27 @@ def get_many(conn: sqlite3.Connection, texts: list[str],
     return out
 
 
+def get_many_any(conn: sqlite3.Connection, texts: list[str],
+                 prompt_version: str,
+                 models: tuple[str, ...]) -> dict[str, str]:
+    """跨模型查：**任何一个** models 里的模型翻过就算翻过。
+
+    ⚠️ 多模型并跑时，「这条要不要翻」的判据必须是跨模型的 ——
+       只查首选模型的话，Qwen3-8B 翻好的那几万条会被判成"没翻"，
+       于是 MT 再翻一遍，多模型协作直接退化成重复劳动。
+
+    ⚠️ **优先级 = models 的顺序，靠前的赢。** 必须确定性 ——
+       否则同一份缓存两次建库得到不同语料，第 5 周评测不可复现。
+    """
+    if not texts:
+        return {}
+    out: dict[str, str] = {}
+    # 倒序遍历：后写的覆盖先写的 ⇒ 最终留下的是优先级最高的那个
+    for m in reversed(models):
+        out.update(get_many(conn, texts, m, prompt_version))
+    return out
+
+
 def put_many(conn: sqlite3.Connection, pairs: list[tuple[str, str]],
              model: str, prompt_version: str) -> None:
     """批量写入并提交。
