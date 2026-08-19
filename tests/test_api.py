@@ -271,3 +271,33 @@ def test_ask_validation(client):
                 {"question": "测试", "top_k": 0},
                 {"question": "测试", "top_k": 99}):
         assert client.post(f"{API}/ask", json=bad).status_code == 422, bad
+
+
+# ── /api/related（结构化关联查询）─────────────────────────────────
+# ⚠️ **零模型调用**，所以这两条可以放心进 CI —— 与 /ask 的 state=ok 不同。
+
+def test_related_finds_same_author(client):
+    """🚨 回归：/ask 答不了「作者还画过什么」，而且答不了是对的。
+
+    流程 C 的召回写死了 WHERE series_root = X（第 15 节原则 4），
+    按设计就看不到别的作品的 chunk。实测「冰之城墙的作者还画过其他漫画吗」
+    → 「资料中没有提到」，而 staff 列里一条 SQL 就查得到《相反的你和我》。
+    """
+    r = client.get(f"{API}/related",
+                   params={"series_root": 535669, "role": "原作"})
+    assert r.status_code == 200
+    body = r.json()
+    titles = [i["name_cn"] or i["name"] for i in body["items"]]
+    assert "相反的你和我" in titles, f"没查到同作者作品：{titles}"
+    assert all(i["via_role"] == "原作" for i in body["items"])
+    # ⚠️ 结果不含本系列 —— 续作不算「另一部作品」
+    assert all(i["series_root"] != 535669 for i in body["items"])
+
+
+def test_related_validation(client):
+    assert client.get(f"{API}/related",
+                      params={"series_root": 999999999}).status_code == 404
+    assert client.get(f"{API}/related",
+                      params={"series_root": 535669,
+                              "role": "不存在的岗位"}).status_code == 422
+    assert client.get(f"{API}/related").status_code == 422

@@ -32,7 +32,7 @@ from enum import Enum
 import numpy as np
 import psycopg
 
-from src import embed, llm, textproc
+from src import embed, llm, related, textproc
 from src import rerank as rr
 
 # ── 参数（G.6 实测定案，改之前先重跑那轮召回宽度扫描）─────────────
@@ -42,6 +42,29 @@ QUOTA_CHAR = 40      # 角色层配额
 QUOTA_SERIES = 10    # 系列层保底（prose）
 QUOTA_SONGS = 3      # 歌曲层保底 —— 见下
 FINAL = 8            # 交给 LLM 的条数
+
+# ── 相关度地板 ───────────────────────────────────────────────────
+# 🚨 **低分 chunk 会把答案稀释掉，这是实测出来的，不是理论担忧。**
+#    「冰之城墙这个漫画的主人公是谁？」rerank 分布出现明显断层：
+#        0.873  0.671 | 0.060  0.032  0.031  0.030  0.025  0.023
+#    前两条里有答案（前言 + 剧情简介点了四个中心人物），后六条是配角简介。
+#        全部 8 条        → 「资料中没有提到。」          ❌
+#        只留 >0.1 的两条 → 「冰川小雪和雨宫凑是主人公。」  ✅
+#    ⚠️ 我先试的是改 prompt（允许从资料推断），**两版都拒答，没用** ——
+#       所以这不是 prompt 能解决的，是上下文里噪声太多。
+#
+# ⚠️ **rerank 的分数此前只被用来排序，绝对值被扔掉了。** G.6 那句
+#    「最终排序全权交给 rerank」只说对了一半：它同时也在说「这条有多相关」，
+#    而把 0.02 的东西塞进 prompt 是在花钱买噪声。
+#
+# ⚠️ **0.05 是按 10 条查询的分布定的，样本偏小 —— 别把它当定论。**
+#    实测最低的一条是「三笠·阿克曼是谁」，top1 只有 0.147。
+#    CLAUDE.md 的 EMB_TOL 教训就是拿 12 组小样本定阈值、扩样后余量只剩
+#    1.3 倍 ⇒ 做成参数，真正定值等第 5 周有真实查询分布再扫。
+MIN_SCORE = 0.05
+# 就算全都低于地板也至少留这么多 —— 宁可让 LLM 看着材料说「没提到」，
+# 也不要因为空列表走进 NO_CORPUS 分支（那会谎称「这部作品没有语料」）。
+MIN_KEEP = 2
 
 # ⚠️ 召回总量是三层之和，**不要再写一个独立的 RECALL_TOTAL 常量**。
 #    加 QUOTA_SONGS 那次就漏改了它（还停在 50，而实际是 53），
@@ -301,28 +324,47 @@ def resolve(conn: psycopg.Connection, question: str) -> Resolution:
     if not mentions:
         return Resolution(state=State.UNKNOWN)
 
-    # 按「被多少个**不同**实体名覆盖」给候选作品投票，最高票唯一者胜出。
+    # ── 定作用域：作品名优先，其次角色名投票 ──────────────────────
     #
-    # ⚠️ 这条规则是实测逼出来的。第一版只在「作品名被点到」时收敛，于是
-    #    「蕾姆和拉姆是什么关系」被判成歧义 —— 而蕾姆只在 Re:0、拉姆虽然
-    #    撞 4 部但其中一部正是 Re:0，**交集唯一**。多个角色互相锚定是
-    #    角色问答里最常见的形态，漏掉它会让反问频繁到不可用。
-    #    💡 「Re:0 的拉姆」那种作品名锚定被这条规则自然涵盖（作品名也是一票），
-    #       所以不需要为 subject 单独写分支。
+    # 🚨 **作品名和角色名不能平票**，这是 G.4 与第 15 节原则 4 的直接要求：
+    #    「角色消歧必须锚定在已确认的 subject 范围内」（alias.parent_subject_id
+    #    那一列的注释写的就是这句）。作品名定的是**作用域**，
+    #    角色名是作用域**内**的实体，两者不是同一层的东西。
     #
-    # ⚠️ **但并列时一律反问，不拿热度当决胜局。** G.4：猜错的代价不对称 ——
-    #    反问多花一次点击，猜错是自信地讲了另一部作品的剧情，而用户很可能
-    #    看不出来。实测「拉姆是谁」（撞 4 部）、「三笠对艾伦」（艾伦撞 6 部）
-    #    都走这条路径，角色名跨作品重名率 4.10%，它是真的会被走到。
-    votes: dict[int, set[str]] = {}
-    for m in mentions:
-        votes.setdefault(m.series_root, set()).add(m.text)
-    ranked_roots = sorted(votes.items(), key=lambda kv: -len(kv[1]))
-    if len(ranked_roots) > 1 and len(ranked_roots[0][1]) == len(ranked_roots[1][1]):
+    # ⚠️ 曾经把这条删掉、改成纯投票，实测立刻回归：
+    #      「冰之城墙这个漫画的主人公是谁？」
+    #        冰之城墙(subject) 1 票  vs  主人公(character) 撞 9 部各 1 票
+    #        → 并列 → 判成 ambiguous，而用户明明已经点名了作品
+    #    根因是「主人公」是个**泛称**却被收成了角色别名 ——
+    #    CLAUDE.md 早就记过「主角重名 6.4%（アリス×9、主人公×9）」。
+    #    ⇒ 有作品名时它就该被作用域直接消解掉，根本轮不到投票。
+    subj_roots = {m.series_root for m in mentions if m.entity_type == "subject"}
+    if len(subj_roots) > 1:
+        # 点到了多部不同作品 —— 这是真歧义（也可能是在做对比，本层不猜）
         return Resolution(state=State.AMBIGUOUS, candidates=mentions,
                           mentions=mentions)
+    if len(subj_roots) == 1:
+        root = subj_roots.pop()
+    else:
+        # 没点作品名 → 按「被多少个**不同**角色名覆盖」投票，最高票唯一者胜出。
+        #
+        # ⚠️ 这条同样是实测逼出来的：「蕾姆和拉姆是什么关系」里蕾姆只在 Re:0、
+        #    拉姆虽然撞 4 部但其中一部正是 Re:0，**交集唯一**。
+        #    多个角色互相锚定是角色问答里最常见的形态，漏掉它反问会频繁到不可用。
+        #
+        # ⚠️ **并列时一律反问，不拿热度当决胜局。** G.4：猜错的代价不对称 ——
+        #    反问多花一次点击，猜错是自信地讲了另一部作品的剧情，
+        #    而用户很可能看不出来。实测「拉姆是谁」（撞 4 部）、
+        #    「三笠对艾伦」（艾伦撞 6 部）都会走到这里。
+        votes: dict[int, set[str]] = {}
+        for m in mentions:
+            votes.setdefault(m.series_root, set()).add(m.text)
+        ranked_roots = sorted(votes.items(), key=lambda kv: -len(kv[1]))
+        if len(ranked_roots) > 1 and len(ranked_roots[0][1]) == len(ranked_roots[1][1]):
+            return Resolution(state=State.AMBIGUOUS, candidates=mentions,
+                              mentions=mentions)
+        root = ranked_roots[0][0]
 
-    root = ranked_roots[0][0]
     mentions = [m for m in mentions if m.series_root == root]
     title = next(m.title for m in mentions if m.series_root == root)
     char_ids = sorted({m.character_id for m in mentions
@@ -439,16 +481,29 @@ def recall(conn: psycopg.Connection, series_root: int, qvec: np.ndarray,
 # ============================================================
 
 def _apply_pin_reserve(order: list[Chunk], final: int,
-                       reserve: int = PIN_RESERVE) -> list[Chunk]:
-    """保证 ① 点名角色的 chunk 出现在最终结果里（见 PIN_RESERVE 的注释）。
+                       reserve: int = PIN_RESERVE,
+                       min_score: float = MIN_SCORE,
+                       min_keep: int = MIN_KEEP) -> list[Chunk]:
+    """挑出最终交给 LLM 的 chunk：① 保底席位 + 相关度地板。
 
-    **只保「在不在」，不保「排第几」** —— 让位之后仍按 rerank 分降序展示，
+    **保底只保「在不在」，不保「排第几」** —— 让位之后仍按 rerank 分降序展示，
     所以被点名但确实不相关的 chunk 会老实地排在后面，不会伪装成最佳答案。
+
+    ⚠️ **pinned 不受相关度地板约束。** 冈部那题他本人的 chunk 只有 0.0089，
+       按地板会被砍掉 —— 而 PIN_RESERVE 存在的全部理由就是保住它
+       （G.5g：alias 是「确定性的解法」，能被分数挤掉就不是确定性的）。
+       用户点了名，这个信号比 reranker 的字面判断更强。
     """
     pins = [c for c in order if c.pinned][:reserve]
     pin_ids = {c.chunk_id for c in pins}
     others = [c for c in order if c.chunk_id not in pin_ids]
-    out = pins + others[:max(0, final - len(pins))]
+
+    room = max(0, final - len(pins))
+    kept = [c for c in others if (c.score or 0.0) >= min_score][:room]
+    if len(kept) < min_keep:
+        kept = others[:min(min_keep, room)]
+
+    out = pins + kept
     out.sort(key=lambda c: -(c.score if c.score is not None else 0.0))
     return out[:final]
 
@@ -520,11 +575,38 @@ def ask(conn: psycopg.Connection, question: str, *,
                       [], res, meta)
     if res.state is State.UNKNOWN:
         return Answer(res.state, "没认出你问的是哪部作品或哪个角色。", [], res, meta)
-    if res.state is State.NO_CORPUS or not chunks:
-        return Answer(State.NO_CORPUS,
-                      f"《{res.title}》在资料库里没有可用的剧情语料。", [], res, meta)
+    # ── 结构化关联查询（src/related.py）────────────────────────────
+    # 🚨 「这个作者/导演还做过什么」**不该走 RAG**：② 召回写死了
+    #    WHERE series_root = X，按设计就看不到别的作品的 chunk。
+    #    实测「冰之城墙的作者还画过其他漫画吗」→「资料中没有提到」，
+    #    而 staff 列里一条 SQL 就能查出《相反的你和我》。
+    # ⚠️ 它拼成一条普通的 (section, text) 走同一个通道进 prompt ——
+    #    不给 LLM 开第二个信息入口，否则「资料」在 prompt 里就有两种含义。
+    rel = (related.lookup(conn, question, res.series_root)
+           if res.series_root else [])
+    extra = related.as_context(rel)
+    if rel:
+        meta["related"] = [
+            {"series_root": r.series_root, "title": r.name_cn or r.name,
+             "year": r.air_year, "via_role": r.via_role, "via_name": r.via_name}
+            for r in rel
+        ]
 
-    text, served_by = llm.answer(question, [c.as_llm_pair() for c in chunks],
-                                 allow_fallback=allow_fallback)
+    if res.state is State.NO_CORPUS or not chunks:
+        # ⚠️ 就算没有剧情语料，关联查询的结果仍然可能回答得了问题 ——
+        #    那批事实来自结构化字段，与 plot_chunk 有没有覆盖无关。
+        if not extra:
+            return Answer(State.NO_CORPUS,
+                          f"《{res.title}》在资料库里没有可用的剧情语料。",
+                          [], res, meta)
+        text, served_by = llm.answer(question, [extra],
+                                     allow_fallback=allow_fallback)
+        meta.update(llm.descriptor(served_by))
+        return Answer(State.OK, text, [], res, meta)
+
+    pairs = [c.as_llm_pair() for c in chunks]
+    if extra:
+        pairs.append(extra)
+    text, served_by = llm.answer(question, pairs, allow_fallback=allow_fallback)
     meta.update(llm.descriptor(served_by))
     return Answer(State.OK, text, chunks, res, meta)

@@ -34,6 +34,7 @@ from src import (
     questionnaire,
     recommend,
     recommend_sql,
+    related,
     retrieve,
     tag_rules,
 )
@@ -90,6 +91,26 @@ def _get_pool() -> ConnectionPool:
                     # ⚠️ 每条新连接都要注册 pgvector 适配器，否则 tag_vec
                     #    读回来是字符串，且 numpy 数组没法当查询参数
                     configure=db.prepare,
+                    # 🚨 **借出前必须验活，否则池子会把已死的连接发出去。**
+                    #    Neon 是 serverless，空闲连接会被它回收，而 psycopg_pool
+                    #    自己不知道 —— 下一个请求拿到它就炸：
+                    #      psycopg.OperationalError:
+                    #        SSL connection has been closed unexpectedly
+                    #    实测复现（2026-08-19）：开着服务打开 /api/docs 看几分钟，
+                    #    第一次 POST /api/ask 直接 500，紧接着重试就 200。
+                    #    ⚠️ **影响所有端点，不只是 /ask** —— 这是第 2 周就埋下的。
+                    #    线上少见只是因为流量近乎为零、几乎每个请求都落在新容器上；
+                    #    真正的触发条件是「容器还活着但连接已被回收」，
+                    #    也就是两次访问间隔超过 Neon 的空闲窗口。
+                    #
+                    #    ⚠️ 代价是每次借出多一次往返（一条空查询）。函数与 Neon
+                    #       同区（iad1 ↔ us-east-2），实测 RTT 约 15 ms，
+                    #       而 /recommend 端到端 235 ms 里 ~200 ms 本来就是
+                    #       国内到边缘的 RTT —— 15 ms 换掉一个 500 值得。
+                    check=ConnectionPool.check_connection,
+                    # 主动比 Neon 更早回收空闲连接，让上面那条 check 尽量不被触发
+                    #（check 失败时池会丢弃并重开，能正确恢复，只是慢一次）。
+                    max_idle=180.0,
                 )
     return _pool
 
@@ -441,4 +462,53 @@ def ask(req: schemas.AskRequest) -> schemas.AskResponse:
                 {m.series_root: m.title for m in res.resolution.candidates}.items())
         ],
         meta=res.meta,
+    )
+
+
+@app.get(f"{API}/related", response_model=schemas.RelatedResponse)
+def get_related(
+    series_root: int = Query(..., description="作品的系列根 id"),
+    role: str = Query(
+        default="",
+        description="要查的岗位，逗号分隔；留空则查 原作+导演+制作公司"),
+    limit: int = Query(8, ge=1, le=50),
+) -> schemas.RelatedResponse:
+    """同作者 / 同导演 / 同制作公司的其他作品。**零模型调用。**
+
+    ⚠️ **这条路径存在的理由是 /ask 答不了这类问题，而且答不了是对的**：
+       流程 C 的召回写死了 `WHERE series_root = X`（实体消歧铁律，
+       第 15 节原则 4），按设计就看不到别的作品的 chunk。
+       实测「冰之城墙的作者还画过其他漫画吗」→「资料中没有提到」，
+       而 staff 列里一条 SQL 就查得到《相反的你和我》。
+
+    ⚠️ 人名从**本作品自己的 staff 列**里读出来再反查，不做文本匹配 ——
+       staff 存日文原形（阿賀沢紅茶）、萌娘正文用简体（阿贺泽红茶），
+       两者字符重合度极低（第 13 节记过 冨樫義博 vs 富坚义博 的同类坑）。
+
+    ⚠️ 结果按 `series_root` 折叠：续作不算「另一部作品」，
+       与推荐链路用的是同一个折叠键，不另起一套。
+    """
+    roles = [r.strip() for r in role.split(",") if r.strip()] or ["原作", "导演"]
+    bad = [r for r in roles if r not in related.STAFF_ROLES]
+    if bad:
+        raise HTTPException(
+            422, f"未知岗位 {bad}；库里只有 {list(related.STAFF_ROLES)}")
+
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT coalesce(name_cn, name) FROM anime_profile WHERE subject_id = %s",
+                (series_root,))
+            row = cur.fetchone()
+        if row is None:
+            raise HTTPException(404, f"没有 series_root={series_root} 的作品")
+        items = related.same_staff(c, series_root, roles, limit=limit)
+        if not role:                      # 默认模式才顺带查公司
+            seen = {r.series_root for r in items}
+            items += [r for r in related.same_studio(c, series_root, limit=limit)
+                      if r.series_root not in seen]
+
+    return schemas.RelatedResponse(
+        series_root=series_root, title=row[0],
+        items=[schemas.RelatedWork(**vars(r)) for r in items[:limit]],
     )

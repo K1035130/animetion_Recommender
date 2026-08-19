@@ -1,0 +1,142 @@
+"""检索层的纯函数测试 —— 不连库、不打外部 API。
+
+⚠️ 与 test_api.py 分工不同：那边验 HTTP 外壳，这边验**挑选逻辑本身**。
+   相关度地板、保底席位、词边界这三条都是被实测 bug 逼出来的规则，
+   而它们的输入都是可以手工构造的 —— 没有理由让它们依赖网络。
+"""
+
+import pytest
+
+from src import related
+from src.retrieve import (
+    MIN_KEEP,
+    MIN_SCORE,
+    PIN_RESERVE,
+    Chunk,
+    _apply_pin_reserve,
+    _latin_word_boundary,
+    _substrings,
+)
+
+
+def mk(cid: int, score: float, *, pinned: bool = False) -> Chunk:
+    return Chunk(chunk_id=cid, section=f"s{cid}", text=f"t{cid}", kind="profile",
+                 source="bangumi_char", character_id=cid if pinned else None,
+                 spoiler_level=0, score=score, pinned=pinned)
+
+
+# ── 相关度地板（MIN_SCORE）────────────────────────────────────────
+
+def test_floor_drops_diluting_chunks():
+    """🚨 回归：低分 chunk 会把答案稀释掉。
+
+    实测「冰之城墙这个漫画的主人公是谁？」的真实分布 —— 前两条里有答案，
+    后六条是配角简介：
+        全部 8 条        → 「资料中没有提到。」
+        砍掉低分的       → 「冰川小雪和雨宫凑是主人公。」
+    """
+    order = [mk(1, 0.873), mk(2, 0.671), mk(3, 0.060), mk(4, 0.032),
+             mk(5, 0.031), mk(6, 0.030), mk(7, 0.025), mk(8, 0.023)]
+    out = _apply_pin_reserve(order, final=8)
+    assert [c.chunk_id for c in out] == [1, 2, 3], "0.05 以下的必须被砍掉"
+
+
+def test_floor_keeps_everything_when_all_relevant():
+    """高分场景不受影响 —— 地板只砍噪声，不改变正常结果。"""
+    order = [mk(i, 0.9 - i * 0.05) for i in range(8)]
+    assert len(_apply_pin_reserve(order, final=8)) == 8
+
+
+def test_floor_never_returns_less_than_min_keep():
+    """⚠️ 全都低于地板时也要留 MIN_KEEP 条。
+
+    返回空列表会让调用方走进 NO_CORPUS 分支，**谎称「这部作品没有语料」** ——
+    而事实是语料有、只是都不太相关。宁可让 LLM 看着材料说「没提到」。
+    """
+    order = [mk(i, 0.001) for i in range(6)]
+    out = _apply_pin_reserve(order, final=8)
+    assert len(out) == MIN_KEEP
+
+
+# ── 保底席位（PIN_RESERVE）───────────────────────────────────────
+
+def test_pin_survives_the_floor():
+    """🚨 回归：pinned 不受相关度地板约束。
+
+    「冈部伦太郎有什么特别的能力」里他本人的 chunk 只有 0.0089 ——
+    按地板会被砍掉，而 PIN_RESERVE 存在的全部理由就是保住它
+    （G.5g：alias 是确定性的解法，能被分数挤掉就不是确定性的）。
+    """
+    order = [mk(i, 0.9 - i * 0.1) for i in range(7)] + [mk(99, 0.0089, pinned=True)]
+    out = _apply_pin_reserve(order, final=8)
+    assert 99 in [c.chunk_id for c in out], "被点名的角色必须在最终结果里"
+    assert MIN_SCORE > 0.0089, "这条测试的前提是该分数低于地板"
+
+
+def test_pin_reserve_is_capped():
+    """保底席位有上限，不能让点名把整个上下文占满。"""
+    order = [mk(i, 0.001, pinned=True) for i in range(10)] + \
+            [mk(50 + i, 0.9) for i in range(5)]
+    out = _apply_pin_reserve(order, final=8)
+    assert sum(1 for c in out if c.pinned) == PIN_RESERVE
+
+
+def test_pin_does_not_get_promoted():
+    """⚠️ 保底只保「在不在」，不保「排第几」。
+
+    否则不相关的点名 chunk 会伪装成最佳答案 —— 展示顺序仍归 rerank 分。
+    """
+    order = [mk(1, 0.9), mk(2, 0.8), mk(99, 0.001, pinned=True)]
+    out = _apply_pin_reserve(order, final=8)
+    assert out[-1].chunk_id == 99
+
+
+# ── 词边界（_latin_word_boundary）────────────────────────────────
+
+@pytest.mark.parametrize(("q", "name", "ok"), [
+    ("python实现", "py", False),      # 从英文词中间截出 → 挡掉
+    ("excel表格", "el", False),
+    ("eva的结局", "eva", True),        # 独立出现的真别名 → 放行
+    ("看eva", "eva", True),
+    ("蕾姆是谁", "蕾姆", True),          # 中文不受词边界约束
+])
+def test_latin_word_boundary(q, name, ok):
+    """🚨 回归：拉丁字母别名必须落在词边界上。
+
+    实测「帮我写一个快速排序的 Python 实现」曾命中 py/hon，
+    于是一个与动画无关的问题被自信地解析成了某部作品。
+    ⚠️ 中文没有词边界，而蕾姆/拉姆/三笠全是 2 字，不能套同一条规则。
+    """
+    start = q.find(name)
+    assert _latin_word_boundary(q, start, start + len(name), name) is ok
+
+
+def test_substrings_are_deduped_and_bounded():
+    subs = _substrings("蕾姆和拉姆")
+    assert "蕾姆" in subs and "拉姆" in subs
+    assert len(subs) == len(set(subs)), "不该有重复"
+    assert all(2 <= len(s) <= 16 for s in subs)
+
+
+# ── 关联查询的触发规则（related.wants）───────────────────────────
+
+@pytest.mark.parametrize(("q", "roles", "studio"), [
+    ("冰之城墙的作者还画过其他漫画吗？", ["原作"], False),
+    ("这部番的导演还做过什么", ["导演"], False),
+    ("制作公司是哪家", [], True),
+    ("蕾姆和拉姆是什么关系？", [], False),      # 不该触发
+    ("进击的巨人讲了什么故事？", [], False),      # 不该触发
+])
+def test_related_triggers(q, roles, studio):
+    """⚠️ 关键词触发，不是意图分类器 —— 第 15 节原则 2：
+    能用规则判的别交给模型。误触发的代价只是多跑一条走索引的 SQL。
+    """
+    assert related.wants(q) == (roles, studio)
+
+
+def test_related_roles_match_the_database():
+    """岗位常量必须与库里实际存在的 role 值一致。
+
+    ⚠️ 凭猜加一个库里没有的 role，查询会静默返回空 —— 不报错，只是没结果。
+    """
+    assert set(related.ROLE_TRIGGERS) <= set(related.STAFF_ROLES)

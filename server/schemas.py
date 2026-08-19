@@ -203,3 +203,29 @@ class AskResponse(BaseModel):
     chunks: list[AskChunk]
     candidates: list[AskCandidate]
     meta: dict
+
+
+# ── 结构化关联查询（src/related.py）────────────────────────────────
+# ⚠️ 与 /ask 的性质完全不同：这里**零模型调用**，答案直接来自 staff / studios
+#    两列，精确且零幻觉。「某某还做过什么」是关联查询不是语义检索。
+
+RelatedRole = Literal["原作", "导演", "脚本", "人物设定", "音乐", "制作公司"]
+
+
+class RelatedWork(BaseModel):
+    series_root: int
+    subject_id: int
+    name: str
+    name_cn: str | None
+    air_year: int | None
+    fav_done: int
+    # 因为哪个 facet 关联上的。⚠️ via_name 是**日文原形**（staff 列的存法），
+    #    与萌娘正文里的简体写法不同 —— 详见 src/related.py 的模块注释。
+    via_role: RelatedRole
+    via_name: str
+
+
+class RelatedResponse(BaseModel):
+    series_root: int
+    title: str | None
+    items: list[RelatedWork]
