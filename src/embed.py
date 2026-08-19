@@ -160,7 +160,7 @@ def api_key() -> str:
     return key
 
 
-def _post(texts: list[str], key: str) -> np.ndarray:
+def _post(texts: list[str], key: str, timeout: float | None = None) -> np.ndarray:
     """发一次请求。错误分类见下。
 
     ⚠️ **分类原则：4xx 不重试（429 除外），5xx 重试。**
@@ -171,6 +171,7 @@ def _post(texts: list[str], key: str) -> np.ndarray:
         BASE_URL,
         json={"model": MODEL, "input": texts, "encoding_format": "float"},
         headers={"Authorization": f"Bearer {key}"},
+        **({} if timeout is None else {"timeout": timeout}),
     )
 
     if r.status_code == 200:
@@ -188,22 +189,25 @@ def _post(texts: list[str], key: str) -> np.ndarray:
     raise EmbedError(f"HTTP {r.status_code}：{body}")
 
 
-def _post_with_retry(texts: list[str], key: str) -> np.ndarray:
+def _post_with_retry(texts: list[str], key: str, *,
+                     retries: int | None = None,
+                     timeout: float | None = None) -> np.ndarray:
+    n_retries = MAX_RETRIES if retries is None else retries
     delay = 1.0
     last: Exception | None = None
-    for attempt in range(MAX_RETRIES):
+    for attempt in range(n_retries):
         try:
-            return _post(texts, key)
+            return _post(texts, key, timeout)
         except QuotaExhausted:
             raise                       # 不重试，直接冒泡
         except (EmbedError, httpx.HTTPError) as e:
             last = e
-            if attempt == MAX_RETRIES - 1:
+            if attempt == n_retries - 1:
                 break
             # 指数退避 + jitter。jitter 是为了避免多进程重跑时同步撞墙
             time.sleep(delay + random.uniform(0, delay * 0.3))
             delay *= 2
-    raise EmbedError(f"重试 {MAX_RETRIES} 次仍失败：{last}")
+    raise EmbedError(f"重试 {n_retries} 次仍失败：{last}")
 
 
 def embed_documents(texts: list[str], key: str | None = None) -> np.ndarray:
@@ -223,13 +227,24 @@ def embed_documents(texts: list[str], key: str | None = None) -> np.ndarray:
     return _post_with_retry(texts, key or api_key())
 
 
-def embed_query(text: str, key: str | None = None) -> np.ndarray:
+def embed_query(text: str, key: str | None = None, *,
+                retries: int | None = None,
+                timeout: float | None = None) -> np.ndarray:
     """编码查询（检索侧）。**加 instruct 前缀。**
 
     ⚠️ 与 embed_documents 拆成两个函数，是为了让「把文档当查询编码」
        这种错误写不出来。实测两者 cos=0.797，混用是静默的质量下降。
+
+    ⚠️ **retries / timeout 是给请求路径用的，离线批量不要传。**
+       模块级的 MAX_RETRIES=5 × TIMEOUT=60 是为 build_embeddings.py 那种
+       跑一小时的离线任务标定的 —— 那里多等五分钟总比重跑一小时便宜。
+       但同一套参数放在用户请求上就是延迟炸弹：阶段 05 实测撞到过一次
+       服务端卡顿，单条查询耗时 **883 秒**，期间还一直握着 Neon 连接
+       （连接随后被 serverless 回收，报 server closed the connection）。
+       ⇒ 请求路径应显式传短预算，见 src/retrieve.py 的 REQUEST_* 常量。
     """
-    return _post_with_retry([QUERY_INSTRUCT + text], key or api_key())[0]
+    return _post_with_retry([QUERY_INSTRUCT + text], key or api_key(),
+                            retries=retries, timeout=timeout)[0]
 
 
 def truncate(vecs: np.ndarray, dim: int) -> np.ndarray:
