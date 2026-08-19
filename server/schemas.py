@@ -148,3 +148,58 @@ class AnimeDetail(BaseModel):
     meta_tags: list[str]
     studios: list[str]
     anilist_id: int | None
+
+
+# ── 流程 C · 剧情问答（阶段 05）────────────────────────────────────
+# ⚠️ 与推荐链路不同，这条路上**有模型调用**（embedding + rerank + LLM），
+#    所以响应里带 meta 做溯源：哪个 reranker、哪个 LLM、召回了多少条。
+#    第 5 周评测要靠它区分「检索没召回」和「模型没答对」——
+#    G.5f 那次判分错误正是因为分不清这两者。
+
+AskState = Literal["ok", "ambiguous", "no_corpus", "unknown"]
+
+
+class AskRequest(BaseModel):
+    question: str = Field(min_length=1, max_length=200)
+
+    # ⚠️ 默认关。剧透门控是主防线（第 15 节原则 2），放开必须由用户**显式**确认。
+    #    但 spoiler=False 不等于结果里没有剧透 —— `spoiler_level` 那一列的
+    #    召回率已知不完整（F.4 ③：2,529 条里 heimu 占 2,421、剧透框仅 150），
+    #    所以前端要**无条件**带一句「回答可能包含剧透」，不要依赖这个开关。
+    spoiler: bool = False
+
+    # 交给 LLM 的 chunk 条数。G.6 实测定案是 8。
+    top_k: int = Field(default=8, ge=1, le=20)
+
+
+class AskChunk(BaseModel):
+    """一条被采纳的语料，前端用来展示出处。"""
+
+    chunk_id: int
+    section: str | None            # 角色名或章节名，即 prompt 里【】中的内容
+    text: str
+    kind: Literal["prose", "songs", "profile"]
+    source: Literal["moegirl", "bangumi_char"]
+    spoiler_level: int
+    # rerank 相关度。⚠️ 量纲不跨查询可比，只用于同一次结果内排序，别展示成百分比。
+    score: float | None
+    # 是否由 ① alias 直取而来（而非向量召回）。见 retrieve.PIN_RESERVE。
+    pinned: bool
+
+
+class AskCandidate(BaseModel):
+    """state=ambiguous 时的候选作品，前端渲染成可点的选项。"""
+
+    series_root: int
+    title: str
+
+
+class AskResponse(BaseModel):
+    state: AskState
+    # state=ok 时是回答正文；其余三种状态是给用户看的说明（反问 / 没语料 / 没认出）。
+    answer: str | None
+    series_root: int | None
+    title: str | None
+    chunks: list[AskChunk]
+    candidates: list[AskCandidate]
+    meta: dict

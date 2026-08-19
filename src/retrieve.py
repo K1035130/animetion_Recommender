@@ -38,11 +38,16 @@ from src import rerank as rr
 # ── 参数（G.6 实测定案，改之前先重跑那轮召回宽度扫描）─────────────
 # 目标 chunk 在纯向量里的真实排名：top-4 / 13 / 9 / 21 / 38
 #   k=20 两道够不着 · k=30 一道够不着 · k=50 全中 · k=80 无额外收益
-RECALL_TOTAL = 50
 QUOTA_CHAR = 40      # 角色层配额
 QUOTA_SERIES = 10    # 系列层保底（prose）
 QUOTA_SONGS = 3      # 歌曲层保底 —— 见下
 FINAL = 8            # 交给 LLM 的条数
+
+# ⚠️ 召回总量是三层之和，**不要再写一个独立的 RECALL_TOTAL 常量**。
+#    加 QUOTA_SONGS 那次就漏改了它（还停在 50，而实际是 53），
+#    而它只在自己的定义处出现过 —— 不报错，只是悄悄给你一个错的数，
+#    与 E.7c ③「统计输出把条目总数写死」同族。
+RECALL_TOTAL = QUOTA_CHAR + QUOTA_SERIES + QUOTA_SONGS
 
 # 🚨 **QUOTA_SONGS 是实测逼出来的，别把它并回 QUOTA_SERIES。**
 #    第一版只分两层，「命运石之门的片头曲是什么」一条 songs 都召不回：
@@ -90,6 +95,18 @@ MENTION_MAX = 16
 #    G.5g 说 alias 路径是「确定性的解法」，**能被 rerank 挤掉就不是确定性的**。
 #    ⇒ 保底只保「在不在」，**不保排第几** —— 排序仍然全归 rerank。
 PIN_RESERVE = 4
+
+# ① 直取的上限。
+#
+# 🚨 **实测可达，不是理论边界。** 构造一条 235 字、点到 57 个航海王角色的问句，
+#    pinned 57 + 召回 53 = **110 条**，超过 rerank 的 MAX_DOCS=100
+#    → 抛 RerankError → 静默降级成纯向量序，
+#    而那条错误信息说的是「召回宽度失控」，**把责任推给了召回，归因是错的**。
+#    航海王一部作品就有 924 个角色，长问句撞上几十个并不需要恶意构造。
+#
+# ⚠️ 取 40 而不是 47（=100−53）是留余量：将来调大任何一个 QUOTA 都不会
+#    悄悄把这条约束顶穿。⇒ 最坏 40+53=93 < 100。
+MAX_PINNED = 40
 
 # ── 请求路径的延迟预算 ───────────────────────────────────────────
 # 🚨 **src/embed.py 的模块级默认值（MAX_RETRIES=5 × TIMEOUT=60）不能用在这里。**
@@ -193,6 +210,32 @@ def _substrings(norm_q: str) -> list[str]:
     return out
 
 
+def _latin_word_boundary(norm_q: str, start: int, end: int, name: str) -> bool:
+    """纯拉丁/数字的别名必须落在词边界上。中日文名不受此限。
+
+    🚨 **实测抓到的假阳性，不是防御性编程。** 10 条与动画无关的日常问句里
+       有 3 条被误判，其中两条就栽在这里：
+
+           「帮我写一个快速排序的 Python 实现」 → py / hon
+           「怎么把 Excel 表格导出成 CSV」      → el / ex
+
+       这些都是从更长的英文词**中间**截出来的两字符片段，恰好撞上了
+       196,669 行别名里的短别名。加词边界后它们全部被挡掉，
+       而独立出现的真别名（EVA / CLANNAD / Fate）不受影响 ——
+       因为那时它们两侧本来就不是字母数字。
+
+    ⚠️ **中文不能用同一条规则**：中文没有词边界，而「蕾姆」「拉姆」「三笠」
+       全是 2 字，按边界判会把真角色名一起杀掉。
+    """
+    if not name.isascii() or not name.isalnum():
+        return True
+    before_ok = start == 0 or not (norm_q[start - 1].isascii()
+                                   and norm_q[start - 1].isalnum())
+    after_ok = end >= len(norm_q) or not (norm_q[end].isascii()
+                                          and norm_q[end].isalnum())
+    return before_ok and after_ok
+
+
 def find_mentions(conn: psycopg.Connection, question: str) -> list[Mention]:
     """扫出问句里所有能对上 alias 的实体，**长的优先、不重叠**。
 
@@ -241,6 +284,8 @@ def find_mentions(conn: psycopg.Connection, question: str) -> list[Mention]:
     taken: list[tuple[int, int]] = []
     out: list[Mention] = []
     for start, end, norm_name in spans:
+        if not _latin_word_boundary(norm_q, start, end, norm_name):
+            continue
         if any(not (end <= ts or start >= te) for ts, te in taken):
             continue                      # 与已选片段重叠 → 跳过（长的已经赢了）
         taken.append((start, end))
@@ -315,10 +360,13 @@ def _row_to_chunk(row, *, pinned: bool = False) -> Chunk:
 
 
 def pinned_chunks(conn: psycopg.Connection, character_ids: list[int],
-                  *, spoiler: bool = False) -> list[Chunk]:
+                  *, spoiler: bool = False,
+                  limit: int = MAX_PINNED) -> list[Chunk]:
     """① 的产物：点了名的角色，按 character_id 直取本人的 chunk。
 
     这一步**不经过向量**，所以不受「角色 chunk 正文里没有自己的名字」影响。
+
+    ⚠️ limit 不是保险起见，见 MAX_PINNED 的注释。
     """
     if not character_ids:
         return []
@@ -329,7 +377,8 @@ def pinned_chunks(conn: psycopg.Connection, character_ids: list[int],
              WHERE c.character_id = ANY(%s)
                AND (%s OR c.spoiler_level = 0)
              ORDER BY c.character_id, c.chunk_no
-        """, (character_ids, spoiler))
+             LIMIT %s
+        """, (character_ids, spoiler, limit))
         return [_row_to_chunk(r, pinned=True) for r in cur.fetchall()]
 
 

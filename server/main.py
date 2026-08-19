@@ -27,7 +27,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from psycopg_pool import ConnectionPool
 
 from server import schemas
-from src import db, questionnaire, recommend, recommend_sql, tag_rules
+from src import (
+    db,
+    embed,
+    llm,
+    questionnaire,
+    recommend,
+    recommend_sql,
+    retrieve,
+    tag_rules,
+)
 from src.textproc import dict_fingerprint, keep_tags, norm_name, tokenize
 
 # 建库时的分词词典指纹。search_tsv 是用这套词典切出来的，查询端必须一致 ——
@@ -124,14 +133,32 @@ app.add_middleware(
 @app.get(f"{API}/health")
 def health() -> dict:
     """存活探针。也顺带确认库里的向量列已回填 —— 忘了跑
-    scripts/build_tag_vectors.py 的话打分会静默返回空列表。"""
+    scripts/build_tag_vectors.py 的话打分会静默返回空列表。
+
+    ⚠️ **三条打分路径各有一列，三个都要报。** 原先只报 with_tag_vec，
+       而 P1 之后 match 是 tag/embedding/staff 三路融合 —— 漏跑
+       build_embeddings.py 或 build_staff_vectors.py 时，那两路会**整项跳过**
+       （零向量参与融合会稀释另外两路，所以代码是有意跳过的），
+       结果依然像模像样，只是悄悄退化成了纯 tag 模型。
+    ⚠️ plot_chunk 那两个是 /api/ask 的前置：没有 vec 就检索不出东西，
+       而 G.4 状态③ 会把它报成「这部作品没有语料」—— 症状和"忘了灌库"一样。
+    """
     with _conn() as c, c.cursor() as cur:
-        cur.execute("SELECT count(*), count(tag_vec) FROM anime_profile")
-        total, with_vec = cur.fetchone()
+        cur.execute("""
+            SELECT count(*), count(tag_vec), count(vec), count(staff_vec)
+              FROM anime_profile
+        """)
+        total, with_tag, with_emb, with_staff = cur.fetchone()
+        cur.execute("SELECT count(*), count(vec) FROM plot_chunk")
+        chunks, chunks_vec = cur.fetchone()
     return {
-        "status": "ok" if with_vec else "tag_vec 未回填",
+        "status": "ok" if with_tag else "tag_vec 未回填",
         "catalog_size": total,
-        "with_tag_vec": with_vec,
+        "with_tag_vec": with_tag,
+        "with_embed_vec": with_emb,
+        "with_staff_vec": with_staff,
+        "plot_chunks": chunks,
+        "plot_chunks_with_vec": chunks_vec,
         "dict_fingerprint": dict_fingerprint(),
     }
 
@@ -361,4 +388,57 @@ def anime_detail(subject_id: int) -> schemas.AnimeDetail:
         bgm_score=float(sc) if sc else None, score_count=sc_cnt, rank=rank,
         done=done, tags=clean, meta_tags=list(metas or []),
         studios=list(studios or []), anilist_id=anilist_id,
+    )
+
+
+@app.post(f"{API}/ask", response_model=schemas.AskResponse)
+def ask(req: schemas.AskRequest) -> schemas.AskResponse:
+    """流程 C · 剧情问答。四步管道见 src/retrieve.py 的模块注释。
+
+    ⚠️ **这是请求路径上第一个会调模型的端点**（前三周的推荐链路全程零模型）。
+       一次请求打三个外部服务：embedding → rerank → LLM，实测端到端 3–6 秒。
+       ⇒ 与 /recommend 的 235 ms 不是一个量级，前端必须给 loading 态。
+
+    ⚠️ **四种状态都返回 200，不要把它们做成 4xx。** 它们是正常的业务结果
+       （反问 / 没语料 / 没认出），不是错误：G.4 明确要求「认出来但没语料」时
+       短路返回而不是把问题丢给 LLM —— 那会让它用训练记忆流畅编一个出来，
+       绕过整条 RAG 链路（没有出处、没有剧透门控、可能是幻觉）。
+       把它做成 404 的话，前端很容易顺手退化成「那就直接问模型吧」。
+
+    ⚠️ **失败要分清是哪一层**，因为降级方向完全不同（A.8）：
+         embedding 挂  → 整条向量检索没了，正确兜底是退回纯 BM25 → 503
+         rerank 挂     → retrieve() 内部已降级成向量序，请求照常成功
+         LLM 挂        → 检索结果是好的，只是没法生成 → 503，但把 chunks 带回去
+    """
+    with _conn() as c:
+        try:
+            res = retrieve.ask(c, req.question,
+                               spoiler=req.spoiler, final=req.top_k)
+        except embed.EmbedError as exc:
+            # ⚠️ 不要在这里 fallback 到别的 embedding 模型 —— 库里 89,544 条
+            #    向量是 Qwen3 定义的坐标系，换模型不报错、只返回排好序的噪声。
+            raise HTTPException(503, f"向量检索不可用：{exc}") from exc
+        except llm.LLMError as exc:
+            raise HTTPException(503, f"生成不可用：{exc}") from exc
+
+    return schemas.AskResponse(
+        state=res.state.value,
+        answer=res.text,
+        series_root=res.resolution.series_root,
+        title=res.resolution.title,
+        chunks=[
+            schemas.AskChunk(
+                chunk_id=ch.chunk_id, section=ch.section, text=ch.text,
+                kind=ch.kind, source=ch.source,
+                spoiler_level=ch.spoiler_level, score=ch.score, pinned=ch.pinned,
+            ) for ch in res.chunks
+        ],
+        # ⚠️ 按 series_root 去重：同一部作品会因为多个同名角色出现多次
+        #    （「拉姆」实测撞 4 部，但每部只该在反问里出现一次）。
+        candidates=[
+            schemas.AskCandidate(series_root=root, title=title)
+            for root, title in sorted(
+                {m.series_root: m.title for m in res.resolution.candidates}.items())
+        ],
+        meta=res.meta,
     )

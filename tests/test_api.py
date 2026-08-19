@@ -213,3 +213,61 @@ def test_anime_detail(client):
     assert "CloverWorks" in d["studios"]
 
     assert client.get(f"{API}/anime/999999999").status_code == 404
+
+
+# ── /api/ask（流程 C，阶段 05）────────────────────────────────────
+# ⚠️ **这里只测不打外部 API 的那几条状态。** state=ok 会真的调
+#    embedding + rerank + LLM：慢（3–6 秒）、要花钱、且 LLM 输出不确定 ——
+#    把它放进 CI 会让测试变成一个不稳定的付费探针。
+#    「答得对不对」是第 5 周离线评测的事，不是冒烟测试的事。
+
+def test_ask_unknown_short_circuits(client):
+    """认不出实体时必须短路，且**不能**假装答出来。
+
+    ⚠️ 这条守的是 G.4 状态④/③ 那个设计意图：检索为空还把问题丢给 LLM，
+       它会用训练记忆流畅地编一个，绕过整条 RAG 链路。
+    """
+    r = client.post(f"{API}/ask", json={"question": "明天几点开会"})
+    assert r.status_code == 200, "业务状态不该做成 4xx"
+    body = r.json()
+    assert body["state"] == "unknown"
+    assert body["chunks"] == [] and body["series_root"] is None
+    assert body["answer"], "要给用户一句说明，不能返回 None 让前端自己编"
+
+
+def test_ask_ambiguous_asks_back(client):
+    """跨作品重名必须反问，且候选按作品去重。
+
+    ⚠️ 「拉姆」实测撞 4 部作品（Re:0 / 战车讲座 / 影宅 / 超次元游戏 海王星）。
+       G.4：猜错的代价不对称 —— 反问多花一次点击，猜错是自信地讲了
+       另一部作品的剧情，而用户很可能看不出来。
+    """
+    r = client.post(f"{API}/ask", json={"question": "拉姆是谁？"})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["state"] == "ambiguous"
+    assert body["chunks"] == [], "反问阶段不该返回任何语料"
+    roots = [c["series_root"] for c in body["candidates"]]
+    assert len(roots) > 1, "只有一个候选就不该判成歧义"
+    assert len(roots) == len(set(roots)), "候选必须按 series_root 去重"
+
+
+def test_ask_latin_substring_not_a_mention(client):
+    """纯拉丁别名必须落在词边界上。
+
+    🚨 回归测试：实测「帮我写一个快速排序的 Python 实现」曾命中 py / hon、
+       「怎么把 Excel 表格导出成 CSV」曾命中 el / ex —— 从英文词**中间**
+       截出的两字符片段撞上了短别名，于是一个与动画无关的问题被自信地
+       解析成了某部作品。见 retrieve._latin_word_boundary()。
+    """
+    for q in ("帮我写一个快速排序的 Python 实现", "怎么把 Excel 表格导出成 CSV"):
+        body = client.post(f"{API}/ask", json={"question": q}).json()
+        assert body["state"] == "unknown", f"{q!r} 被误判成 {body['state']}"
+
+
+def test_ask_validation(client):
+    """入参校验。question 有长度上下界，top_k 有范围。"""
+    for bad in ({}, {"question": ""}, {"question": "x" * 300},
+                {"question": "测试", "top_k": 0},
+                {"question": "测试", "top_k": 99}):
+        assert client.post(f"{API}/ask", json=bad).status_code == 422, bad
