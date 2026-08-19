@@ -5,9 +5,11 @@
    而它们的输入都是可以手工构造的 —— 没有理由让它们依赖网络。
 """
 
+import datetime
+
 import pytest
 
-from src import related
+from src import llm, recommend, related
 from src.retrieve import (
     MIN_KEEP,
     MIN_SCORE,
@@ -140,3 +142,74 @@ def test_related_roles_match_the_database():
     ⚠️ 凭猜加一个库里没有的 role，查询会静默返回空 —— 不报错，只是没结果。
     """
     assert set(related.ROLE_TRIGGERS) <= set(related.STAFF_ROLES)
+
+
+# ── 多轮对话的上下文预算（retrieve._trim）────────────────────────
+
+def test_history_is_truncated():
+    """🚨 历史不截会把当前这轮的资料挤没。
+
+    I.2 ② 实测：上下文噪声一多，LLM 就从「答对」退化成「资料中没有提到」
+    （同一题 8 条→拒答、3 条→答对）。历史是同一种噪声，而且**不受
+    MIN_SCORE 那道地板约束** —— 地板管 chunk，管不到历史。
+    """
+    from src.retrieve import MAX_HISTORY_CHARS, _trim
+
+    long_q, long_a = "问" * 999, "答" * 999
+    out = _trim([(long_q, long_a)])
+    assert len(out[0][0]) == MAX_HISTORY_CHARS
+    assert len(out[0][1]) == MAX_HISTORY_CHARS
+
+
+def test_trim_handles_empty_answer():
+    """短路的那几轮（反问 / 没语料）answer 可能是 None，不能炸。"""
+    from src.retrieve import _trim
+
+    assert _trim([("问", None)]) == [("问", "")]
+
+
+# ── /api/season 的窗口口径（recommend.cour_window）────────────────
+
+def test_cour_window_matches_documented_measurement():
+    """第四部分的实测口径：「十年前的这个季度」（2026-08 查）
+    = 2016-06-24 ~ 2016-10-01 共 134 部。窗口两端必须逐日吻合，
+    差一天口径就变了，而那 134 部是按这个窗口数出来的。
+    """
+    lo, hi = recommend.cour_window(2016, 8)     # 8 月归到 7 月番
+    assert lo == datetime.date(2016, 6, 24)
+    assert hi == datetime.date(2016, 10, 1)
+    # 同季度内任何月份给出同一个窗口
+    assert recommend.cour_window(2016, 7) == (lo, hi)
+    assert recommend.cour_window(2016, 9) == (lo, hi)
+
+
+def test_cour_window_grace_crosses_year_boundary():
+    """1 月番的 7 天宽限要跨进上一年的 12 月。"""
+    lo, hi = recommend.cour_window(2025, 1)
+    assert lo == datetime.date(2024, 12, 25)
+    assert hi == datetime.date(2025, 4, 1)
+
+
+# ── llm.descriptor 的指纹必须覆盖 prompt ──────────────────────────
+
+def test_descriptor_changes_when_answer_prompt_changes(monkeypatch):
+    """🚨 回归：改 prompt 指纹一个字符都不变（2026-08-19 之前的实况）。
+
+    后果是第 5 周评测日志声称两批数字同源，而实际 prompt 已经换过了。
+    同一条纪律 embed（指纹校验）和 translate_cache（PROMPT_VERSION）
+    都做对了，唯独 LLM 这条漏了。
+    """
+    before = llm.descriptor(llm.PRIMARY)["fingerprint"]
+    monkeypatch.setattr(llm, "ANSWER_SYSTEM", llm.ANSWER_SYSTEM + "。")
+    assert llm.descriptor(llm.PRIMARY)["fingerprint"] != before
+
+
+def test_descriptor_changes_when_hyde_prompt_changes(monkeypatch):
+    before = llm.descriptor(llm.PRIMARY)["fingerprint"]
+    monkeypatch.setattr(llm, "HYDE_SYSTEM", llm.HYDE_SYSTEM + "。")
+    assert llm.descriptor(llm.PRIMARY)["fingerprint"] != before
+
+
+def test_descriptor_is_deterministic():
+    """同一份配置两次调用必须给出同一个指纹 —— 它是「同源」的判据本身。"""
+    assert llm.descriptor(llm.PRIMARY) == llm.descriptor(llm.PRIMARY)

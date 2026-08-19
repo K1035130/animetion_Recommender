@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -147,6 +148,23 @@ MAX_PINNED = 40
 #    本层能做的只是**尽早失败**，别让用户干等。最坏 ≈ 12×2 + 退避 ≈ 25 秒。
 REQUEST_EMBED_RETRIES = 2
 REQUEST_EMBED_TIMEOUT = 12.0
+
+# ── 多轮对话的上下文预算 ─────────────────────────────────────────
+# 反问（G.4 状态②）只有在用户**能把答案送回来**时才有意义，否则那句
+# 「你是指哪一部？」就是死路。⇒ 支持两种续问，且**两种的性质完全不同**：
+#
+#   ① 结构化续问：客户端把选中的 series_root 传回来  → 零模型、确定性
+#   ② 自由多轮  ：把最近几轮 Q&A 传回来             → 交给 LLM 消解指代
+#
+# ⚠️ **能用 ① 就别用 ②**（第 15 节原则 2：能用规则判的别交给模型）。
+#    消歧回合的答案是一个 id，让 LLM 从「我要第二个」里猜 id 是白白引入不确定性。
+#
+# 🚨 **上下文长度必须有硬上限，理由是实测过的**：I.2 ② 发现低分 chunk 会
+#    稀释上下文、把 LLM 逼成拒答（同一题 8 条→拒答、3 条→答对）。
+#    历史消息是**同一种噪声**，而且它不像 chunk 那样受 MIN_SCORE 约束。
+#    ⇒ 只带最近几轮、每轮再截断，宁可少带也不要把当前这轮的资料挤没了。
+MAX_HISTORY_TURNS = 3
+MAX_HISTORY_CHARS = 300      # 每条消息的截断长度
 
 
 class State(str, Enum):
@@ -365,8 +383,21 @@ def resolve(conn: psycopg.Connection, question: str) -> Resolution:
                               mentions=mentions)
         root = ranked_roots[0][0]
 
+    return _scoped(conn, root, mentions)
+
+
+def _scoped(conn: psycopg.Connection, root: int,
+            mentions: list[Mention], *, title: str | None = None) -> Resolution:
+    """作用域已经定下来之后的收尾：取标题、收角色 id、判有没有语料。
+
+    ⚠️ 抽成函数是因为**有三个入口会走到这里**：正常 resolve、结构化续问
+       （客户端回传 series_root）、以及上一轮作用域的继承。
+       复制三份的话，「状态③ 必须短路」这条会在其中某一份里被漏掉，
+       而漏掉的症状是 LLM 用训练记忆流畅编一个答案出来（G.4 状态③）。
+    """
     mentions = [m for m in mentions if m.series_root == root]
-    title = next(m.title for m in mentions if m.series_root == root)
+    if title is None:
+        title = next((m.title for m in mentions), None)
     char_ids = sorted({m.character_id for m in mentions
                        if m.character_id is not None})
 
@@ -377,12 +408,35 @@ def resolve(conn: psycopg.Connection, question: str) -> Resolution:
         cur.execute("SELECT count(*) FROM plot_chunk_scope WHERE series_root = %s",
                     (root,))
         (n,) = cur.fetchone()
+        if title is None:                  # 继承/回传来的 root 没有 mention 带标题
+            cur.execute("SELECT coalesce(name_cn, name) FROM anime_profile "
+                        "WHERE subject_id = %s", (root,))
+            row = cur.fetchone()
+            title = row[0] if row else None
     if n == 0:
         return Resolution(state=State.NO_CORPUS, series_root=root, title=title,
                           character_ids=char_ids, mentions=mentions)
 
     return Resolution(state=State.OK, series_root=root, title=title,
                       character_ids=char_ids, mentions=mentions)
+
+
+def resolve_in_scope(conn: psycopg.Connection, question: str,
+                     root: int) -> Resolution:
+    """把作用域**钉死**在 root 上再解析（结构化续问 / 继承上一轮）。
+
+    用于两种场景：
+      ① 上一轮反问「你是指哪一部？」，客户端把用户选中的 series_root 传回来
+      ② 追问句自己认不出实体（「那结局呢」），继承上一轮的作用域
+
+    ⚠️ **仍然要跑 find_mentions**，因为角色 id 要在这个作用域内重新认一遍 ——
+       「蕾姆」在别的作品里也有，钉死作用域正是为了让它只认对的那个。
+    ⚠️ **不会因为 root 与问句无关就报错**：调用方（客户端）说了算，
+       这一层不猜。传错 root 的后果是答非所问，但那是显式的、可回退的，
+       比静默猜错好（G.4 那条「代价不对称」）。
+    """
+    mentions = [m for m in find_mentions(conn, question) if m.series_root == root]
+    return _scoped(conn, root, mentions)
 
 
 # ============================================================
@@ -563,14 +617,156 @@ def retrieve(conn: psycopg.Connection, question: str, *,
 # ④ 生成
 # ============================================================
 
+def _trim(hist: Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    """把历史里每条消息截到 MAX_HISTORY_CHARS。
+
+    🚨 **不截会把当前这轮的资料挤没。** I.2 ② 实测过：上下文里噪声一多，
+       LLM 就从「答对」退化成「资料中没有提到」（同一题 8 条→拒答、3 条→答对）。
+       历史是同一种噪声，而且**不受 MIN_SCORE 那道地板约束** ——
+       地板管的是 chunk，管不到历史。⇒ 这里是唯一能拦住它的地方。
+    ⚠️ 截断只影响喂给模型的副本，不改调用方持有的历史。
+    """
+    out = []
+    for q, a in hist:
+        out.append((q[:MAX_HISTORY_CHARS], (a or "")[:MAX_HISTORY_CHARS]))
+    return out
+
+
+def _last_scope(conn: psycopg.Connection,
+                hist: Sequence[tuple[str, str]]) -> Resolution | None:
+    """从最近的历史里倒着找一个能定出作用域的问句，返回它的整个 Resolution。
+
+    ⚠️ **必须倒着走并且允许跳过**，不能只看上一轮：多轮追问会连成一串
+       没有实体的句子（「三笠是谁」→「那结局呢」→「她和艾伦呢」），
+       只重解析上一轮会拿到 UNKNOWN，**链条从第三轮就断了**。
+    ⚠️ **返回整个 Resolution 而不只是 root**，因为 character_ids 也要带过来 ——
+       理由见 ask() 里合并 pin 的那段（代词让向量召回失准，直取不受影响）。
+    ⚠️ 代价是最多 MAX_HISTORY_TURNS 次 find_mentions（各一条走索引的查询），
+       只在当前问句自己定不出作用域时才会走到这里。
+    """
+    for q, _ in reversed(list(hist)):
+        r = resolve(conn, q)
+        if r.series_root is not None:
+            return r
+    return None
+
+
+def _candidate_labels(conn: psycopg.Connection,
+                      candidates: list[Mention]) -> list[str]:
+    """反问时展示的选项。**同名的要用年份区分开。**
+
+    🚨 实测 bug：原先写的是 `{f"《{m.title}》" for m in candidates}` ——
+       **按标题去重**，于是两个同名但不同 series_root 的作品被折成一个选项：
+         「《多罗罗》的片头曲是什么？」→「你是指哪一部？《多罗罗》」
+       1969 版(done=911) 与 2019 版(done=9450) 是两个系列根，
+       用户看到唯一一个选项，**根本无从选择**，反问就此变成死路。
+    ⚠️ 全库有 **81 个**这样的同名标题（忍者神龟×3 铁臂阿童木×3 狮子王×3
+       Kanon×2…），正是 E.3 记过的「重制/不同改编同名」那批 —— 不是边角情况。
+    ⇒ 按 series_root 去重（而不是按标题），并在标题相撞时补年份。
+    """
+    by_root = {m.series_root: m.title for m in candidates}
+    if not by_root:
+        return []
+    with conn.cursor() as cur:
+        cur.execute("SELECT subject_id, air_year, fav_done FROM anime_profile "
+                    "WHERE subject_id = ANY(%s)", (list(by_root),))
+        meta = {r[0]: (r[1], r[2]) for r in cur.fetchall()}
+    dup = {t for t in by_root.values()
+           if list(by_root.values()).count(t) > 1}
+    # 热度高的排前面 —— 用户更可能问的是那一部（但**不拿它当决胜局**自动选中）
+    roots = sorted(by_root, key=lambda r: -(meta.get(r, (None, 0))[1] or 0))
+    out = []
+    for r in roots:
+        year = meta.get(r, (None, None))[0]
+        label = f"《{by_root[r]}》"
+        if by_root[r] in dup and year:
+            label += f"（{year}）"
+        out.append(label)
+    return out
+
+
 def ask(conn: psycopg.Connection, question: str, *,
         spoiler: bool = False, final: int = FINAL,
-        allow_fallback: bool = True) -> Answer:
-    """完整四步。**chunks 为空时短路，绝不调 LLM**（G.4 状态③）。"""
-    res, chunks, meta = retrieve(conn, question, spoiler=spoiler, final=final)
+        allow_fallback: bool = True,
+        scope: int | None = None,
+        history: Sequence[tuple[str, str]] | None = None) -> Answer:
+    """完整四步。**chunks 为空时短路，绝不调 LLM**（G.4 状态③）。
+
+    多轮对话（2026-08-19 加）：
+      `scope`   客户端回传的 series_root —— 上一轮反问的答案。**零模型、确定性。**
+      `history` 最近几轮 (问, 答)，交给 LLM 消解「她」「那结局呢」这类指代。
+
+    ⚠️ **服务端不存任何会话状态**，历史由调用方传入 —— 与第 2 节那条
+       「评分随请求传入」的架构铁律同源：游客的 localStorage 和将来注册用户的
+       会话表都走同一个入口，这一层不区分。
+    ⚠️ **两者的优先级不同**：`scope` 是显式指令，直接钉死作用域；
+       `history` 只在**当前问句自己认不出实体时**才用来继承作用域 ——
+       否则「聊完进击的巨人接着问芙莉莲」会被锁死在上一部作品里。
+    """
+    hist = list(history or ())[-MAX_HISTORY_TURNS:]
+
+    res = None
+    if scope is not None:
+        # ① 结构化续问：用户点了候选，作用域已经确定
+        res = resolve_in_scope(conn, question, scope)
+    else:
+        res = resolve(conn, question)
+        if hist and res.state in (State.UNKNOWN, State.AMBIGUOUS):
+            prev_res = _last_scope(conn, hist)
+            prev = prev_res.series_root if prev_res else None
+            if prev is not None:
+                if res.state is State.UNKNOWN:
+                    # ② 追问句自己没有实体（「那结局呢」）→ 继承上一轮的作用域。
+                    res = resolve_in_scope(conn, question, prev)
+                elif any(m.series_root == prev for m in res.candidates):
+                    # ③ 追问句有实体但撞了多部，而**上一轮的作用域正是候选之一**
+                    #    → 用它消歧，不要再问一遍用户刚说过的事。
+                    #
+                    # 🚨 **这条是端到端实跑才发现的，单元测试和设计都没料到。**
+                    #    我原以为追问句会落在 UNKNOWN，实测「她和艾伦是什么关系？」
+                    #    落的是 **AMBIGUOUS** —— 因为「艾伦」本身撞多部作品。
+                    #    追问句最常见的形态恰恰是「代词 + 一个不唯一的实体」，
+                    #    只处理 UNKNOWN 等于这条路径整个没接上。
+                    res = resolve_in_scope(conn, question, prev)
+                elif not any(m.entity_type == "subject" for m in res.candidates):
+                    # ④ 歧义**全部来自角色名、问句一个作品名都没点** → 沿用上一轮。
+                    #
+                    # 🚨 实测：聊完进击的巨人再问「她和艾伦是什么关系？」，
+                    #    候选是**另外 8 部**作品，进击的巨人根本不在其中 ——
+                    #    因为它的艾伦存的是「艾伦·耶格尔」，而裸名「艾伦」
+                    #    在 alias 里属于别人（55770 名下只有「艾伦·克鲁格」）。
+                    #    ⇒ 这正是 I.1 ②「alias 只有官方书写形态、没有简称」那条缺口
+                    #      在多轮场景里的形态：**裸名全局有歧义，在上下文里没有。**
+                    #
+                    # ⚠️ **必须限定「没点作品名」**：若问句自己点了作品
+                    #    （「多罗罗的片头曲」→ 候选含 subject），那歧义是关于
+                    #    「哪一部」的，硬套上一轮的作用域会答非所问。
+                    res = resolve_in_scope(conn, question, prev)
+            # ⚠️ 其余情况保持反问 —— 换话题了就别硬套旧作用域。
+
+            # 继承成功时，把上一轮认出的角色也带过来做 ① 直取。
+            #
+            # 🚨 **只继承作用域是不够的，这是实测出来的。** 「三笠是谁」之后问
+            #    「她和艾伦是什么关系？」，作用域正确继承到进击的巨人、召回了
+            #    6 条 chunk，**LLM 仍然答「资料中没有提到」** —— 因为送去做向量
+            #    召回的查询串里还留着代词「她」，召回的不是三笠那几条。
+            #    而上一轮已经确定性地知道「她」= 三笠(character_id)，
+            #    直取不经过向量，**不受代词影响**。
+            # ⚠️ 只带**同一作用域**的角色（prev_res 本来就是那个作用域解析出来的），
+            #    不会把别的作品的角色 pin 进来。
+            if (prev_res is not None and res.state is State.OK
+                    and res.series_root == prev):
+                merged_ids = sorted(set(res.character_ids)
+                                    | set(prev_res.character_ids))
+                res.character_ids = merged_ids[:MAX_PINNED]
+
+    res, chunks, meta = retrieve(conn, question, spoiler=spoiler,
+                                 final=final, res=res)
+    if hist:
+        meta["history_turns"] = len(hist)
 
     if res.state is State.AMBIGUOUS:
-        names = sorted({f"《{m.title}》" for m in res.candidates})
+        names = _candidate_labels(conn, res.candidates)
         return Answer(res.state, f"你是指哪一部？{' / '.join(names[:5])}",
                       [], res, meta)
     if res.state is State.UNKNOWN:
@@ -600,13 +796,15 @@ def ask(conn: psycopg.Connection, question: str, *,
                           f"《{res.title}》在资料库里没有可用的剧情语料。",
                           [], res, meta)
         text, served_by = llm.answer(question, [extra],
-                                     allow_fallback=allow_fallback)
+                                     allow_fallback=allow_fallback,
+                                     history=_trim(hist))
         meta.update(llm.descriptor(served_by))
         return Answer(State.OK, text, [], res, meta)
 
     pairs = [c.as_llm_pair() for c in chunks]
     if extra:
         pairs.append(extra)
-    text, served_by = llm.answer(question, pairs, allow_fallback=allow_fallback)
+    text, served_by = llm.answer(question, pairs, allow_fallback=allow_fallback,
+                                 history=_trim(hist))
     meta.update(llm.descriptor(served_by))
     return Answer(State.OK, text, chunks, res, meta)

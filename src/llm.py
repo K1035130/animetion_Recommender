@@ -144,22 +144,42 @@ def chain(allow_fallback: bool = True) -> list[Provider]:
     return [PRIMARY, *FALLBACKS] if allow_fallback else [PRIMARY]
 
 
+def prompt_digest() -> str:
+    """两条 system prompt 的联合摘要。改任何一条的任何一个字符它都会变。"""
+    h = hashlib.sha256()
+    h.update(HYDE_SYSTEM.encode())
+    h.update(b"\x00")                    # 分隔符：防止跨条拼接出同一串字节
+    h.update(ANSWER_SYSTEM.encode())
+    return h.hexdigest()[:16]
+
+
 def descriptor(served_by: Provider) -> dict:
     """记录**实际**服务方，写进评测日志。
 
     ⚠️ 与 embed.fingerprint() 的用途不同：那个是**校验**（读向量前比对，
        不符就拒绝）；这个纯粹是**记录**，因为 LLM 换了不会让已有数据失效。
        但第 5 周报告必须写清「这批数字是哪个模型跑的」，否则不可复现。
+
+    ⚠️ **指纹必须覆盖 prompt 与 max_tokens（2026-08-19 补）。**
+       此前只有 provider/model/temperature —— 改 ANSWER_SYSTEM 指纹一个
+       字符都不变，第 5 周评测日志会声称两批数字同源而实际不是。
+       同一条纪律 embed（指纹校验）和 translate_cache（键含 PROMPT_VERSION）
+       都做对了，唯独这条漏了。max_tokens 也进指纹：它决定回答会不会被截断。
     """
     payload = json.dumps(
         {"provider": served_by.name, "model": served_by.model,
-         "temperature": TEMPERATURE},
+         "temperature": TEMPERATURE,
+         "max_tokens": [MAX_TOKENS_HYDE, MAX_TOKENS_ANSWER],
+         "hyde_system": HYDE_SYSTEM, "answer_system": ANSWER_SYSTEM},
         sort_keys=True, ensure_ascii=False,
     )
     return {
         "provider": served_by.name,
         "model": served_by.model,
         "temperature": TEMPERATURE,
+        # 单独暴露 prompt 摘要：排查「两批日志指纹不同」时，先看是 prompt
+        # 变了还是模型变了，不用逐字段 diff
+        "prompts": prompt_digest(),
         "fingerprint": hashlib.sha256(payload.encode()).hexdigest()[:16],
     }
 
@@ -335,6 +355,7 @@ def answer(
     chunks: list[tuple[str | None, str]],
     *,
     allow_fallback: bool = True,
+    history: list[tuple[str, str]] | None = None,
 ) -> tuple[str, Provider]:
     """基于检索到的 chunk 生成回答（流程 C 的最后一步）。
 
@@ -353,9 +374,21 @@ def answer(
 
     body = "\n\n".join(
         f"【{sec}】{text}" if sec else text for sec, text in chunks)
+
+    # ⚠️ **历史以对话消息的形式给，不拼进「资料」里。** 拼进去的话
+    #    ANSWER_SYSTEM 第 1 条（只能依据给出的资料回答）就被架空了 ——
+    #    上一轮的回答会变成「资料」，而它本身可能是模型说的话，
+    #    于是错误会在多轮里自我强化。分成 messages 则边界清楚：
+    #    资料是资料，对话是对话。
+    # ⚠️ 截断由调用方（retrieve）负责，这里只负责组装。
+    msgs: list[dict] = [{"role": "system", "content": ANSWER_SYSTEM}]
+    for q, a in (history or []):
+        msgs.append({"role": "user", "content": q})
+        msgs.append({"role": "assistant", "content": a})
+    msgs.append({"role": "user", "content": f"资料：\n{body}\n\n问题：{question}"})
+
     return complete(
-        [{"role": "system", "content": ANSWER_SYSTEM},
-         {"role": "user", "content": f"资料：\n{body}\n\n问题：{question}"}],
+        msgs,
         max_tokens=MAX_TOKENS_ANSWER,
         allow_fallback=allow_fallback,
     )

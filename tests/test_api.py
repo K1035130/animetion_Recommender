@@ -301,3 +301,85 @@ def test_related_validation(client):
                       params={"series_root": 535669,
                               "role": "不存在的岗位"}).status_code == 422
     assert client.get(f"{API}/related").status_code == 422
+
+
+# ── /api/ask 的多轮对话（2026-08-19）─────────────────────────────
+# ⚠️ 这两条**零模型调用**，所以能进 CI：ambiguous 在 retrieve() 里就返回了，
+#    走不到 embed/rerank/LLM（与 state=ok 的用例不同，那种不放 CI）。
+
+def test_ask_ambiguous_candidates_are_distinguishable(client):
+    """🚨 回归：同名重制版必须能被区分开，否则反问是死路。
+
+    实测 bug：《多罗罗》1969(done=911) 与 2019(done=9450) 是两个 series_root，
+    而反问的选项曾按**标题**去重 → 用户看到唯一一个「《多罗罗》」，无从选择。
+    全库有 81 个这样的同名标题（忍者神龟×3 铁臂阿童木×3 狮子王×3…）。
+    """
+    r = client.post(f"{API}/ask", json={"question": "《多罗罗》的片头曲是什么？"})
+    assert r.status_code == 200
+    b = r.json()
+    assert b["state"] == "ambiguous"
+    cands = b["candidates"]
+    assert len(cands) >= 2, f"应给出多个候选，实际 {cands}"
+    roots = [c["series_root"] for c in cands]
+    assert len(set(roots)) == len(roots), "候选必须按 series_root 去重，不能重复"
+    # 标题相同的候选，必须能靠年份区分
+    same = [c for c in cands if c["title"] == cands[0]["title"]]
+    if len(same) > 1:
+        years = [c["year"] for c in same]
+        assert all(y is not None for y in years), f"同名候选缺年份：{same}"
+        assert len(set(years)) == len(years), f"同名候选年份也相同：{same}"
+
+
+def test_resolve_in_scope_pins_the_scope(db_conn):
+    """结构化续问：客户端回传 series_root 后，作用域被钉死。
+
+    ⚠️ 不走 HTTP 端点，因为 state=ok 会真的调 embed/rerank/LLM。
+       这里只验解析层，零外部调用。
+    """
+    from src import retrieve
+
+    q = "《多罗罗》的片头曲是什么？"
+    assert retrieve.resolve(db_conn, q).state is retrieve.State.AMBIGUOUS
+    for root in (107454, 240838):          # 1969 / 2019
+        res = retrieve.resolve_in_scope(db_conn, q, root)
+        assert res.series_root == root, "回传的 root 必须被无条件采纳"
+        assert res.state is not retrieve.State.AMBIGUOUS, "钉死之后不该再反问"
+
+
+# ── /api/season（按档期浏览）──────────────────────────────────────
+# ⚠️ 零模型调用、无个性化 —— 「这个季度在播什么」谁来问答案都一样。
+
+def test_season_documented_window(client):
+    """第四部分的实测基准：2016 年 7 月季 = 2016-06-24 ~ 2016-10-01 共 134 部，
+    头名《你的名字。》done=57,748。窗口两端必须逐日吻合；
+    总数只做下限断言 —— 季度更新灌新数据后精确值会漂。
+    """
+    b = client.get(f"{API}/season", params={"year": 2016, "month": 7}).json()
+    assert (b["year"], b["month"]) == (2016, 7)
+    assert b["window_start"] == "2016-06-24"
+    assert b["window_end"] == "2016-10-01"
+    assert b["total"] >= 100, f"2016 夏季实测 134 部，现在只有 {b['total']}"
+
+    items = b["items"]
+    dones = [i["done"] for i in items]
+    assert dones == sorted(dones, reverse=True), "应按 fav_done 降序"
+    assert all(b["window_start"] <= i["air_date"] < b["window_end"]
+               for i in items), "有条目落在窗口外"
+    top = items[0]["name_cn"] or items[0]["name"]
+    assert top == "你的名字。", f"头名应是文档实测的《你的名字。》，得到 {top}"
+
+
+def test_season_month_normalizes_to_cour(client):
+    """传 8 月要归一化到 7 月番 —— 用户不知道「季度月」是 1/4/7/10。"""
+    a = client.get(f"{API}/season", params={"year": 2016, "month": 8}).json()
+    b = client.get(f"{API}/season", params={"year": 2016, "month": 7}).json()
+    assert a["month"] == 7
+    assert (a["window_start"], a["window_end"]) == \
+           (b["window_start"], b["window_end"])
+
+
+def test_season_defaults_to_current_cour(client):
+    """缺省参数 = 今天所在季度。「十年前的这个季度」只要传 year=今年-10。"""
+    b = client.get(f"{API}/season").json()
+    assert b["month"] in (1, 4, 7, 10)
+    assert b["window_start"] <= b["window_end"]

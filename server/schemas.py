@@ -171,6 +171,24 @@ class AskRequest(BaseModel):
     # 交给 LLM 的 chunk 条数。G.6 实测定案是 8。
     top_k: int = Field(default=8, ge=1, le=20)
 
+    # ── 多轮对话（2026-08-19 加）───────────────────────────────────
+    # ⚠️ **服务端不存会话状态，历史由调用方传入** —— 与第 2 节那条
+    #    「评分随请求传入」的架构铁律同源：游客的 localStorage 与将来
+    #    注册用户的会话表走同一个入口，这一层不区分是谁传来的。
+
+    # 上一轮反问「你是指哪一部？」时，用户点中的那个候选的 series_root。
+    # ⚠️ **给了就无条件钉死作用域**，不再解析作品名 —— 这是用户的显式指令。
+    #    消歧回合本可以让 LLM 去猜「我要第二个」，但那是白白引入不确定性
+    #    （第 15 节原则 2：能用规则判的别交给模型）。
+    scope: int | None = None
+
+    # 最近几轮 (问, 答)，用来消解「她」「那结局呢」这类指代。
+    # ⚠️ 只在**当前问句自己认不出实体时**才用来继承作用域，否则
+    #    「聊完进击的巨人接着问芙莉莲」会被静默锁死在上一部作品里。
+    # 🚨 服务端还会再截一次（retrieve.MAX_HISTORY_TURNS / MAX_HISTORY_CHARS）：
+    #    上下文噪声会把 LLM 逼成拒答，这是 I.2 ② 实测过的。
+    history: list[tuple[str, str]] = Field(default_factory=list, max_length=10)
+
 
 class AskChunk(BaseModel):
     """一条被采纳的语料，前端用来展示出处。"""
@@ -188,10 +206,17 @@ class AskChunk(BaseModel):
 
 
 class AskCandidate(BaseModel):
-    """state=ambiguous 时的候选作品，前端渲染成可点的选项。"""
+    """state=ambiguous 时的候选作品，前端渲染成可点的选项。
+
+    ⚠️ **前端要把 `series_root` 原样回传到下一轮的 `scope`**，
+       否则那句「你是指哪一部？」就是死路 —— 用户选了也没地方送。
+    """
 
     series_root: int
     title: str
+    # ⚠️ 同名重制版必须靠年份区分：《多罗罗》1969 与 2019 是两个系列根，
+    #    只显示标题的话两个选项长得一模一样，用户无从选择（全库 81 例）。
+    year: int | None = None
 
 
 class AskResponse(BaseModel):
@@ -229,3 +254,30 @@ class RelatedResponse(BaseModel):
     series_root: int
     title: str | None
     items: list[RelatedWork]
+
+
+# ── 按档期浏览（GET /api/season）──────────────────────────────────
+# ⚠️ 无个性化的浏览，**不挂在 /recommend 上** —— 那个要传评分才能算偏好向量，
+#    而「这个季度在播什么」谁来问答案都一样。零模型调用。
+
+
+class SeasonItem(BaseModel):
+    subject_id: int
+    name: str
+    name_cn: str | None
+    air_date: str
+    form: str | None
+    done: int
+    bgm_score: float | None
+
+
+class SeasonResponse(BaseModel):
+    # 归一化后的季度（month 恒为 1/4/7/10），查询传 8 月会归到 7 月番
+    year: int
+    month: int
+    # 窗口口径：recommend.cour_window —— 本季起点 −7 天 ~ 下季起点（右开）
+    window_start: str
+    window_end: str
+    # 窗口内的总数（items 受 limit 截断，total 不受）
+    total: int
+    items: list[SeasonItem]

@@ -426,6 +426,24 @@ def season_window(today: datetime.date | None = None
     return lo, hi
 
 
+def cour_window(year: int, month: int) -> tuple[datetime.date, datetime.date]:
+    """**单个**季度的档期窗口 = 本季起点 − 宽限 ~ 下季起点（右开）。
+
+    「十年前的这个季度在播什么」这类按档期浏览的口径（GET /api/season）。
+    ⚠️ 与 season_window 不是一回事：那个是推荐候选池的**三季混合**窗口，
+       这个是单季列表 —— 从它借用的只有 COUR_GRACE_DAYS 那 7 天宽限
+       （接住抢跑的季番，例：7 月番窗口 = 6/24 ~ 10/1）。
+    ⚠️ 右端是**下季起点（开区间）**，所以相邻两季的窗口在「下季起点前 7 天」
+       有重叠 —— 9/25 开播的作品既算 7 月番的尾巴也算 10 月番的抢跑。
+       这是宽限的固有代价，别为消除重叠把右端改成 −7 天：
+       那会让 9/25 开播的新番在「当季」查询里凭空消失一周。
+    """
+    start = _cour_start(year, month)
+    lo = start - datetime.timedelta(days=COUR_GRACE_DAYS)
+    hi = _shift_cour(start, 1)
+    return lo, hi
+
+
 def _months_ago(n: int) -> int:
     """n 个月前的「年*100+月」。
 

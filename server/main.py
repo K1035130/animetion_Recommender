@@ -16,6 +16,7 @@ user_rating 表都往这同一个入口喂数据，推荐链路一行不改。
    把并发拖成串行。同步端点由 FastAPI 丢进线程池，才是正确做法。
 """
 
+import datetime
 import os
 import threading
 from collections.abc import Iterator
@@ -434,13 +435,24 @@ def ask(req: schemas.AskRequest) -> schemas.AskResponse:
     with _conn() as c:
         try:
             res = retrieve.ask(c, req.question,
-                               spoiler=req.spoiler, final=req.top_k)
+                               spoiler=req.spoiler, final=req.top_k,
+                               scope=req.scope, history=req.history)
         except embed.EmbedError as exc:
             # ⚠️ 不要在这里 fallback 到别的 embedding 模型 —— 库里 89,544 条
             #    向量是 Qwen3 定义的坐标系，换模型不报错、只返回排好序的噪声。
             raise HTTPException(503, f"向量检索不可用：{exc}") from exc
         except llm.LLMError as exc:
             raise HTTPException(503, f"生成不可用：{exc}") from exc
+
+        # ⚠️ 候选的年份要在连接还开着的时候取。同名重制版（《多罗罗》1969/2019，
+        #    全库 81 例）不带年份就是两个一模一样的选项，用户无从选择。
+        roots = {m.series_root: m.title for m in res.resolution.candidates}
+        years: dict[int, int | None] = {}
+        if roots:
+            with c.cursor() as cur:
+                cur.execute("SELECT subject_id, air_year FROM anime_profile "
+                            "WHERE subject_id = ANY(%s)", (list(roots),))
+                years = dict(cur.fetchall())
 
     return schemas.AskResponse(
         state=res.state.value,
@@ -456,10 +468,11 @@ def ask(req: schemas.AskRequest) -> schemas.AskResponse:
         ],
         # ⚠️ 按 series_root 去重：同一部作品会因为多个同名角色出现多次
         #    （「拉姆」实测撞 4 部，但每部只该在反问里出现一次）。
+        # ⚠️ **不能按标题去重** —— 那会把《多罗罗》1969 与 2019 折成一个选项。
         candidates=[
-            schemas.AskCandidate(series_root=root, title=title)
-            for root, title in sorted(
-                {m.series_root: m.title for m in res.resolution.candidates}.items())
+            schemas.AskCandidate(series_root=root, title=title,
+                                 year=years.get(root))
+            for root, title in sorted(roots.items())
         ],
         meta=res.meta,
     )
@@ -511,4 +524,65 @@ def get_related(
     return schemas.RelatedResponse(
         series_root=series_root, title=row[0],
         items=[schemas.RelatedWork(**vars(r)) for r in items[:limit]],
+    )
+
+
+@app.get(f"{API}/season", response_model=schemas.SeasonResponse)
+def season(
+    year: int | None = Query(default=None, ge=1890, le=2100),
+    month: int | None = Query(default=None, ge=1, le=12),
+    include_nsfw: bool = False,
+    limit: int = Query(default=100, ge=1, le=200),
+) -> schemas.SeasonResponse:
+    """某个季度在播什么。**零模型调用，一条 SQL。**
+
+    year/month 缺省取今天（UTC）所在季度，所以「十年前的这个季度」
+    只要传 `year=今年-10` —— 意图路由层（第四部分分支③）就是这么用的。
+
+    ⚠️ **air_date 上没有索引，这是 Seq Scan**（实测 5.9 ms / 扫 11,453 行）。
+       不要照抄 /api/related 那句「走索引的 SQL」—— 那条是 staff @> jsonb
+       命中 GIN，本条不是。5.9 ms 相对 ~200 ms 的跨国 RTT 是噪声，
+       所以**不建索引**；真要建也得先量，别凭「看着像范围查询」就加。
+    ⚠️ 不挂在 /recommend 上：那个要传评分才能算偏好向量，而这里是
+       无个性化的浏览。窗口口径的唯一定义处是 recommend.cour_window()
+       （本季起点 −7 天 ~ 下季起点，右开），不要在 SQL 里另写日期算术。
+    ⚠️ 排序按 fav_done 降序 + subject_id 次级键 —— 并列时 Postgres 给
+       任意顺序，没有次级键结果不可复现（B 节踩过的同一个坑）。
+
+    ⚠️ **回溯型查询才有料，当季/未来天生稀薄** —— 这不是本端点的 bug，
+       是候选集 `done>=50` 的口径（第四部分「季度更新」①）：
+         2016 年夏季  134 部        ← 「十年前的这个季度」，主力用法
+         当季(2026Q3)  43 部        ← dump 快照最晚 air_date 2026-09-11
+         下一季         0 部        ← 库内 air_date > 今天的总共只有 2 部
+       与「mode=upcoming 实测只召回 2 部」同一个根因。⇒ 路由层拿它答
+       「下季看什么」会返回空列表，**要在那里给话术，不要在这里放宽窗口**。
+    """
+    today = datetime.datetime.now(datetime.UTC).date()
+    lo, hi = recommend.cour_window(year or today.year, month or today.month)
+
+    with _conn() as c, c.cursor() as cur:
+        cur.execute("""
+            SELECT subject_id, name, name_cn, air_date, form, fav_done, score,
+                   count(*) OVER () AS total
+              FROM anime_profile
+             WHERE air_date >= %s AND air_date < %s
+               AND (%s OR NOT nsfw)
+             ORDER BY fav_done DESC, subject_id
+             LIMIT %s
+        """, (lo, hi, include_nsfw, limit))
+        rows = cur.fetchall()
+
+    # 归一化回季度月：查询传 8 月，结果标 7 月番
+    cour_start = lo + datetime.timedelta(days=recommend.COUR_GRACE_DAYS)
+    return schemas.SeasonResponse(
+        year=cour_start.year, month=cour_start.month,
+        window_start=lo.isoformat(), window_end=hi.isoformat(),
+        total=rows[0][7] if rows else 0,
+        items=[
+            schemas.SeasonItem(
+                subject_id=r[0], name=r[1], name_cn=r[2],
+                air_date=r[3].isoformat(), form=r[4], done=r[5],
+                bgm_score=float(r[6]) if r[6] is not None else None,
+            ) for r in rows
+        ],
     )
