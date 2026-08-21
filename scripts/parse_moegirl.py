@@ -192,6 +192,10 @@ KIND_PAT = [
 DROP_KINDS = {"episodes", "goods", "credits", "info", "guide"}
 
 
+# ⚠️ 复用同一条正则，**不另写一份** —— 两份迟早漂移。
+SONGS_PAT = next(p for k, p in KIND_PAT if k == "songs")
+
+
 def classify(title: str, text: str = "") -> str:
     """按章节标题（必要时看内容）判断 chunk 类型。"""
     for kind, pat in KIND_PAT:
@@ -226,6 +230,64 @@ CREDIT_PAT = re.compile(r"CV[.:：]|作词|作曲|编曲|演唱[:：]|作詞|編
 def is_credit_list(text: str) -> bool:
     """像演职员/歌曲清单而不是散文。"""
     return len(CREDIT_PAT.findall(text)) >= 3 or (text.count("•") + text.count("・")) >= 3
+
+
+# ⚠️ **OP/ED 的归属信息住在独立的短标题段落里，不在曲目行里。**
+#    萌娘的排版是「<p>片头曲（OP）</p>」当小标题，后面跟曲目详情：
+#
+#        片尾曲(ED)                    ← 7 字，被 12 字下限当"残句"丢掉
+#        曲名：偶尔也说说昔日吧…        ← 58 字，保留
+#
+#    结果：**结构 100% 丢失、内容 100% 保留** —— 语料里只剩一串曲子，
+#    分不出哪首是 OP 哪首是 ED，而那正是留住 songs 的全部理由。
+#    实测 2,302 页里 1,926 页（83.7%）带这类标注，全部丢失。
+#    🚨 这是**第二个** OP/ED 杀手：第一个是 is_credit_list（已在下方修过），
+#       这条躲在「丢掉『参见』这类残句」的注释后面，一直没被发现。
+#
+# ⚠️ **修法是吸收成前缀，不是放宽 12 字下限。** 放宽会把「参见」残句放回来；
+#    而且标题单独成 block 时，chunk_blocks 可能把它和曲目切进**不同的 chunk**
+#    （药屋的「相关音乐」就切成了 2 条）—— 贴成前缀则切到哪里都不丢归属。
+SONG_LABEL = re.compile(
+    r"^(?:"
+    r"第[0-9一二三四五六七八九十]+[期季部]|"
+    r"(?:片头曲|片頭曲|片尾曲|片尾|片头|主题曲|主題曲|插曲|插入曲|插入歌|"
+    r"印象曲|印象歌|角色歌|character\s*song)"
+    r"(?:\s*[（(][^）)]{0,8}[）)])?\s*\d*|"
+    r"(?:OP|ED|IN|IM)\s*\d*"
+    r")$", re.IGNORECASE)
+
+# 一首歌的字段被拆成多段时的续行（《电波女与青春男》：曲名一段、作词一段、
+# 歌手一段）。逐段贴前缀会得到「片头曲(OP)：作词…」这种割裂的重复行。
+SONG_CONT = re.compile(r"^(?:作词|作曲|编曲|作詞|編曲|演唱|歌|CV)[、，,]?[^:：]{0,6}[:：]")
+
+# 期数与曲类是两级：`第1期` 之下可以有 OP/ED/插曲各若干。
+SONG_STAGE = re.compile(r"^第[0-9一二三四五六七八九十]+[期季部]$")
+
+
+def attach_song_labels(blocks: list) -> list:
+    """把 songs 章节里的分组标题吸收成随后曲目行的前缀。
+
+    ⚠️ 标题 block 本身**从列表里去掉** —— 它已经贴进后面的行了，留着会
+       重复，而且它本来就撑不过 12 字下限。
+    ⚠️ 只吸收「标题后面真的跟着曲目」的情况；一节末尾孤零零的标题直接丢，
+       与原行为一致。
+    """
+    stage = kind = ""
+    out = []
+    for txt, hm, boxed in blocks:
+        if SONG_LABEL.match(txt):
+            if SONG_STAGE.match(txt):
+                stage, kind = txt, ""     # 换期时曲类归零，否则会串到下一期
+            else:
+                kind = txt
+            continue
+        if out and SONG_CONT.match(txt):
+            prev = out[-1]
+            out[-1] = (prev[0] + " " + txt, prev[1] + hm, prev[2] or boxed)
+            continue
+        prefix = " ".join(x for x in (stage, kind) if x)
+        out.append((f"{prefix}：{txt}" if prefix else txt, hm, boxed))
+    return out
 
 
 def n_cjk(s: str) -> int:
@@ -279,7 +341,11 @@ def restore_language_variants(root) -> None:
         except (ValueError, TypeError):
             continue
         t = ((d.get("disabled") or {}).get("t")) or ""
-        t = re.sub(r"<[^>]+>", "", t).strip()
+        t = re.sub(r"<[^>]+>", "", t)
+        # ⚠️ 属性里放的是 **wikitext 片段**，不是 HTML —— 只去标签会留下
+        #    「想風]]」「蒼空の炎]]」这类残尾。内链取显示名（[[A|B]] → B）。
+        t = re.sub(r"\[\[(?:[^\[\]|]*\|)?([^\[\]|]*)\]\]", r"\1", t)
+        t = t.replace("[[", "").replace("]]", "").strip()
         if t:
             el.text = t
 
@@ -436,6 +502,9 @@ def parse_page(html: str) -> list[dict]:
         path = " > ".join([*crumb, title]) if title else " > ".join(crumb)
 
         blocks = [block_text(el) for el in own_blocks(sec)]
+        # ⚠️ **必须在 12 字下限之前** —— 分组标题只有 6~7 字，过滤之后就没了。
+        if SONGS_PAT.search(" ".join([*crumb, title])):
+            blocks = attach_song_labels(blocks)
         blocks = [b for b in blocks if len(b[0]) >= 12]      # 丢掉「参见」这类残句
         if not blocks:
             continue
