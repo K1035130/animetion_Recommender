@@ -57,6 +57,13 @@ from src.textproc import dict_fingerprint, tokenize
 
 CHUNKS = Path(__file__).resolve().parent.parent / "data" / "interim" / "moegirl_chunks.jsonl"
 TITLES = Path(__file__).resolve().parent.parent / "data" / "interim" / "moegirl_titles.json"
+_ROOT = Path(__file__).resolve().parent.parent
+# 阶段 06 角色页。⚠️ 与作品页**共用 plot_chunk 表和 source='moegirl'** ——
+#    sql/007 第 1 周就把 moegirl_page.kind 的 CHECK 写成了 ('series','character')，
+#    位置是留好的，不需要动 schema。两者靠 pageid 区分，唯一约束
+#    (source, pageid, character_id, chunk_no) 天然不冲突。
+CHAR_CHUNKS = _ROOT / "data" / "interim" / "moegirl_char_chunks.jsonl"
+CHAR_MANIFEST = _ROOT / "data" / "raw" / "moegirl_char" / "manifest.jsonl"
 
 # 写库批大小。⚠️ 别调太大：单批越大，中途失败时回滚掉的越多。
 WRITE_BATCH = 1_000
@@ -94,22 +101,34 @@ def preflight(conn) -> set[int]:
 # ============================================================
 # 第 2 段：读语料（不碰数据库）
 # ============================================================
-def load_corpus(known: set[int], limit: int | None):
+def load_corpus(known: set[int], limit: int | None, kind: str = "series"):
     """返回 (pages, chunks, scope)。
 
     ⚠️ series_roots 里不在 anime_profile 的要**在这里挡掉**，否则写
        plot_chunk_scope 时才炸外键 —— 那时 API 的钱已经花完了。
     """
-    if not CHUNKS.exists():
-        raise SystemExit(f"✗ 缺少 {CHUNKS}，先跑 scripts/parse_moegirl.py")
-    if not TITLES.exists():
-        raise SystemExit(f"✗ 缺少 {TITLES}，先跑 scripts/fetch_moegirl.py")
+    char = kind == "character"
+    src = CHAR_CHUNKS if char else CHUNKS
+    if not src.exists():
+        raise SystemExit(f"✗ 缺少 {src}，先跑 scripts/parse_moegirl.py"
+                         + (" --kind character" if char else ""))
+    if char:
+        if not CHAR_MANIFEST.exists():
+            raise SystemExit(f"✗ 缺少 {CHAR_MANIFEST}，先跑 scripts/fetch_char_pages.py")
+        # ⚠️ 角色页 manifest 是**追加写**的（断点续跑会重复 pageid），保留最后一条。
+        meta = {}
+        for line in CHAR_MANIFEST.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                m = json.loads(line)
+                meta[m["pageid"]] = m
+    else:
+        if not TITLES.exists():
+            raise SystemExit(f"✗ 缺少 {TITLES}，先跑 scripts/fetch_moegirl.py")
+        manifest = json.loads(TITLES.read_text(encoding="utf-8"))
+        # manifest 的键是 subject_id，值里带 pageid —— 我们要的是按 pageid 索引
+        meta = {v["pageid"]: v for v in manifest.values()}
 
-    manifest = json.loads(TITLES.read_text(encoding="utf-8"))
-    # manifest 的键是 subject_id，值里带 pageid —— 我们要的是按 pageid 索引
-    meta = {v["pageid"]: v for v in manifest.values()}
-
-    rows = [json.loads(x) for x in CHUNKS.read_text(encoding="utf-8").splitlines()]
+    rows = [json.loads(x) for x in src.read_text(encoding="utf-8").splitlines()]
 
     # 按页分组后再截断，保证 --limit 时页面是完整的（半页语料没有意义）
     by_page: dict[int, list[dict]] = defaultdict(list)
@@ -125,7 +144,7 @@ def load_corpus(known: set[int], limit: int | None):
         m = meta.get(pid)
         if m is None:                       # manifest 与 chunk 文件不同步
             continue
-        pages.append((pid, "series", m["title"], int(m["lastrevid"])))
+        pages.append((pid, kind, m["title"], int(m["lastrevid"])))
         for r in by_page[pid]:
             chunks.append(r)
             for sr in r["series_roots"]:
@@ -254,10 +273,16 @@ def write_scope(conn, scope) -> int:
     return n
 
 
-def record_meta(conn, n_chunks: int, n_pages: int) -> None:
-    """登记出处。⚠️ 没有这一行就说明本脚本没跑完 —— 半灌的语料比全空更危险。"""
+def record_meta(conn, n_chunks: int, n_pages: int, kind: str = "series") -> None:
+    """登记出处。⚠️ 没有这一行就说明本脚本没跑完 —— 半灌的语料比全空更危险。
+
+    ⚠️ **作品页和角色页各记一行，key 不同。** 两者是分开跑、分开增量的，
+       共用一个 key 的话后跑的那次会把前一次的 rows/built_at 覆盖掉，
+       而那一行正是"这批语料是谁、什么时候、用哪个模型灌的"的唯一记录。
+    """
+    key = "plot_chunk_char" if kind == "character" else "plot_chunk"
     desc = embed.descriptor(
-        table="plot_chunk", source="moegirl",
+        table="plot_chunk", source="moegirl", page_kind=kind,
         pages=n_pages, rows=n_chunks,
         dict_fingerprint=dict_fingerprint(),
         built_at=datetime.now(UTC).isoformat(timespec="seconds"),
@@ -265,11 +290,11 @@ def record_meta(conn, n_chunks: int, n_pages: int) -> None:
     with conn.cursor() as cur:
         cur.execute("""
             INSERT INTO build_meta (key, value, updated_at)
-                 VALUES ('plot_chunk', %s, now())
+                 VALUES (%s, %s, now())
             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-        """, (Json(desc),))
+        """, (key, Json(desc)))
     conn.commit()
-    print(f"build_meta['plot_chunk'] = {desc}")
+    print(f"build_meta[{key!r}] = {desc}")
 
 
 def main() -> int:
@@ -277,6 +302,8 @@ def main() -> int:
     ap.add_argument("--limit", type=int, help="只处理前 N 个页面（小样本试跑）")
     ap.add_argument("-c", "--concurrency", type=int, default=8,
                     help="embedding 并发路数（默认 8）")
+    ap.add_argument("--kind", choices=("series", "character"), default="series",
+                    help="灌作品页（默认）还是角色页")
     args = ap.parse_args()
 
     # ── 第 1 段：前置检查（短连接）─────────────────────────────
@@ -286,7 +313,7 @@ def main() -> int:
     with db.connect() as conn:
         known = preflight(conn)
 
-    pages, chunks, scope = load_corpus(known, args.limit)
+    pages, chunks, scope = load_corpus(known, args.limit, args.kind)
     if not chunks:
         print("✗ 没有可灌的 chunk", file=sys.stderr)
         return 1
@@ -317,7 +344,7 @@ def main() -> int:
             #    拿它去写 build_meta 会让指纹行显示 rows=0，
             #    看着像"没灌成功"，实际库里是满的。
             #    与 E.7c 记的「统计输出把条目总数写死」同类：不报错，只是数字错。
-            record_meta(conn, len(chunks), len(pages))
+            record_meta(conn, len(chunks), len(pages), args.kind)
 
         with conn.cursor() as cur:
             cur.execute("""

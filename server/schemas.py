@@ -256,6 +256,33 @@ class RelatedResponse(BaseModel):
     items: list[RelatedWork]
 
 
+# ── 声优配役（GET /api/voice）────────────────────────────────────
+# ⚠️ 与 /related 同一类：结构化事实查询，**零模型调用**。
+#    role_type 原样返回给前端（1=主角 2=配角 3=客串，可能为 null），
+#    由展示层决定怎么标 —— 服务端不做成中文字符串，否则前端要反解析。
+
+
+class VoiceRoleItem(BaseModel):
+    character_id: int
+    # ⚠️ 可能为 null：voice_role 涉及 82,814 个角色，其中 30.9% 在 alias 里
+    #    查不到名字（那些角色没写简介，没被 build_char_chunks 收进来）。
+    #    如实返回 null，不要填「未知」之类的占位串。
+    character_name: str | None
+    series_root: int
+    title: str
+    air_year: int | None
+    role_type: int | None
+    fav_done: int | None
+
+
+class VoiceResponse(BaseModel):
+    person_id: int
+    name: str                 # dump 原名，多为日文
+    name_cn: str | None
+    n_roles: int              # 库内配役总数（未截断），items 是其中前 limit 条
+    items: list[VoiceRoleItem]
+
+
 # ── 按档期浏览（GET /api/season）──────────────────────────────────
 # ⚠️ 无个性化的浏览，**不挂在 /recommend 上** —— 那个要传评分才能算偏好向量，
 #    而「这个季度在播什么」谁来问答案都一样。零模型调用。

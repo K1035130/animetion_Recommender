@@ -89,6 +89,13 @@ MANIFEST = RAW_DIR / "manifest.jsonl"
 TITLE_MAP = Path("data/interim/moegirl_titles.json")
 OUT = Path("data/interim/moegirl_chunks.jsonl")
 
+# 阶段 06 的角色页。⚠️ **切分/清洗规则与作品页共用同一套** —— 实测 36 页角色页
+#    产出 prose 193 + songs 4、零 credits 垃圾，章节是「简介/经历/能力」这类，
+#    不需要为角色页另写一个解析器。两者唯一的差别是**作用域从哪来**（见 main）。
+CHAR_RAW_DIR = Path("data/raw/moegirl_char")
+CHAR_MANIFEST = CHAR_RAW_DIR / "manifest.jsonl"
+CHAR_OUT = Path("data/interim/moegirl_char_chunks.jsonl")
+
 # 目标 400 字：全量实测 2,233 个条目 → 19,526 条（中位 7 chunk/页、156 字/条）。
 # 📌 存储不再是约束（升级付费后按 $0.35/GB-月 线性计费，3 万条约 $0.06/月），
 #    所以这个数现在只该按**检索质量**来调，不用再对照什么天花板。
@@ -98,10 +105,29 @@ TARGET, MAX_CHARS, MIN_CHARS = 400, 600, 80
 # ⚠️ **table 不能一刀切剥掉。** 萌娘百科拿表格当**排版容器**用：剧透提示框、
 #    台词引用框、剧情概要框全是 <table>。实测 30 页 1,149 个表格里有 36 个是
 #    这种容器，共 40,405 字 —— 一刀切会丢掉《辉夜》的剧情简介和《JOJO》的分部概要。
-# 判据（实测定的）：单元格 ≤4 且平均每格 ≥60 字 → 排版容器，保留并转成 <p>；
+# 判据（实测定的）：单元格 ≤40 且平均每格 ≥60 字 → 排版容器，保留并转成 <p>；
 #                   否则是数据表（分集列表/STAFF表/单行本列表），丢掉。
 #    数据表的特征就是「格子多、每格短」，两者分得很开。
-TABLE_MAX_CELLS, TABLE_MIN_AVG = 4, 60
+#
+# 🚨 **上限从 4 放宽到 40（2026-08-21）—— 原值在丢剧情，这是 F.4 ④ 的精确根因。**
+#    实测同一页的《上条当麻》给出了完美对照：
+#        「旧约」table  cells=2   密度=1715.5 汉字/格 → 保留
+#        「新约」table  cells=18  密度= 489.4        → ★整表删除（9,973 字）
+#    每格 489 个汉字，**密度判据早就认定它是散文容器**，却被 cells<=4 先否决了 ——
+#    那 18 个格子是里面嵌的几个小注释表凑出来的，不是数据表的特征。
+#    ⚠️ 密度才是真判据，格子数只该用来挡「格子多且每格短」，不该单独一票否决。
+#
+#    收益（36 个角色页 + 2,302 个作品页实测）：
+#        角色页 chunk 430→520 (+21%)、正文 +28%，新增 91 条里「经历」占 51 条
+#               （鲁迪乌斯 3岁-74岁人生历程、上条当麻新约剧情），零垃圾
+#        作品页 +0.8% chunk / +1.5% 字，多是「经历>漫画剧情」「用语剧情>时间线」
+#    📌 这直接对上 B.1 可回答率那条 **「结局」12/12 全部未命中** —— 结局就住在
+#       这些被整表删掉的折叠块里（萌娘用 mw-collapsible 折叠长剧情，而它是 table）。
+#
+# ⚠️ **为什么是 40 而不是取消上限**：试过 40 / 200 / 无上限，三档产出**逐字节相同**
+#    —— 语料里根本没有 cells>40 的散文容器。既然如此就保留一个有限上限，
+#    真来了个 500 格的怪东西时还有个兜底，不必赌密度判据在极端情况下也成立。
+TABLE_MAX_CELLS, TABLE_MIN_AVG = 40, 60
 
 # 📌 萌娘百科的剧透提示模板，**比 heimu 更强的剧透信号**：
 #    heimu 是行内的、只标短语，且只有 21/28 个条目有；这个框标的是**整段剧情概要**。
@@ -549,27 +575,42 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="解析萌娘百科 HTML 为 chunk")
     ap.add_argument("--limit", type=int, help="只处理前 N 个条目")
     ap.add_argument("--stats-only", action="store_true", help="只统计不写文件")
+    ap.add_argument("--kind", choices=("series", "character"), default="series",
+                    help="解析作品页（默认）还是角色页")
     a = ap.parse_args()
 
+    char = a.kind == "character"
+    raw_dir = CHAR_RAW_DIR if char else RAW_DIR
+    manifest = CHAR_MANIFEST if char else MANIFEST
+    out_path = CHAR_OUT if char else OUT
+
     rows = [json.loads(x) for x in
-            MANIFEST.read_text(encoding="utf-8").splitlines() if x.strip()]
+            manifest.read_text(encoding="utf-8").splitlines() if x.strip()]
     # 同一 pageid 可能被抓过两次（重跑），保留最后一条
     rows = list({r["pageid"]: r for r in rows}.values())
     if a.limit:
         rows = rows[:a.limit]
 
     # pageid → 它覆盖的系列根（一个条目可能对应多个系列，见 fetch 脚本的去重说明）
-    tmap = json.loads(TITLE_MAP.read_text(encoding="utf-8"))
-    roots: dict[int, list[int]] = {}
-    for root, v in tmap.items():
-        roots.setdefault(v["pageid"], []).append(int(root))
+    # ⚠️ **两种页面的作用域来源不同，这是它们唯一的实质差别**：
+    #    作品页靠标题解析（moegirl_titles.json：series_root → pageid）；
+    #    角色页没有标题解析这一步，作用域是**抓取时**从「哪个作品页链到它」
+    #    推出来的，已经记在 char manifest 的 series_roots 里。
+    #    ⚠️ 一个角色可以属于多部作品（Fate 系列尤其），所以那是个列表不是单值。
+    if char:
+        roots = {r["pageid"]: r.get("series_roots", []) for r in rows}
+    else:
+        tmap = json.loads(TITLE_MAP.read_text(encoding="utf-8"))
+        roots = {}
+        for root, v in tmap.items():
+            roots.setdefault(v["pageid"], []).append(int(root))
 
-    fh = None if a.stats_only else OUT.open("w", encoding="utf-8")
+    fh = None if a.stats_only else out_path.open("w", encoding="utf-8")
     per_page, sec_counter, n_chunks, n_spoil, sizes = [], Counter(), 0, 0, []
     skipped = 0
     bar = make_bar(len(rows), "解析", "页")
     for r in rows:
-        f = RAW_DIR / f"{r['pageid']}.html.gz"
+        f = raw_dir / f"{r['pageid']}.html.gz"
         if not f.exists():
             skipped += 1
             continue
@@ -608,7 +649,7 @@ def main() -> None:
     total_pages = len(rows) if not a.limit else None
     if a.limit:
         # 外推基数取 manifest 的真实条目数，不要写死
-        allrows = sum(1 for x in MANIFEST.read_text(encoding="utf-8").splitlines() if x.strip())
+        allrows = sum(1 for x in manifest.read_text(encoding="utf-8").splitlines() if x.strip())
         est = n_chunks / done * allrows
         print(f"\n外推到 {allrows:,} 个条目: {est:,.0f} 条 "
               f"（约 {est * 2400 / 1e6:.0f} MB · 存储 ${est * 2400 / 1e9 * 0.35:.2f}/月）")
@@ -620,7 +661,7 @@ def main() -> None:
     for s, n in sec_counter.most_common(12):
         print(f"   {n:>6,}  {s[:34]}")
     if not a.stats_only:
-        print(f"\n→ {OUT}")
+        print(f"\n→ {out_path}")
 
 
 if __name__ == "__main__":

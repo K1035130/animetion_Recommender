@@ -38,6 +38,7 @@ from src import (
     related,
     retrieve,
     tag_rules,
+    voice,
 )
 from src.textproc import dict_fingerprint, keep_tags, norm_name, tokenize
 
@@ -524,6 +525,41 @@ def get_related(
     return schemas.RelatedResponse(
         series_root=series_root, title=row[0],
         items=[schemas.RelatedWork(**vars(r)) for r in items[:limit]],
+    )
+
+
+@app.get(f"{API}/voice", response_model=schemas.VoiceResponse)
+def get_voice(
+    name: str = Query(..., min_length=2, description="声优名，中日文均可"),
+    limit: int = Query(20, ge=1, le=100),
+) -> schemas.VoiceResponse:
+    """某位声优配过哪些角色。**零模型调用。**
+
+    ⚠️ **这条路径存在的理由与 /related 相同：/ask 答不了，而且答不了是对的。**
+       流程 C 的召回写死了 `WHERE series_root = X`，天生看不到跨作品的事实；
+       而钉宫理惠在库里有 478 条配役，靠向量召回最多凑出零星几条提及。
+
+    ⚠️ 名字走 alias 的 norm_name **精确匹配**，不做繁简/变体的模糊匹配 ——
+       sql/009 把声优名灌进 alias 正是为此（「花泽香菜」→ 花澤香菜）。
+       📌 这些 person 行不会污染作品/角色解析：retrieve.find_mentions 的
+          JOIN 条件是 coalesce(parent_subject_id, subject_id)，
+          而声优行这两列都是 NULL，INNER JOIN 天然把它们排除。
+
+    ⚠️ 结果按 **character_id** 折叠而不是 series_root：问的是「配过哪些角色」，
+       同一角色出现在续作/OVA 里只算一次。选代表作时 role_type 优先于热度 ——
+       否则「神乐」会被《齐木楠雄》的客串役顶掉《银魂》的主角役（见 voice.py）。
+    """
+    with _conn() as c:
+        people = voice.find_person(c, name)
+        if not people:
+            raise HTTPException(404, f"没有找到声优「{name}」")
+        p = people[0]
+        items = voice.roles_of(c, p.person_id, limit=limit)
+
+    return schemas.VoiceResponse(
+        person_id=p.person_id, name=p.name, name_cn=p.name_cn,
+        n_roles=p.n_roles,
+        items=[schemas.VoiceRoleItem(**vars(r)) for r in items],
     )
 
 
