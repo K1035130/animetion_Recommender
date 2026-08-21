@@ -182,11 +182,38 @@ def make_questions(works: list[dict], n: int, seed: int) -> list[dict]:
 
 
 def build(args) -> int:
+    only = ({int(x) for x in args.only.split(",")}
+            if getattr(args, "only", None) else None)
     conn = db.connect()
     try:
         works = sample_works(conn, max(args.n, 20), args.seed)
         qs = make_questions(works, args.n, args.seed)
-        print(f"出题 {len(qs)} 道，覆盖 {len({q['root'] for q in qs})} 部作品\n")
+        for k, q in enumerate(qs, 1):
+            q["idx"] = k                     # ⚠️ 题号必须在过滤**之前**钉死
+        if only:
+            # 🚨 **定点重测仍然先生成完整题集再过滤，不能"只出这几道题"。**
+            #    make_questions 的抽样是有状态的（take() 在作品池上轮转），
+            #    直接按 n=5 生成会得到**完全不同的 5 道题**，而且看起来一切正常。
+            bad = only - {q["idx"] for q in qs}
+            assert not bad, f"题号超出范围：{sorted(bad)}"
+            prev = {}
+            if RAW.exists():
+                for k, old in enumerate(json.loads(RAW.read_text(encoding="utf-8")), 1):
+                    prev[k] = old
+            qs = [q for q in qs if q["idx"] in only]
+            for q in qs:
+                old = prev.get(q["idx"])
+                if not old:
+                    continue
+                # 题面与基线逐条核对 —— 对不上说明 seed/口径变了，此时"重测"
+                # 测的是另一道题，比不测更糟。
+                assert old["question"] == q["question"], (
+                    f"题 {q['idx']} 与基线题面不一致：\n"
+                    f"  基线 {old['question']}\n  本次 {q['question']}")
+                q["prev"] = {"chunks": old["chunks"], "answer": old["answer"]}
+            print(f"定点重测 {len(qs)} 道（题号 {sorted(only)}），题面已与基线核对\n")
+        else:
+            print(f"出题 {len(qs)} 道，覆盖 {len({q['root'] for q in qs})} 部作品\n")
         for i, q in enumerate(qs, 1):
             ans = R.ask(conn, q["question"], spoiler=q["spoiler"],
                         allow_fallback=False)      # ⚠️ 评测锁死主力模型
@@ -197,20 +224,68 @@ def build(args) -> int:
                             "pinned": c.pinned, "source": c.source}
                            for c in ans.chunks]
             q["meta"] = ans.meta
-            print(f"  [{i:2d}/{len(qs)}] {q['kind']:5} {q['state']:10} "
+            print(f"  [{q.get('idx', i):2d}] {q['kind']:5} {q['state']:10} "
                   f"{q['question'][:34]}")
     finally:
         conn.close()
+        clients.close_all()
 
-    RAW.parent.mkdir(parents=True, exist_ok=True)
-    RAW.write_text(json.dumps(qs, ensure_ascii=False, indent=2), encoding="utf-8")
-    out = Path(args.out) if args.out else SHEET
-    out.write_text(render(qs), encoding="utf-8")
+    # 🚨 **定点重测绝不能覆盖基线。** RAW 是那 60 题的原始记录，
+    #    SHEET 里有 Kevin 已经填好的标签 —— 覆盖掉就再也拿不回来了。
+    raw_out = RAW.with_name(RAW.stem + "_rescore.json") if only else RAW
+    out = (Path(args.out) if args.out
+           else (SHEET.with_name("eval-answerability-rescore.md") if only else SHEET))
+    assert not (only and out == SHEET), "定点重测不能写回基线打分表"
+
+    raw_out.parent.mkdir(parents=True, exist_ok=True)
+    raw_out.write_text(json.dumps(qs, ensure_ascii=False, indent=2), encoding="utf-8")
+    out.write_text(render(qs, RESCORE_HEADER if only else None), encoding="utf-8")
     print(f"\n打分表  {out}")
-    print(f"原始数据 {RAW}")
+    print(f"原始数据 {raw_out}")
     print("\n填完后跑： uv run --group etl python scripts/eval_answerability.py score")
     return 0
 
+
+RESCORE_HEADER = """# 定点重测打分表 —— songs 保底席位修复后
+
+> 📌 **背景**：第 5 周评测发现「片头片尾」8/8 全失败，**100% 是 `MIN_SCORE=0.05`
+> 造成的** —— songs chunk 每次都被正确召回、排层内第 1，但 rerank 分只有
+> 0.003–0.028，被地板全部砍掉。2026-08-20 修法上线（`SONGS_SEAT` 保底席位：
+> OP/ED 问句给 songs 层第 1 一个独立席位，**占座而非豁免地板**）。
+>
+> **这份表只有 5 道题** —— 全库 60 题里检索结果**真的变了**的就这 5 道，
+> 是算出来的不是估的：[49] 在 `resolve` 就 `ambiguous` 短路；
+> [47] [52]（大闹天宫 / 西游记之大圣归来）的池子里**根本没有 songs chunk**，
+> 那是语料覆盖问题，地板怎么改都救不回。**其余 55 道逐字节未变，标签仍然有效。**
+>
+> 🚨 **要验的是新的一格，不是重复上次的判断。**
+> 上次这 5 道全是「资料里没有 → 模型正确拒答」；这次**资料里应该有答案了**，
+> 真正的问题是：**生成能不能用上它。**
+> ⇒ 很可能出现「`retrieval: y` + `answer: r`」这一格 —— 那**不是好结果**，
+> 它意味着答案在资料里而模型没用上（I.2 ② 那类上下文问题），比拒答更值得记。
+>
+> ---
+>
+> **打分规则与 60 题那份完全相同 —— 两问，顺序不能反。**
+>
+> **第一问 `retrieval:`** —— 只看列出的资料，**答案在不在里面**？`y` / `n`
+>   ⚠️ 本轮的答案载体是 **songs 章节**（形如
+>      `コレカラ 歌：Machico 作词：森由里子…`）。
+>      ⚠️ **只要它写明了片头/OP 是哪首，就算 `y`** —— 哪怕格式很生硬。
+>      而如果只列了"相关音乐"却分不出哪首是 OP、哪首是 ED，那算 `n`，
+>      并请在 `note:` 里写一句（那是语料切块的问题，不是检索的问题）。
+>
+> **第二问 `answer:`** —— `r` 没给实质回答 / `y` 给了且对 / `n` 给了但错
+>   ⚠️ 先说「资料中没有提到」接着又补了实质内容 → 算**给了**，按对错记 `y`/`n`。
+>   ⚠️ 张冠李戴（把 ED 说成 OP、把游戏版主题曲说成动画 OP）记 `n`，这类最危险。
+>
+> `note:` 可留空。每题末尾有一个折叠块「修复前这题什么样」，
+> **请打完两个分再展开** —— 先判资料、再判回答、最后才对照。
+>
+> 填完把这个文件发我，或直接跑：
+> `uv run --group etl python scripts/eval_answerability.py score --sheet docs/eval-answerability-rescore.md`
+
+"""
 
 HEADER = """# 可回答率打分表（B.1）
 
@@ -264,10 +339,13 @@ HEADER = """# 可回答率打分表（B.1）
 """
 
 
-def render(qs: list[dict]) -> str:
-    lines = [HEADER]
+def render(qs: list[dict], header: str | None = None) -> str:
+    """⚠️ 题号取 `q["idx"]`（若有）而不是列表位置 —— 定点重测（`--only`）
+    必须沿用**原来的题号**，否则和已经填好的 60 题打分表对不上。"""
+    lines = [HEADER if header is None else header]
     for i, q in enumerate(qs, 1):
-        lines.append(f"---\n\n## [{i}] {q['kind']}　·　{q['question']}\n")
+        num = q.get("idx", i)
+        lines.append(f"---\n\n## [{num}] {q['kind']}　·　{q['question']}\n")
         tags = [f"作用域语料：角色 {q['n_char']} · 萌娘 {q['n_moe']} · 歌曲 {q['n_song']}",
                 f"状态 `{q['state']}`"]
         if q["spoiler"]:
@@ -306,6 +384,22 @@ def render(qs: list[dict]) -> str:
         lines.append("answer: ?")
         lines.append("note:")
         lines.append("```\n")
+
+        # ⚠️ 「修复前」的对照放在**两个填空之后**，与第一问排在模型回答之前
+        #    是同一条纪律：先判资料 → 再判回答 → 最后才看对照。
+        #    顺序颠倒会把判断锚死在旧结论上（"上次说没有，那这次多半也没有"）。
+        if q.get("prev"):
+            pv = q["prev"]
+            lines.append("<details><summary>▽ 打完分再看：修复前这题什么样"
+                         "（仅供对照，不参与判分）</summary>\n")
+            lines.append(f"修复前检索到 {len(pv['chunks'])} 条：\n")
+            for c in pv["chunks"]:
+                sc = f"{c['score']:.4f}" if c.get("score") is not None else "  -  "
+                sec = f"【{c['section']}】" if c["section"] else ""
+                lines.append(f"- `{sc}` {sec}{c['text'][:60]}")
+            lines.append("\n修复前的回答：\n")
+            lines.append("> " + (pv["answer"] or "（无）").replace("\n", "\n> ") + "\n")
+            lines.append("</details>\n")
     return "\n".join(lines)
 
 
@@ -418,6 +512,9 @@ def main() -> int:
     b.add_argument("--n", type=int, default=60)
     b.add_argument("--seed", type=int, default=0)
     b.add_argument("--out", default=None)
+    b.add_argument("--only", default=None,
+                   help="定点重测这几道题（逗号分隔题号）。题目仍由完整的 "
+                        "(n, seed) 生成再过滤，结果另存，绝不覆盖基线")
     b.set_defaults(fn=build)
     r = sub.add_parser("render", help="只按当前格式重排版，不重跑管道")
     r.add_argument("--out", default=None)
