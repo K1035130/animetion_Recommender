@@ -49,7 +49,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from src import db, embed, llm, tag_rules
+from src import clients, db, embed, llm, tag_rules
 from src.textproc import keep_tags
 
 # 查询集：(自然语言查询, 判定相关的 tag 集合)
@@ -217,4 +217,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # ⚠️ 收尾必须在 finally 里：异常路径同样要放掉 httpx 连接池。
+    #    见 src/clients.py —— 这四个脚本此前只关了 Neon 连接。
+    try:
+        _code = main()
+    finally:
+        clients.close_all()
+    raise SystemExit(_code)

@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -119,6 +120,56 @@ MENTION_MAX = 16
 #    G.5g 说 alias 路径是「确定性的解法」，**能被 rerank 挤掉就不是确定性的**。
 #    ⇒ 保底只保「在不在」，**不保排第几** —— 排序仍然全归 rerank。
 PIN_RESERVE = 4
+
+# ── OP/ED 题的 songs 保底席位 ────────────────────────────────────
+#
+# 🚨 **第 5 周评测 §4.2：「片头片尾」8/8 全失败，100% 是 MIN_SCORE 造成的。**
+#    songs chunk **每次都被正确召回、且排层内第 1**（QUOTA_SONGS 工作正常），
+#    但 rerank 分只有 0.003–0.028，被 0.05 的地板全部砍掉。
+#
+# 📌 **根因不是阈值定高了，是绝对阈值在这类查询上根本不是对的判据。**
+#    songs chunk 是条目式文本（`コレカラ 歌：Machico 作词：森由里子…`），
+#    与「片头曲是什么」这句自然语言的 cross-encoder 相关性天然就低 ——
+#    E.4 早写过「歌名是关键词查找，走 BM25 更准」，这是同一现象在 rerank 侧的形态。
+#
+# 🚨 **而且 1e-3 量级的地板在物理上就调不稳**：
+#    `scripts/eval_min_score.py --probe-rerank` 实测 rerank 分数噪声
+#    **5e-4 ~ 8e-4**（批次组成 + 服务端连续批处理），
+#    最低那条 songs chunk 才 0.0032 —— 噪声占它的 25%。
+#
+# ✅ **55 题实测对比（scripts/eval_min_score.py sweep）**：
+#
+#        判据                      songs 命中   上下文新增/题
+#        绝对 0.05（原）              0/7          —
+#        绝对 0.0                     4/7        +3.44
+#        相对 top1×0.02               4/7        +2.02
+#        **保底席位（本方案）**       **5/7**    **+0.09**
+#
+#    ⇒ 规则完胜调阈值：救回更多，代价小 38 倍。**这正是第 15 节原则 2
+#      「确定性门控 > 调参」的一个带数字的实例。**
+#    ⚠️ 剩下 2 题（大闹天宫 / 西游记之大圣归来）**池子里根本没有 songs chunk**，
+#       是语料覆盖问题，地板怎么改都救不回 ⇒ 在能修的 5 题上是 5/5。
+#
+# ⚠️ **必须是「占座」不是「豁免地板」** —— 这是 I.2 ① 那条教训的原样复发：
+#    `kept = [c for c in others if keep(c)][:room]` 按分数降序取前缀，
+#    只放行不占座的话，一条分数极低的 chunk 仍会被 `[:room]` 截掉。
+#
+# ⚠️ **席位独立于 PIN_RESERVE，不共用那 4 席。**
+#    实测题库里两者只在《∀高达》一题同时出现，且 pinned 只有 2 条、没撞上 ——
+#    **所以这条是按构造选的，不是实测选的**：pinned 占满 4 席时共用会让
+#    songs 席位失效，而"保底"一旦有条件就不再是保底。代价至多多 1 条上下文。
+# 🚨 **OP / ED 必须加拉丁词边界，裸子串会大面积误命中。**
+#    自检实测：库里 **75 部**作品名含裸 OP/ED，其中不乏头部作品 ——
+#        Fate/stay night [Unlimit**ed** Blade Works] · **pop**子和pipi美的日常
+#        SPE**ED** GRAPHER · **TOP** をねらえ! · 恋爱FL**OP**S
+#    问这些作品**任何**问题都会触发 songs 席位，把一条无关 chunk 塞进上下文 ——
+#    正是 I.2 ② 那个"低分 chunk 稀释上下文把 LLM 逼成拒答"的成因。
+#    ⚠️ 与 `_latin_word_boundary()` 是同一类问题、同一条修法
+#       （那个是给 alias 扫描用的，这里模式固定，用 lookaround 更直接）。
+#    ⚠️ 中文关键词不需要边界：「片头」不会出现在别的词里面。
+SONGS_QUERY = re.compile(
+    r"片头|片尾|主题曲|插曲|(?<![A-Za-z])(?:OP|ED)(?![A-Za-z])", re.IGNORECASE)
+SONGS_SEAT = 1
 
 # ① 直取的上限。
 #
@@ -537,7 +588,8 @@ def recall(conn: psycopg.Connection, series_root: int, qvec: np.ndarray,
 def _apply_pin_reserve(order: list[Chunk], final: int,
                        reserve: int = PIN_RESERVE,
                        min_score: float = MIN_SCORE,
-                       min_keep: int = MIN_KEEP) -> list[Chunk]:
+                       min_keep: int = MIN_KEEP,
+                       seat: int | None = None) -> list[Chunk]:
     """挑出最终交给 LLM 的 chunk：① 保底席位 + 相关度地板。
 
     **保底只保「在不在」，不保「排第几」** —— 让位之后仍按 rerank 分降序展示，
@@ -550,16 +602,36 @@ def _apply_pin_reserve(order: list[Chunk], final: int,
     """
     pins = [c for c in order if c.pinned][:reserve]
     pin_ids = {c.chunk_id for c in pins}
-    others = [c for c in order if c.chunk_id not in pin_ids]
 
-    room = max(0, final - len(pins))
+    # songs 保底席位：独立于 PIN_RESERVE，且**占座**而非豁免地板（见 SONGS_SEAT）。
+    seats = [c for c in order
+             if c.chunk_id == seat and c.chunk_id not in pin_ids][:SONGS_SEAT]
+    held = pin_ids | {c.chunk_id for c in seats}
+    others = [c for c in order if c.chunk_id not in held]
+
+    room = max(0, final - len(pins) - len(seats))
     kept = [c for c in others if (c.score or 0.0) >= min_score][:room]
     if len(kept) < min_keep:
         kept = others[:min(min_keep, room)]
 
-    out = pins + kept
+    out = pins + seats + kept
     out.sort(key=lambda c: -(c.score if c.score is not None else 0.0))
     return out[:final]
+
+
+def songs_seat(question: str, pool: Sequence[Chunk]) -> int | None:
+    """OP/ED 类问句 → 该给保底席位的那条 songs chunk 的 id；否则 None。
+
+    取**层内第 1**（= 向量召回里最像的那条），不是 rerank 分最高的那条 ——
+    rerank 恰恰是在这类查询上判不准的那一环，用它选席位等于绕回原点。
+    ⚠️ `recall()` 的返回在层内保持 rn 序，所以"第一条 songs"就是层内第 1。
+    """
+    if not SONGS_QUERY.search(question):
+        return None
+    for c in pool:
+        if c.kind == "songs" and c.character_id is None:
+            return c.chunk_id
+    return None
 
 
 def retrieve(conn: psycopg.Connection, question: str, *,
@@ -599,7 +671,8 @@ def retrieve(conn: psycopg.Connection, question: str, *,
             chunk = merged[idx]
             chunk.score = score
             order.append(chunk)
-        out = _apply_pin_reserve(order, final)
+        out = _apply_pin_reserve(order, final,
+                                 seat=songs_seat(question, pool))
         meta["reranked"] = True
         meta.update(rr.descriptor())
     except rr.RerankError as exc:

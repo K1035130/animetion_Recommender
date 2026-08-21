@@ -18,6 +18,7 @@ from src.retrieve import (
     _apply_pin_reserve,
     _latin_word_boundary,
     _substrings,
+    songs_seat,
 )
 
 
@@ -213,3 +214,91 @@ def test_descriptor_changes_when_hyde_prompt_changes(monkeypatch):
 def test_descriptor_is_deterministic():
     """同一份配置两次调用必须给出同一个指纹 —— 它是「同源」的判据本身。"""
     assert llm.descriptor(llm.PRIMARY) == llm.descriptor(llm.PRIMARY)
+
+
+# ── songs 保底席位（SONGS_SEAT）───────────────────────────────────
+#
+# 🚨 这一组锁的是第 5 周评测 §4.2 那个 8/8 全失败：songs chunk 每次都被
+#    正确召回、排层内第 1，却被 MIN_SCORE 地板砍掉。
+#    55 题实测：保底席位 5/7，上下文只 +0.09 条/题；把地板降到 0 只有 4/7
+#    却要 +3.44 条/题。**规则完胜调阈值。**
+
+def mk_song(cid: int, score: float) -> Chunk:
+    return Chunk(chunk_id=cid, section="主题曲", text=f"OP{cid}", kind="songs",
+                 source="moegirl", character_id=None, spoiler_level=0,
+                 score=score, pinned=False)
+
+
+@pytest.mark.parametrize("q, hit", [
+    ("《龙王的工作！》的片头曲是什么？", True),
+    ("这部动画的片尾曲叫什么", True),
+    ("OP 是谁唱的", True),
+    ("这部的 op 好听吗", True),          # 小写
+    ("ED曲叫什么", True),                # 紧跟中文，仍算边界
+    ("主题曲信息", True),
+    ("《龙王的工作！》讲了什么故事？", False),   # 不是 OP/ED 题 → 不给席位
+    ("三笠是谁", False),
+    # 🚨 拉丁词内部的 OP/ED —— 自检发现库里 **75 部**作品名会这样误命中，
+    #    其中不乏头部作品。裸子串版本这 5 条全部误触发。
+    ("《Fate/stay night [Unlimited Blade Works]》讲了什么故事？", False),
+    ("《SPEED GRAPHER》的结局是什么？", False),
+    ("《TOP をねらえ!》讲了什么故事？", False),
+    ("《pop子和pipi美的日常》讲了什么", False),
+    ("《恋爱FLOPS》讲了什么故事？", False),
+])
+def test_songs_seat_only_fires_on_op_ed_questions(q, hit):
+    pool = [mk(1, 0.9), mk_song(2, 0.003)]
+    assert (songs_seat(q, pool) == 2) is hit
+
+
+def test_songs_seat_survives_the_floor():
+    """🚨 回归：∀高达 0.0032 / 跟班×服务 0.0034 —— 全在 0.05 地板之下。"""
+    order = [mk(1, 0.543), mk(2, 0.4), mk(3, 0.3), mk(4, 0.2),
+             mk(5, 0.1), mk(6, 0.09), mk(7, 0.08), mk(8, 0.07),
+             mk_song(9, 0.0032)]
+    plain = _apply_pin_reserve(order, final=8)
+    assert 9 not in [c.chunk_id for c in plain], "没有席位时它本来就该被砍掉"
+
+    out = _apply_pin_reserve(order, final=8, seat=9)
+    assert 9 in [c.chunk_id for c in out], "给了席位就必须保住"
+    assert len(out) == 8
+
+
+def test_songs_seat_must_reserve_not_merely_exempt():
+    """🚨 **这条锁的是「占座」与「豁免地板」的区别 —— 只豁免会失败。**
+
+    构造：8 条都在地板之上，songs 分数最低。
+    若实现成「豁免地板」，songs 仍要和它们按分数序竞争 `[:room]`，
+    排在第 9 位被截掉；只有**占座**才进得来。
+    ⚠️ 这正是 I.2 ① 那条教训（PIN_RESERVE 保「在不在」）的同一形态，
+       没有这条测试，将来有人"简化"成豁免版不会有任何红灯。
+    """
+    order = [mk(i, 0.9 - i * 0.05) for i in range(1, 9)] + [mk_song(99, 0.001)]
+    assert all(c.score >= MIN_SCORE for c in order[:8])
+    out = _apply_pin_reserve(order, final=8, seat=99)
+    assert 99 in [c.chunk_id for c in out], "占座必须挤掉一条普通 chunk"
+    assert len(out) == 8
+
+
+def test_songs_seat_does_not_eat_pin_reserve():
+    """席位独立于 PIN_RESERVE：4 条 pinned 占满时 songs 仍进得来。
+
+    ⚠️ 这条是**按构造定的，不是实测定的** —— 55 题题库里两者只在《∀高达》
+       同时出现且 pinned 只有 2 条，没撞上。留测试是为了把这个选择钉死：
+       "保底"一旦有条件就不再是保底。
+    """
+    order = ([mk(i, 0.9) for i in range(1, 5)]          # 4 条高分普通
+             + [mk(10 + i, 0.001, pinned=True) for i in range(PIN_RESERVE)]
+             + [mk_song(99, 0.001)])
+    out = _apply_pin_reserve(order, final=8, seat=99)
+    ids = [c.chunk_id for c in out]
+    assert 99 in ids, "pinned 占满 4 席时 songs 席位仍须生效"
+    assert sum(1 for c in out if c.pinned) == PIN_RESERVE
+
+
+def test_songs_seat_absent_is_a_noop():
+    """池子里没有 songs chunk（大闹天宫那类）→ 行为与今天完全一致。"""
+    order = [mk(1, 0.873), mk(2, 0.671), mk(3, 0.060), mk(4, 0.032)]
+    assert songs_seat("《大闹天宫》的片头曲是什么？", order) is None
+    assert ([c.chunk_id for c in _apply_pin_reserve(order, final=8, seat=None)]
+            == [c.chunk_id for c in _apply_pin_reserve(order, final=8)])

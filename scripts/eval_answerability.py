@@ -48,7 +48,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src import db
+from src import clients, db
 from src import retrieve as R
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -431,4 +431,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # ⚠️ 收尾必须在 finally 里：异常路径同样要放掉 httpx 连接池。
+    #    见 src/clients.py —— 这四个脚本此前只关了 Neon 连接。
+    try:
+        _code = main()
+    finally:
+        clients.close_all()
+    raise SystemExit(_code)

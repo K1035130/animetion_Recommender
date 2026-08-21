@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from src import db, embed, embed_cache, langclean, translate_cache
+from src import clients, db, embed, embed_cache, langclean, translate_cache
 
 # ⚠️ **固定查询集 —— 改它就等于换了口径，改完必须重跑全部对照。**
 # 选取原则：覆盖不同题材，且都是"描述性找番"（流程 B 路径①）的真实形态。
@@ -215,4 +215,10 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # ⚠️ 收尾必须在 finally 里：异常路径同样要放掉 httpx 连接池。
+    #    见 src/clients.py —— 这四个脚本此前只关了 Neon 连接。
+    try:
+        _code = main()
+    finally:
+        clients.close_all()
+    raise SystemExit(_code)
