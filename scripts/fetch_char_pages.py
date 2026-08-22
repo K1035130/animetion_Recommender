@@ -170,14 +170,32 @@ def main() -> int:
                                  encoding="utf-8")
                 print(f"  存在性已存盘 {i + len(part):,} / {len(unknown):,}", flush=True)
 
-        todo = [t for t in targets if sizes.get(t)
-                and str(sizes[t]["pageid"]) not in have]
+        # 🚨 **按 pageid 去重，不能按标题。** 多个角色名会**重定向到同一个页面**：
+        #    实测 54 个 pageid 被 118 个标题指向 —— 极端的是
+        #    《逆转系列/被害人》，11 个受害者名（高日美佳/冈高夫/吞田菊三…）
+        #    全都指向它；还有大小写变体（Death the Kid / Death the kid）。
+        #    不去重就会把同一页抓 11 遍，实测白抓了 34 次。
+        # ⚠️ **roots 要合并不要覆盖**：实测这 34 组的 series_roots 恰好都一致
+        #    （同名角色本就同属一部作品），但那是数据凑巧，不是保证 ——
+        #    覆盖的话某天就会静默丢掉一半作用域。
+        by_pid: dict[int, tuple[str, set[int]]] = {}
+        for t in targets:
+            v = sizes.get(t)
+            if not v:
+                continue
+            pid = v["pageid"]
+            if pid in by_pid:
+                by_pid[pid][1].update(targets[t])
+            else:
+                by_pid[pid] = (t, set(targets[t]))
+        todo = [(t, roots) for pid, (t, roots) in by_pid.items()
+                if str(pid) not in have]
         print(f"\n开始抓取 {len(todo):,} 页 · {args.delay:.0f}s/页 "
               f"≈ {len(todo) * args.delay / 3600:.1f} 小时", flush=True)
         bar = make_bar(len(todo), "抓角色页", "页")
         ok = fail = 0
         with OUT_MANIFEST.open("a", encoding="utf-8") as mf:
-            for t in todo:
+            for t, roots in todo:
                 v = sizes[t]
                 try:
                     r = c.get(f"{REST}/{quote(v['title'], safe='')}/html")
@@ -188,7 +206,7 @@ def main() -> int:
                         "pageid": v["pageid"], "title": v["title"],
                         "lastrevid": v.get("lastrevid"), "wikitext_len": v.get("length"),
                         "html_len": len(r.text), "asked": t,
-                        "series_roots": sorted(targets[t]),
+                        "series_roots": sorted(roots),
                         "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                     }, ensure_ascii=False) + "\n")
                     mf.flush()
