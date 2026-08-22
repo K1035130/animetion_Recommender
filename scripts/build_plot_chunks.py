@@ -101,7 +101,23 @@ def preflight(conn) -> set[int]:
 # ============================================================
 # 第 2 段：读语料（不碰数据库）
 # ============================================================
-def load_corpus(known: set[int], limit: int | None, kind: str = "series"):
+def series_pageids(conn) -> set[int]:
+    """库里已经是**作品页**的 pageid。
+
+    🚨 **角色与作品同名时，同一个 pageid 会既被当作品页又被当角色页。**
+       实测 5 个：犬夜叉 · 哆啦A梦 · Free! · 幽灵公主 · 逆A高达 ——
+       角色 alias 里有「哆啦A梦」，反查就把作品页当成角色页抓回来了。
+       不挡的话灌库时：moegirl_page.kind 被 UPSERT 从 series 改成 character，
+       而 plot_chunk 的唯一键 (source, pageid, character_id, chunk_no) 相同，
+       **作品页原有的 chunk 会被角色页的覆盖**。两处损坏都不报错。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pageid FROM moegirl_page WHERE kind = 'series'")
+        return {r[0] for r in cur.fetchall()}
+
+
+def load_corpus(known: set[int], limit: int | None, kind: str = "series",
+                exclude_pages: set[int] | frozenset = frozenset()):
     """返回 (pages, chunks, scope)。
 
     ⚠️ series_roots 里不在 anime_profile 的要**在这里挡掉**，否则写
@@ -140,7 +156,11 @@ def load_corpus(known: set[int], limit: int | None, kind: str = "series"):
 
     pages, chunks, scope = [], [], set()
     dropped_roots = 0
+    skipped_pages = 0
     for pid in pageids:
+        if pid in exclude_pages:            # 见 series_pageids 的说明
+            skipped_pages += 1
+            continue
         m = meta.get(pid)
         if m is None:                       # manifest 与 chunk 文件不同步
             continue
@@ -153,6 +173,9 @@ def load_corpus(known: set[int], limit: int | None, kind: str = "series"):
                 else:
                     dropped_roots += 1
 
+    if skipped_pages:
+        print(f"⚠️ 跳过 {skipped_pages} 个页面：它们在库里已经是作品页"
+              f"（角色与作品同名，见 series_pageids）")
     if dropped_roots:
         print(f"⚠️ 有 {dropped_roots} 处 series_root 不在 anime_profile 里，已跳过")
     return pages, chunks, sorted(scope)
@@ -312,8 +335,10 @@ def main() -> int:
     #    11 分钟的 API 阶段，写库时 SSL connection has been closed unexpectedly。
     with db.connect() as conn:
         known = preflight(conn)
+        # ⚠️ 只在角色页模式下查 —— 作品页自己灌自己，不存在这个冲突。
+        exclude = series_pageids(conn) if args.kind == "character" else frozenset()
 
-    pages, chunks, scope = load_corpus(known, args.limit, args.kind)
+    pages, chunks, scope = load_corpus(known, args.limit, args.kind, exclude)
     if not chunks:
         print("✗ 没有可灌的 chunk", file=sys.stderr)
         return 1

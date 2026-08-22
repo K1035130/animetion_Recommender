@@ -159,8 +159,20 @@ class AnimeDetail(BaseModel):
 AskState = Literal["ok", "ambiguous", "no_corpus", "unknown"]
 
 
+# 单一输入框背后的分岔口。"auto" = 服务端自己判（src/router.py）。
+# ⚠️ **按钮不是独立功能，而是强制指定 route 的参数** —— 第四部分那条
+#    「单一入口 vs 功能按钮」的结论：两者不是二选一，单一入口涵盖按钮。
+# 📌 route 同时是**评测入口**：四条分支混在一个端点里，「推荐的 NDCG」和
+#    「问答的准确率」会被搅在一起，评测必须能直接打各条子路径。
+AskRoute = Literal["auto", "ask", "voice", "season"]
+
+
 class AskRequest(BaseModel):
     question: str = Field(min_length=1, max_length=200)
+
+    # ⚠️ 指定了就**强制**走那条分支，但空结果时会回落到 ask 并在
+    #    route_reason 里说明 —— 硬失败会让用户以为功能坏了。
+    route: AskRoute = "auto"
 
     # ⚠️ 默认关。剧透门控是主防线（第 15 节原则 2），放开必须由用户**显式**确认。
     #    但 spoiler=False 不等于结果里没有剧透 —— `spoiler_level` 那一列的
@@ -220,6 +232,12 @@ class AskCandidate(BaseModel):
 
 
 class AskResponse(BaseModel):
+    # ⚠️ **实际走的分支，必须回传。** 路由错了是**静默**的 —— 用户会以为
+    #    系统笨，而不知道是分错了路。前端要把它显示出来并允许改：
+    #    「我理解为：查询 2016 年夏季新番 ▾」比静默猜测好得多。
+    route: str
+    route_reason: str
+
     state: AskState
     # state=ok 时是回答正文；其余三种状态是给用户看的说明（反问 / 没语料 / 没认出）。
     answer: str | None
@@ -228,6 +246,14 @@ class AskResponse(BaseModel):
     chunks: list[AskChunk]
     candidates: list[AskCandidate]
     meta: dict
+
+    # 非 ask 分支的结构化结果，按 route 二选一（都为 None 就是走了 ask）。
+    # ⚠️ 这两条分支**零模型调用**，答案直接来自库 —— 与 /ask 的 3~6 秒
+    #    不是一个量级，前端可以不给 loading 态。
+    # ⚠️ 字符串注解 + 文件末尾 model_rebuild()：这两个模型定义在本类**之后**
+    #    （文件按「端点分组」排版，不按依赖序）。改动它们的位置时别忘了 rebuild。
+    voice: "VoiceResponse | None" = None
+    season: "SeasonResponse | None" = None
 
 
 # ── 结构化关联查询（src/related.py）────────────────────────────────
@@ -308,3 +334,8 @@ class SeasonResponse(BaseModel):
     # 窗口内的总数（items 受 limit 截断，total 不受）
     total: int
     items: list[SeasonItem]
+
+
+# ⚠️ AskResponse 用字符串注解引用了下面才定义的 VoiceResponse / SeasonResponse，
+#    必须在两者都定义完之后重建，否则 FastAPI 生成 schema 时会炸。
+AskResponse.model_rebuild()

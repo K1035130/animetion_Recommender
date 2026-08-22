@@ -33,14 +33,18 @@ CLAUDE.md 只保留**每次开工需要的**：现状、操作手册（A–D）�
 
 # 第一部分 · 现状与下一步
 
-## 📍 当前进度（更新于 2026-08-19）
+## 📍 当前进度（更新于 2026-08-21）
 
-**阶段 05 检索层 ①②③④ 已实现并上线端点。下一步：第 5 周离线评测。**
-实现细节与这一轮抓到的 bug 全部记在 **I 节**；G 节保留为设计依据。
+**第 5 周评测已收口；当前在补语料层：解析器修了两条丢内容的规则，
+角色页（阶段 06）正在抓，声优问答已上线。**
+阶段 05 检索层 ①②③④ 的实现细节与 bug 记在 **I 节**；G 节保留为设计依据。
 
 ```
 POST /api/ask       流程 C 剧情问答，四步管道         src/retrieve.py
 GET  /api/related   同作者/导演/公司的其他作品，零模型   src/related.py
+GET  /api/voice     某声优配过哪些角色，零模型          src/voice.py
+POST /api/ask       ⬆️ 现在是**单一入口**：自动分派 voice / season / ask
+                    三条分支，或由 route 参数强制指定       src/router.py
 ```
 
 ⚠️ **实现过程推翻了 G 节的两条结论**，都是实测逼出来的（详见 I.2）：
@@ -56,26 +60,58 @@ GET  /api/related   同作者/导演/公司的其他作品，零模型   src/rel
 `Parallel Seq Scan` 扫 89,544 条向量 / 176 MB TOAST，**541 ms 全是真实 CPU**。
 而今天做的 `/api/related` 恰好用一条走索引的 SQL 替掉了它的一大类用途（I.3）。
 
-### ▶️ 下次开工从这里接（2026-08-20 收工）
+### ▶️ 下次开工从这里接（2026-08-21 收工）
 
-✅ **第 5 周离线评测（工作流 B）五项全部收口** —— 跨语言 A/B · HyDE 对照 ·
-点名类 150 题 · 可回答率 60 题 · **B.4 参数扫描**。工作流 A（推荐 LOO）已定不做。
-✅ **`SONGS_SEAT` 已实现并端到端验证** —— 4 道 OP/ED 题全部召回 songs chunk。
-❌ **剥作品名已实测否决**（净 +0），代码留在评测脚本里作负结果。
+**这一轮做完的四件事：**
+
+✅ **解析器修了两条正在丢内容的规则**（`scripts/parse_moegirl.py`，均已灌库）
+  ① **songs 分组标题被当残句丢掉** —— 「片头曲（OP）」只有 7 字，被
+     `len(b[0]) >= 12` 那行过滤掉，于是 songs chunk 只剩一串曲名，
+     **分不出哪首是 OP**。实测全库 **83.7% 的页面**有这类标注，全丢。
+     修法是**吸收成前缀**（`片头曲（OP）：花になって`）而不是放宽下限 ——
+     放宽会把「参见」残句放回来，且标题可能被切到另一条 chunk。
+     带标注的 songs chunk **2.6% → 82.8%**（与 HTML 侧独立测出的 83.7% 吻合）。
+  ② 🚨 **`TABLE_MAX_CELLS` 4 → 40，这是 F.4 ④ 的精确根因。**
+     《上条当麻》同一页给出完美对照：「旧约」table cells=2 → 保留；
+     「新约」cells=18、**每格 489 汉字** → 整表删除（9,973 字）。
+     密度判据早就认出它是散文容器，被 `cells<=4` 这条硬上限一票否决了。
+     ⚠️ 试过 40/200/无上限三档产出**逐字节相同**，所以取有限值留兜底。
+     收益：角色页 +21% chunk / **+28% 正文**（新增 91 条里「经历」占 51 条）；
+     作品页只 +0.8%，且**对 12 道结局题一条都没帮上**（0/12 语料未变）。
+
+✅ **阶段 04b 完成**（`scripts/extract_char_links.py`）—— 见六阶段计划表。
+✅ **阶段 06 开抓**：热度前 500 部 → 4,955 页，7 秒/页约 10 小时，进行中。
+✅ **声优问答上线**（`sql/009` + `scripts/build_voice_roles.py` + `src/voice.py`
+   + `GET /api/voice`）—— 见第四部分「声优配役」一条。
+✅ **路由分派上线**（`src/router.py` + `POST /api/ask` 的 `route` 字段）——
+   单一入口那条待办的最后一步，见第四部分。
 
 **下一步，按优先级：**
 
 ```
-1. 五道题重新打分 [45][46][48][50][51] —— 检索侧已修，要验生成侧能不能用上它
-                              ⚠️ **是 5 道不是 8 道**（算出来的，不是估的）：
-                              [49] 在 resolve 就 ambiguous 短路，[47][52] 池子里
-                              根本没 songs chunk ⇒ seat 为 None，走原分支。
-                              **其余 55 道逐字节未变，标签仍有效。**
-2. 路由分派（单一入口分支 ③④）—— §4.4 坐实：播出时间/关联作品丢给 RAG
-                              会 75% 编答案；/api/season 与 /api/related 都已就绪，
-                              缺的是分派器 + route 字段（route 同时是评测入口）
-3. 收口报告，然后进第 6 周
+1. 角色页抓完 → parse --kind character → 编码 → 灌库
+                管道已就绪（两个脚本都加了 --kind character，零 schema 改动，
+                sql/007 第 1 周就把 moegirl_page.kind 写成了 ('series','character')）
+2. 角色页到齐后再跑一轮评分测试（Kevin 定：语料改动攒在一起，评测只跑一次）
+3. 流程 B 找番（G.1 路径①）—— 单一入口现在只差它这一条分支；
+                做完之后前端才好放第四个按钮
 ```
+
+⚠️ **五道 songs 题的第三轮结果已出（`docs/eval-answerability-rescore-v3.md`，未填分）**：
+检索侧逐条未变（干净 A/B），生成侧 **0/5 → 4/5 明确答对**。
+[45] 龙王「片头曲是《コレカラ》」· [48] 红猪正确说明没有 OP 并标出 ED/插曲 ·
+[50] ∀高达两首 OP 及话数全对 · [51] Servant 正确。
+⚠️ 唯一错的 [46] 电波女把**演唱者当成了曲名**（`Os-宇宙人` 才是曲名，
+`エリオをかまってちゃん` 是乐队）—— 旧语料里这个曲名整个丢失，仍是净改善。
+🎁 **意外收获：rerank 分暴涨 3–43 倍**（chunk 里现在有「片头曲」这个字面），
+5/6 已越过 `MIN_SCORE=0.05` ⇒ **`SONGS_SEAT` 从主力降级成兜底**（别删，
+红猪那类本来就没 OP 的剧场版仍要靠它）。
+
+🚫 **两个猜想被证伪，记下来防止再犯**：我先说 table 修复「直接对上结局 12/12 全灭」——
+**0/12 道题的语料有任何变化**；接着又猜「是剧透门控挡掉了结局」——
+`eval_answerability.py` 第 27 行的注释就是为此写的，结局题一直是 `spoiler=True` 跑的。
+⇒ 结局答不了的根因还是 I.9 那句：**结局细节住在角色页**。
+两次都是想把新发现套到老问题上，都不成立。
 
 ⚠️ **别顺手做的**：§3.3 那条「`MIN_SCORE` 在纯召回路径上吃掉 22.5 pp」
 **仍然维持"不据此改常量"** —— B.4 结的是 OP/ED 那一类，两条路径不是一回事
@@ -162,16 +198,29 @@ I.2 ① 的设计）—— **不要据此改常量，等 B.1 人工题库**，�
 
 **未提交**（Kevin 自己提交）：
 ```
-M  CLAUDE.md · docs/week5-eval-report.md
-M  src/retrieve.py            SONGS_QUERY / SONGS_SEAT / songs_seat() + seat 参数
-M  tests/test_retrieve.py     23 → 42 项
-M  scripts/eval_{answerability,retrieval_named,hyde,crosslang}.py   finally 收尾
-?? src/clients.py             close_all() 单一定义处
-?? tests/test_clients.py      5 项（含防漂移）
-?? scripts/eval_min_score.py  B.4 扫描脚本（pool / sweep）
+M  CLAUDE.md
+M  scripts/parse_moegirl.py       songs 分组标题 + TABLE_MAX_CELLS 4→40
+                                  + wikitext 内链残留 + --kind character
+M  scripts/build_plot_chunks.py   --kind character（角色页共用同一套灌库编排）
+M  server/main.py · server/schemas.py    GET /api/voice
+?? sql/009_voice_role.sql         person / voice_role 两表 + alias 扩 person（已执行）
+?? scripts/build_voice_roles.py   声优灌数据（已执行）
+?? src/voice.py                   声优配役查询
+?? tests/test_voice.py            17 项
+?? tests/test_parse_moegirl.py    9 项（锁住上面那两条解析规则）
+?? scripts/extract_char_links.py  阶段 04b（提链接 + prop=info）
+?? scripts/fetch_char_pages.py    阶段 06 抓取（正在跑）
+?? src/router.py                  意图分派（classify / parse_cour / relax_voice）
+?? tests/test_router.py           30 项
+?? docs/eval-answerability-rescore-v2.md · -v3.md    两轮定点重测（未填分）
 ```
-—— 此前那批（cour_window / 指纹 / /api/season）**已在 `34ff36e` 及之前入库**，
-工作区在本轮开工时是干净的。
+—— 上一批（`clients.py` / `SONGS_SEAT` / `eval_min_score.py`）已在
+`d6f318b` 及之前入库。
+
+⚠️ **不入 git 但很重要的本地产物**（换机器要重跑）：
+`data/interim/char_page_links.json`（16,569 候选）·`char_page_sizes.json`
+（已查存在性，红链存 None 免得反复重查）·`char_calib.json`（30 页换算率校准）·
+`data/raw/moegirl_char/`（角色页 HTML）。
 
 ⚠️ **备份提醒**：`data/interim/translate_cache/`（50 MB）是 4.4 万条译文的**唯一副本**
 （H.5 已否决入库），丢了是重翻 8 小时。
@@ -180,13 +229,20 @@ M  scripts/eval_{answerability,retrieval_named,hyde,crosslang}.py   finally 收�
 问卷支持多次作答 · P1 三路融合（tag + embedding + staff/studio）。
 
 `animetion-recommender.vercel.app` —— 前端 + API 同一个 Vercel 项目、同源。
-库占用 **770 MB**（`pg_database_size()`；Neon 控制台口径更高，见第 5 节）。
-`plot_chunk` **89,544 条**（萌娘 20,127 + dump 角色 69,417）· 覆盖系列根 6,131 个 ·
-**覆盖作品 79.3% · 热度加权 97.3%**。
-`alias` **235,047 行**（subject 38,378 + character 196,669）。
-测试 **86 项**（18 打分一致性 + 21 接口 + 42 检索层/请求路径纯函数 + 5 客户端收尾）。
-⚠️ 2026-08-20 顺带发现此前这行的**分项一直是错的**（接口那项写 19、实际 21）——
-总数对而分项不对，是因为加测试时只改了总数。⇒ 改这行时逐个文件跑一遍再写。
+库占用 **782 MB**（`pg_database_size()`；Neon 控制台口径更高，见第 5 节）。
+`plot_chunk` **89,947 条**（萌娘 prose 17,033 + songs 3,497 + dump 角色 69,417）·
+覆盖系列根 6,131 个 · **覆盖作品 79.3% · 热度加权 97.3%**。
+⚠️ **这两个覆盖率是低估的**（2026-08-21 实测）：另有 **703 部作品、占全库热度
+4.95%** 的语料其实就在库里，只是 `series_root` 没折叠衍生条目、作用域映射
+不过去 —— 触发案例见第四部分「同 IP 衍生折叠」。
+`alias` **263,690 行**（subject 38,378 + character 196,669 + **person 28,643**）。
+`person` **8,215** · `voice_role` **145,306**（sql/009，见第四部分「声优配役」）。
+测试 **142 项**（18 打分一致性 + 21 接口 + 42 检索层 + 9 解析器 + 17 声优
++ 30 路由 + 5 客户端收尾）。
+⚠️ 分项是逐个文件 `--collect-only` 数出来的 —— 2026-08-20 发现过「总数对而
+分项错」（加测试时只改了总数），所以改这行时别估。
+⚠️ **解析器那 9 项用 `pytest.importorskip("lxml")`**（lxml 在 etl 组），
+`uv run pytest` 只跑 103 项，要 `uv run --group etl python -m pytest` 才满 112。
 
 📌 **2026-08-18：语料已全部转为中文** —— 作品 summary 日文残留 **39 / 10,864 (0.36%)**、
 角色 chunk **560 / 69,417 (0.81%)**。做法见 **H 节**，灌库过程见 **H.7**。
@@ -199,7 +255,8 @@ M  scripts/eval_{answerability,retrieval_named,hyde,crosslang}.py   finally 收�
 | 2 | P0 推荐 + 选题 + 续作折叠 + API + pgvector + 前端 v0 + 部署 | ✅ |
 | 3 | Embedding 建库 ✅ · 问卷选题多样化(MMR) ✅ · P1 融合 staff/studio ✅ | ✅ |
 | **4** | 萌娘语料 ✅ · 角色语料(03) ✅ · 语料转中文 ✅ · LLM 选型 ✅ · 检索层(05) ✅ | ✅ |
-| **5** | **离线评测（核心卖点，不可压缩）** | ⬜ **← 下一步在这** |
+| **5** | **离线评测（核心卖点，不可压缩）** | ✅ 五项收口 |
+| **5.5** | 补语料：解析器修复 ✅ · 角色页(06) 🔄 · 声优配役 ✅ | 🔄 **← 现在在这** |
 | 6 | 信息增益选题 + 账号系统 + 季度同步 | ⬜ |
 
 ### 2026-08-16 这一天做完的（详见 F 节）
@@ -220,9 +277,9 @@ M  scripts/eval_{answerability,retrieval_named,hyde,crosslang}.py   finally 收�
 | **02** | 灌萌娘作品页 chunk | ✅ | 19,526 条 / 602 批 8 路 / ≤¥0.28 |
 | **03** | 灌 dump 角色简介 | ✅ **2026-08-16** | **69,999 chunk** / 66,748 角色 / ¥0.65 · 详见 **F.7** |
 | **04a** | 标题补救 | ✅ | +601 chunk · +229 映射 / ¥0.009 |
-| **04b** | 角色页链接提取 | ⬜ | 从已抓的 2,301 页 HTML 提链接，**算准阶段 06 体积** |
+| **04b** | 角色页链接提取 | ✅ **2026-08-21** | 16,569 个候选 · **红链 47.2%** · 换算率 0.809（分档实测）· 详见下方 |
 | **05** | 检索层（流程 C） | ✅ **2026-08-19** | 设计见 **G 节**，实现与实测见 **I 节**。流程 B（找番）未做 |
-| **06** | 抓萌娘角色页 | ⬜ 可选 | ≈22,814 页 / **15–40 小时** / 编码 ¥0.3。📌 理由已累积三条：更详细 · 中文角色语料唯一来源 · **结局等剧情细节住在角色页**（GOSICK 实例，I.9） |
+| **06** | 抓萌娘角色页 | 🔄 **抓取中 2026-08-21** | 本次取热度前 500 部 → **4,955 页 / ~10 小时**（全量 8,813 页 / 17.1 小时）。📌 理由四条：更详细 · 中文角色语料唯一来源 · **结局等剧情细节住在角色页**（GOSICK 实例 I.9，且 B.1 那 12 道结局题实测作品页怎么修都够不着）· 30 页实测「经历」是第三多的章节 |
 
 📌 **顺序建议：03 → 05。** 03 只要一个脚本、零抓取、¥0.46，而它补的是
 **角色那一层两级全空**（既无 dump 简介也无萌娘页）—— 这才是角色问答完全答不了的
@@ -236,17 +293,46 @@ M  scripts/eval_{answerability,retrieval_named,hyde,crosslang}.py   finally 收�
 （アリス×9、主人公×9）在没有作品锚定时无解。
 验收：`character_id` 全非空 · scope 覆盖 9,245 部 · `alias` 出现 character 行。
 
-⚠️ **阶段 06 的体积可以在抓取之前算准，不用估。** `prop=info` 一次给 50 个标题的
-`length`（wiki 源码字节数），而这是标题解析本来就要做的一步。作品页实测换算率
-**0.469 chunk/KB**，但它随页面变长单调下降（0.889 → 0.391）—— 因为长页面的长度
-来自表格和列表，**而那些我们本来就丢掉**（火影 175 KB 只出 11 chunk，银魂 144 KB → 13）。
-⚠️ 这条对角色页**不能直接套**：角色页的长度来自「个人经历」这类散文，是要留的，
-换算率大概率接近 0.889 那一档。⇒ 抽 30 页真抓一次校准再乘全量 length，
-40 小时值不值就变成一道算术题。
+### 04b 实测结果（2026-08-21，`scripts/extract_char_links.py`）
 
-💡 **角色数是极端长尾，天然有个控制阀**：每系列中位 9 · p90 32 · **max 801（航海王）**，
-光之美少女 702 · 宝可梦 389 · 火影 348。**前 1% 的系列吃掉 11.8% 的角色。**
-按系列设上限（比如 30）只影响 10% 的系列，却能把航海王从 801 砍到 30。
+**候选怎么来的**：全页提内链 + `alias` 表反查。⚠️ **不按章节标题定位** ——
+各页结构差异极大：《药屋》有「登场人物」节但角色与声优混排，《进击的巨人》
+**根本没有**这个节（角色藏在 CAST 里 175 条），而「题外话」一节有 2,059 个导航噪声。
+⇒ 用 `alias` 里 `entity_type='character'` + `parent_subject_id` 反查，
+这正是阶段 03 灌 196,669 行角色 alias 时特意留那一列的用途。
+得到 **16,569 个候选**（下界：萌娘有而 dump 没有的角色会漏，但估体积时下界更安全）。
+
+| 取热度前 N 部 | 存活页 | 热度覆盖 | 抓取耗时 | chunk | 库增长 | 编码 |
+|---|---|---|---|---|---|---|
+| 100 | 1,694 | 35.2% | 3.3 h | 9,791 | +59 MB | ¥0.07 |
+| 300 | 3,564 | 59.4% | 6.9 h | 20,590 | +124 MB | ¥0.14 |
+| **500**（本次） | 5,010 | 72.0% | 9.7 h | 28,945 | +174 MB | ¥0.20 |
+| 全量 2,302 | 8,813 | 100% | 17.1 h | 50,912 | +306 MB | ¥0.35 |
+
+**三个把预期拉回现实的实测数：**
+
+🚨 **红链 47.2%**（随机抽样 1,200 个）—— 作品页里近一半的角色链接指向尚未建立的
+条目。⇒ **必须先 `prop=info` 再抓**：直接抓的话前 500 部有约 3,800 次 404
+× 7 秒 = **7.4 小时纯浪费**，而补齐存在性只要约 17 分钟。
+存活率与热度强相关（最热档 **67.1%** vs 最冷档 43.8%），所以按热度切收益更好。
+
+🚨 **「每系列设上限 30」这个控制阀基本没用 —— 原先的预期是错的。**
+原文写「前 1% 的系列吃掉 11.8% 的角色，上限 30 能把航海王从 801 砍到 30」，
+但那个 **max 801 是 bangumi 的角色数**；萌娘不给路人角色建页，实际
+**每页中位 3 · p90 17 · max 349**。长尾已经被萌娘自己截断过一次了，
+再截 **上限 30 只省 14%**（32.3 → 27.7 小时）。⇒ 改用热度切分。
+
+✅ **换算率 0.809 chunk/KB**（30 页分层抽样：小/中/大各 10）——
+原文预判「角色页接近 0.889 那一档」**是对的**，作品页的 0.469 确实不适用。
+⚠️ 但顶部没抽到（最大才 53.8 KB），补测 6 个超大页后改成分档：
+`<3KB 1.233 · 3-6KB 0.923 · 6-25KB 0.763 · >25KB 0.539`。
+📌 有意思的是分档后总量（50,912）与单一率 0.809 时（50,900）**几乎一样** ——
+小页面的高率恰好抵消大页面的低率，所以总量估算本身是稳健的；
+分档模型解释的是「为什么鲁迪乌斯 52 KB 只出 12 chunk」（大半是能力表、关系表）。
+
+✅ **`parse_moegirl.py` 直接可用，不需要为角色页改造**：30 页产出
+prose 193 + songs 4、**零 credits 垃圾**，章节 top 是「简介 25 · (前言) 22 ·
+经历 19 · 能力 16」。📌 「经历」排第三，直接给 I.9 那条「结局住在角色页」加了实据。
 
 📌 存储：三阶段全做完 ≈131,000 chunk · 向量 269 MB · 正文 64 MB · **$0.12/月**。
 存储不再是约束，这是敢把批次 3 排进来的前提。
@@ -1071,20 +1157,25 @@ DB 往返已经便宜到可以忽略。
 | [scripts/build_series_map.py](scripts/build_series_map.py) | 产出 `data/interim/series_root.json`（问卷折叠的前置依赖，同样不入 git） |
 | [scripts/build_tag_vectors.py](scripts/build_tag_vectors.py) | `tag_vec` / `series_root` 两列。⚠️ 改过词表/tag_rules/tagvec 后**必须重跑**，否则打分读到旧向量 |
 | [scripts/fetch_moegirl.py](scripts/fetch_moegirl.py) | 抓萌娘百科 → `data/raw/moegirl/*.html.gz`（**只抓不解析**）。幂等、可断点续跑。⚠️ 7 秒/请求，全量约 3.9 小时，见 E.1 |
-| [scripts/parse_moegirl.py](scripts/parse_moegirl.py) | 解析上一步的 HTML → `data/interim/moegirl_chunks.jsonl`。**不写数据库** —— 切分粒度要由它的实际产出来定，见 E.4 |
-| [scripts/build_plot_chunks.py](scripts/build_plot_chunks.py) | `moegirl_page` / `plot_chunk` / `plot_chunk_scope` 三张表 + `build_meta['plot_chunk']`。幂等，靠 md5 比对跳过未变化的行（F.4 ①） |
+| [scripts/parse_moegirl.py](scripts/parse_moegirl.py) | 解析上一步的 HTML → `data/interim/moegirl_chunks.jsonl`。**不写数据库** —— 切分粒度要由它的实际产出来定，见 E.4。⚠️ `--kind character` 切到角色页（`moegirl_char/` → `moegirl_char_chunks.jsonl`）；**切分/清洗规则两者共用**，唯一实质差别是作用域来源：作品页靠标题解析，角色页用抓取时记的 `series_roots` |
+| [scripts/build_plot_chunks.py](scripts/build_plot_chunks.py) | `moegirl_page` / `plot_chunk` / `plot_chunk_scope` 三张表 + `build_meta['plot_chunk']`。幂等，靠 md5 比对跳过未变化的行（F.4 ①）。⚠️ `--kind character` 灌角色页：**零 schema 改动**（sql/007 第 1 周就把 `moegirl_page.kind` 的 CHECK 写成了 `('series','character')`），`build_meta` 另记 `plot_chunk_char` 一行 —— 共用一个 key 的话后跑那次会覆盖前一次的 rows/built_at |
 | [scripts/rescue_moegirl_titles.py](scripts/rescue_moegirl_titles.py) | 补救标题解析漏掉的系列。⚠️ **三步走**：解析（联网）→ 人工过一眼 → `--from-file --apply-b` 应用。中间那步不能省，见 F.3 |
 | [scripts/build_char_chunks.py](scripts/build_char_chunks.py) | `plot_chunk` 里 `source='bangumi_char'` 的行 + `plot_chunk_scope` + **`alias` 里 `entity_type='character'` 的行** + `build_meta['char_chunk']`。⚠️ 与 `load_profiles.py` 用**不同的 alias source 值**（`char_*` 前缀），两者永不相交。幂等，md5 跳过 |
+| [scripts/extract_char_links.py](scripts/extract_char_links.py) | 阶段 04b。两段：本地提角色页链接 → `--sizes` 联网查 `prop=info`。**不写库**。⚠️ `--sample N` 必须走随机抽样，取 `sorted` 的前 N 个会得到有偏样本（见下） |
+| [scripts/fetch_char_pages.py](scripts/fetch_char_pages.py) | 阶段 06 抓角色页 → `data/raw/moegirl_char/*.html.gz` + manifest。**只抓不解析**，幂等、断点续跑。⚠️ 复用 `fetch_moegirl` 的 UA / 7 秒节流 / `resolve_titles`，不另写一份 |
+| [scripts/build_voice_roles.py](scripts/build_voice_roles.py) | `person` / `voice_role` 两表 + `alias` 里 `entity_type='person'` 的行（source 一律 `person_*` 前缀）。⚠️ 与 `load_profiles`（subject 行）、`build_char_chunks`（`char_*`）三者 source 永不相交 |
 | [scripts/translate_corpus.py](scripts/translate_corpus.py) | **只写本地缓存 `data/interim/translate_cache/`，不碰数据库**。⚠️ 与灌库分家的理由：翻译很贵（数小时），而灌库策略可能改几次 —— 分开就不用为了改灌库重翻一遍。可中断续跑，自动防系统睡眠 |
 
-📌 **阶段 05 新增三个模块，都在 `src/` 且都不写库**（线上请求路径要用，
-而 `.vercelignore` 排掉了 `scripts/`）：
+📌 **`src/` 下的请求路径模块，都不写库**（线上要用，而 `.vercelignore`
+排掉了 `scripts/`）：
 
 | 文件 | 职责 |
 |---|---|
 | [src/retrieve.py](src/retrieve.py) | ①②③④ 主管道 + G.4 状态机。**只读库** |
 | [src/rerank.py](src/rerank.py) | `BAAI/bge-reranker-v2-m3` 客户端。⚠️ **可以换模型**（输出是相对排序，用完即弃），A.8 那条铁律不适用于它 |
 | [src/related.py](src/related.py) | 结构化关联查询，读 `staff` / `studios` 两列。**零模型调用** |
+| [src/router.py](src/router.py) | 意图分派：`classify()` 判 voice/season/ask，`parse_cour()` 解析时间表达。**纯函数、零模型、不碰库** —— 信号全是触发词与正则 |
+| [src/voice.py](src/voice.py) | 声优配役查询（`GET /api/voice`）。**零模型调用**。⚠️ 与 related 的关键差异：**必须从问句里抠人名**，靠 alias 的 `norm_name` 精确匹配（sql/009 把声优灌进 alias 正为此），不做繁简/变体模糊匹配 |
 
 ⚠️ **两个 loader 现在会调 `src/langclean.py` + `src/translate_store.py`**
 （顺序：剥离 → 换译文 → 切块，见 H.4）。它们是**纯函数 + 本地缓存查询**，
@@ -1132,6 +1223,20 @@ uv run --group etl python scripts/rescue_moegirl_titles.py --from-file --apply-b
 # ── 阶段 03：角色语料（零抓取，只读 dump）──────────────────
 uv run --group etl python scripts/build_char_chunks.py --limit 500   # 先小样本
 uv run --group etl python scripts/build_char_chunks.py               # ≈15 分 / ¥0.45
+
+# ── 声优配役（零抓取，只读 dump）────────────────────────────
+psql < sql/009_voice_role.sql
+uv run --group etl python scripts/build_voice_roles.py --dry-run     # 先看账
+uv run --group etl python scripts/build_voice_roles.py               # ≈3 分，无 API 调用
+
+# ── 阶段 04b + 06：角色页（唯一一笔大墙钟开销）──────────────
+uv run --group etl python scripts/extract_char_links.py              # 本地提链接，~25 秒
+uv run --group etl python scripts/extract_char_links.py --sizes --sample 1200
+#   ⚠️ 全量 prop=info 约 40 分钟；只为估比例的话用 --sample（**必须随机**）
+uv run --group etl python scripts/fetch_char_pages.py --top 500 --dry-run
+uv run --group etl python scripts/fetch_char_pages.py --top 500      # ≈10 小时，可断点续跑
+uv run --group etl python scripts/parse_moegirl.py --kind character
+uv run --group etl python scripts/build_plot_chunks.py --kind character
 
 # ── 语料语言统一（H 节）────────────────────────────────────
 psql < sql/008_translation.sql               # 译文备份表
@@ -1190,13 +1295,18 @@ $env:PYTHONIOENCODING='utf-8'; uv run python ...    # PowerShell（开发机默�
 
 ## E. 萌娘百科语料链路 → [docs/corpus.md](docs/corpus.md)
 
-> ✅ 已完工。铁律速查：**7 秒/请求勿调低** · UA 诚实（不冒用被封禁 bot 名） ·
+> ✅ 已完工（阶段 06 角色页抓取沿用同一套）。铁律速查：**7 秒/请求勿调低** ·
+> UA 诚实（不冒用被封禁 bot 名，联系方式 kevin1035130@outlook.com） ·
 > robots 的 `ai-train=no` ⇒ **这份语料永不可用于训练/微调**（embedding 编码不算训练） ·
 > CC BY-NC-SA：公开展示正文必须署名 · 抓取与解析两阶段分离（改切分策略不用重抓）。
 
 ## F. plot_chunk 语料层 → [docs/corpus.md](docs/corpus.md)
 
 > ✅ 已完工。速查：正文进 Neon（推翻原设计） · **未建 HNSW**，路径③ 579 ms 悬而未决（见 I.5 与 F.1 标注） ·
+> 🚨 **2026-08-21 修了两条正在丢内容的解析规则**（见第一部分开工段）：
+> songs 分组标题被 12 字下限当残句丢掉（83.7% 的页面受影响）·
+> `TABLE_MAX_CELLS` 4→40（**F.4 ④ 的精确根因**：密度判据认得出散文容器，
+> 被 cells 硬上限一票否决）。两条都由 `tests/test_parse_moegirl.py` 9 项锁住 ·
 > 灌库靠 md5 跳过未变行（否则全表 UPDATE 让 TOAST 翻倍） ·
 > **F.5 换机器陷阱**：`moegirl_titles.json` 不入 git，rescue 三条规则要补跑 ·
 > `plot_chunk` 的 176 MB 向量在 TOAST 里，要用 `pg_total_relation_size` 看。
@@ -1335,7 +1445,51 @@ Neon 缩到零唤醒的只是数据库 compute。
 「4 小时 × 0.5 CU」和「1 小时 × 2 CU」都是 2 CU-小时，**成本持平但墙钟时间少 4 倍**。
 ⚠️ 建完记得调回 0.5，否则常驻上限又回到高位。
 
-### ⬜ 🧭 单一入口 vs 功能按钮 —— 待定的产品架构决策（2026-08-19 Kevin 提出）
+### ✅ 🧭 单一入口 + 功能按钮 —— 已落地（2026-08-21）
+
+**结论就是当初预判的那个：两者不是二选一。** 按钮 = 强制指定 `route` 的参数，
+单一入口涵盖按钮。实现是 `src/router.py` + `POST /api/ask` 的
+`route` / `route_reason` 两个字段，30 项测试。
+
+📌 **路由准确率实测（2026-08-21）—— 数据说明按钮救的是哪一类**：
+
+```
+60 题评测集（格式规整）    判对 56/56    ← 已实现的分支上 100%
+                                     （错的 4 道全是 season，当时未实现）
+口语 / 省略型输入          判错 5/10
+   花泽香菜          → ask ❌   钉宫理惠 龙与虎 → ask ❌
+   樱井孝宏都演过什么  → ask ❌   三笠的声优      → ask ❌
+```
+
+⇒ **按钮救的不是「歧义」，是「用户不肯把话说完整」。** 规则想覆盖这类就得
+放宽，一放宽又会把「这部动画的声优阵容怎么样」这种闲聊吞进去。
+🎯 **所以真正的架构收益是 `router.relax_voice()`：自动分派保持保守，
+按钮路径可以完全不保守** —— 点了「声优」就是显式指令，不需要任何触发词。
+
+⚠️ **建议的按钮只放已经能用的**：剧情(ask) · 声优(voice) · 新番(season)。
+**别放流程 B「找番」** —— 它还没实现，放了用户点一次发现没用，
+之后就不会再点任何按钮了。
+
+🚨 **三个实现时抓到的问题**：
+① 「下一季有什么新番」**静默返回了当季** —— `parse_cour` 不认「下一季」，
+   落到默认的「今天所在季度」。用户问下季拿到当季，**从结果里看不出来**。
+   ⇒ 补了相对季度表（含跨年：2026 Q3 + 2 → 2027 Q1）。
+② **回落原因只写在 `route_reason` 里，用户看不到** —— 实测「下一季」回落后
+   `answer` 只有「没认出你问的是哪部作品或哪个角色」，对他毫无信息量，
+   真原因藏在一个他不会看的字段里。⇒ 拼进 `answer`，但**只在 ask 也没答上来时**。
+③ `ask` 分支原有的 `return` 没带新字段，**回落路径直接 ValidationError** ——
+   正常路径全绿，只有走到空结果回落才触发。靠那个用例才暴露。
+
+⚠️ **已知限制（已固化成测试）**：「人 + 档期」的复合查询丢掉人名那一半 ——
+「花泽香菜今年有哪些新番」→ season，"花泽香菜"被整个忽略。
+要修得让 season 支持按 `person_id` 过滤（`voice_role` JOIN + 档期窗口，一条 SQL），
+那是新功能不是路由的事。在那之前 **route 回显是唯一的补救**。
+
+---
+
+以下是 2026-08-19 定这条时的原始论证，保留：
+
+#### 原始决策记录（2026-08-19 Kevin 提出）
 
 **Kevin 的倾向：集成到一个端口，用户用起来方便。**
 他同时指出：「关于时间的问题、或者没有完全归类到某一部动画的问题，
@@ -1396,13 +1550,18 @@ A 和 B 因此不是二选一，B 涵盖 A。
 ⇒ 评测**必须直接打各条子路径**（或传 `route` 强制指定），不能只测端点。
 📌 这也是 `route` 参数的第二个用途：它是评测的入口，不只是 UI 的开关。
 
-#### ⬜ 落地顺序（都不阻塞第 5 周）
+#### 落地顺序（都不阻塞第 5 周）
 
 ```
 1. GET /api/season       一条 SQL，复用第 7 节已定的季度窗口口径   ✅ 2026-08-19
-2. 流程 B 找番            anime_profile.vec + BM25 混合，G.1 路径①
-3. 把四条分支合进 /ask     加 route 字段与可选的 route 参数
+2. 流程 B 找番            anime_profile.vec + BM25 混合，G.1 路径①   ⬜ 仍未做
+3. 把分支合进 /ask        加 route 字段与可选的 route 参数        ✅ 2026-08-21
 ```
+
+📌 **实现时发现 related 不需要单开一条分支** —— `retrieve.ask` 里早就把它
+当作**补充上下文**塞进 LLM 了（`related.as_context`），所以新增的只有
+voice 和 season 两条。⚠️ `_season_payload` 从 `GET /api/season` 抽出来给两处共用，
+复制一份的话两条路径迟早对「哪些算这一季」给出不同答案。
 
 ⚠️ **1 和 2 各自独立可用，先做出来再谈合并。** 反过来先设计分派器，
 会在两条分支都还没有的时候去猜它们的行为 —— 与「先跑通小样本再全量」
@@ -1469,12 +1628,66 @@ baseline 之后改一次 prompt，前面所有数字作废（现在指纹至少�
 实测 4/4 都正确拒答。真正试过改 prompt 的那次（允许从资料推断）**没有效果**，
 问题在上下文噪声不在 prompt。
 
+### ✅ 声优配役 —— 「XXX 配过哪些角色」（2026-08-21 上线）
+
+`sql/009_voice_role.sql` + `scripts/build_voice_roles.py` + `src/voice.py`
++ `GET /api/voice`。**零模型调用**，17 项测试。
+
+```
+person 8,215 · voice_role 145,306 · 覆盖 8,529 部（候选集 74.5%）
+alias  +28,643 行（entity_type='person'）
+```
+
+**数据全部来自 dump，不抓萌娘。** 实测对照（钉宫理惠）：dump 701 条配对/433 部、
+带 `subject_id`+`character_id`、零抓取；萌娘 749 条「角色————《作品》」/710 部，
+**只有条目名要做标题映射**（F.5 那类问题的新一份），还要抓约 2,500 页 ≈ 5 小时。
+多出的 48 条基本是游戏/Drama CD。⇒ 先用 dump，若「角色名显示成日文」真影响体验
+再定向补，那时是可量化的补丁而不是先赌 5 小时。
+
+⚠️ **`role_type` 只用于排序，绝不用于过滤。** 这是问答不是推荐特征 ——
+「花泽香菜配过哪些角色」只答主角役就是答错。截断丢的数据找不回来，排序不丢。
+📌 推荐侧的声优特征（`staff_vec`）是**另一件事**：那里才需要「仅主角 + df>=8」
+（974 维，DIM 1933→2907），且要改 sql/006 列宽 + 全库重算 + 会改变推荐结果，
+风险与时机都不同，**别混做一次**。⬜ 那条仍挂着，建议与角色页评测那轮合并。
+
+🚨 **两个实现时抓到的 bug，都进了测试**：
+① 先只按 `series_root` 折叠，结果「逢坂大河《龙与虎》」和「逢坂大河《龙与虎OVA》」
+   各占一行（OVA 自成一根，正是下一条那个遗留缺口）⇒ 改按 **`character_id`** 折叠。
+② **选代表作时 `role_type` 必须压过热度**：「神乐」在《齐木楠雄》(done=27,828)
+   是客串、在《银魂》(done=18,539) 是主角 —— 只按热度会选中客串那条，
+   接着又因 `role_type≠1` 排到末尾，**结果钉宫理惠的代表作里整个看不到神乐**。
+   ⚠️ 这类 bug 极隐蔽：列表看着完全正常，只是少了一个本该在的名字。
+
+⚠️ **对现有解析零影响**：`retrieve.find_mentions` 的 JOIN 条件是
+`coalesce(parent_subject_id, subject_id)`，而声优行这两列都是 NULL，
+INNER JOIN 天然把它们排除 —— 这 28,643 行别名不会污染作品/角色解析。
+⚠️ 但 `alias_uniq` **必须把 `person_id` 加进唯一约束**：声优行两个 id 都是 NULL，
+而约束是 `NULLS NOT DISTINCT`，不加的话两个同名声优会撞约束、后灌的被静默丢掉
+（001 里那条注释警告过的坑换个位置复发）。
+
+✅ **已接进 `/ask` 的路由分派**（2026-08-21）—— 见下一条。
+
 ### ⬜ 同 IP 衍生折叠 —— `/api/related` 32% 的结果是噪声
 
 问灵能百分百会返回它自己的「REIGEN」「第一回灵能相谈所」「10周年纪念映像」。
 根因是 `series_root` 只折叠 `rt=2/3`（前传/续集），没折叠 `rt=6/11/12`（番外/衍生）。
-**完整数据与两个修法的取舍见 I.3 末尾。** 倾向方案 A（标题包含关系）先顶上，
-方案 B（载入 `subject-relations`）留到第 6 周与那条 `rt=12` 遗留缺口一起解决。
+**完整数据与两个修法的取舍见 I.3 末尾。**
+
+📌 **2026-08-21 量化了这个缺口，比原先以为的大**：全库 5,958 部作品自成一根
+且无萌娘语料，其中 **703 部的标题以某个「有语料的根」为前缀**，
+合计占全库热度 **4.95%** —— 它们的语料其实就在库里，只是作用域映射不过去。
+触发案例：《总之就是非常可爱 ～制服～》(root=376708) 拿不到主系列
+《总之就是非常可爱》(root=301541) 的萌娘页，而 B.1 有一道结局题正好问它。
+⇒ **「覆盖作品 79.3% / 热度加权 97.3%」是低估的。**
+
+🚨 **但这批数据同时证伪了方案 A（标题前缀）**：热度最高的那个是
+「钢之炼金术师 FULLMETAL ALCHEMIST」(done=37,474) —— 它是 2009 重制版，
+**后半剧情与 2003 版完全不同**，蹭 2003 版的语料会答错。
+正是 E.3 记的「重制/不同改编同名」那 81 个同名标题的坑。
+⇒ **方案 B（载入 dump 的 `subject-relations`，按 `rt` 判断）才是正解**，
+标题前缀只能当临时补丁。留到第 6 周与那条 `rt=12` 遗留缺口一起解决。
+⚠️ 它要动 `series_root`，会牵连推荐的续作折叠、`/api/related`、问卷选题三处，
+**不要和语料改动混在一次做**。
 
 ### ⬜ 前端要加剧透提醒 —— 因为剧透门控**确定会漏**（2026-08-16 Kevin 定）
 

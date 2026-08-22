@@ -37,6 +37,7 @@ from src import (
     recommend_sql,
     related,
     retrieve,
+    router,
     tag_rules,
     voice,
 )
@@ -135,6 +136,7 @@ app = FastAPI(
     redoc_url="/api/redoc",
 )
 API = "/api"
+NL_ = chr(10)
 
 # CORS 仅供本地开发：Vite dev server 在 5173，而 API 跑在 8000，属跨源。
 # ⚠️ **线上同源，这段不生效也不需要生效。**
@@ -433,7 +435,70 @@ def ask(req: schemas.AskRequest) -> schemas.AskResponse:
          rerank 挂     → retrieve() 内部已降级成向量序，请求照常成功
          LLM 挂        → 检索结果是好的，只是没法生成 → 503，但把 chunks 带回去
     """
+    # ── 分派 ──────────────────────────────────────────────────
+    # ⚠️ 这是**意图路由**不是意图分类器：信号全部确定性（触发词 + 时间正则），
+    #    没有一处交给模型判。见 src/router.py 的模块注释。
+    if req.route == "auto":
+        route, reason = router.classify(req.question)
+    else:
+        route, reason = req.route, "由调用方指定"
+    fell_back = ""          # 非空 = 从 voice/season 回落过来的，原因写在里面
+
     with _conn() as c:
+        # ── voice：某声优配过哪些角色。零模型。 ────────────────────
+        if route == "voice":
+            # ⚠️ 按钮路径用**宽松判据**：用户点了「声优」就是显式指令，
+            #    不需要任何触发词 —— 「花泽香菜」这类裸名字正是自动分派
+            #    覆盖不到、而按钮能救的那一类（router.relax_voice 的注释）。
+            people = (voice.find_person(c, req.question)
+                      if req.route == "voice" or router.relax_voice(req.question)
+                      else [])
+            if people:
+                person = people[0]
+                items = voice.roles_of(c, person.person_id, limit=req.top_k * 2)
+                ctx = voice.as_context(person, items)
+                return schemas.AskResponse(
+                    route="voice", route_reason=reason, state="ok",
+                    answer=ctx[1] if ctx else None,
+                    series_root=None, title=None, chunks=[], candidates=[],
+                    meta={"zero_model": True},
+                    voice=schemas.VoiceResponse(
+                        person_id=person.person_id, name=person.name,
+                        name_cn=person.name_cn, n_roles=person.n_roles,
+                        items=[schemas.VoiceRoleItem(**vars(r)) for r in items],
+                    ),
+                )
+            # ⚠️ 空结果**回落而不是 404** —— 用户点错按钮很常见，
+            #    硬失败会让他以为功能坏了。回落要在 route_reason 里说清楚。
+            fell_back = "没有找到这个名字的声优。"
+            route, reason = "ask", "没找到这个声优，改按剧情问答处理"
+
+        # ── season：按档期浏览。零模型。 ──────────────────────────
+        if route == "season":
+            cour = router.parse_cour(req.question)
+            payload = _season_payload(c, *(cour or (None, None)),
+                                      limit=req.top_k * 3, include_nsfw=False)
+            if payload.items:
+                head = (f"{payload.year} 年 {payload.month} 月番共 "
+                        f"{payload.total} 部，按热度列出前 {len(payload.items)} 部：")
+                lines = [f"{it.name_cn or it.name}（{it.air_date}）"
+                         for it in payload.items]
+                return schemas.AskResponse(
+                    route="season", route_reason=reason, state="ok",
+                    answer=head + NL_.join([""] + lines),
+                    series_root=None, title=None, chunks=[], candidates=[],
+                    meta={"zero_model": True}, season=payload,
+                )
+            # ⚠️ **当季/未来天生稀薄**（候选集 done>=50 挡住新番，
+            #    「下一季」实测 0 部）—— 这里给话术，不要去放宽档期窗口，
+            #    放宽只会把上一季的旧番混进来冒充新番。
+            fell_back = (f"{payload.year} 年 {payload.month} 月番在库内没有收录作品"
+                         "——新番的收藏数还不够，暂时进不了候选集。")
+            route = "ask"
+            reason = ("该档期在库内没有收录作品（新番收藏数不足，"
+                      "见「季度更新」①），改按剧情问答处理")
+
+        # ── ask：流程 C 剧情问答（内含 related 补充上下文）──────────
         try:
             res = retrieve.ask(c, req.question,
                                spoiler=req.spoiler, final=req.top_k,
@@ -456,8 +521,17 @@ def ask(req: schemas.AskRequest) -> schemas.AskResponse:
                 years = dict(cur.fetchall())
 
     return schemas.AskResponse(
+        # ⚠️ route 可能不是分派器最初判的那个 —— voice/season 空结果会回落到
+        #    这里，此时 reason 里写着为什么回落。回传的必须是**实际走的**。
+        route=route, route_reason=reason,
         state=res.state.value,
-        answer=res.text,
+        # ⚠️ **回落的原因必须出现在 answer 里，不能只放在 route_reason。**
+        #    用户主要看 answer —— 实测「下一季有什么新番」回落后只显示
+        #    「没认出你问的是哪部作品或哪个角色」，那句话对他毫无信息量，
+        #    真正的原因（该档期没收录）却藏在一个他不会看的字段里。
+        #    ⚠️ 只在 ask 也没答上来时拼接：ask 真答出东西了就别打断它。
+        answer=(f"{fell_back}{res.text or ''}"
+                if fell_back and res.state.value != "ok" else res.text),
         series_root=res.resolution.series_root,
         title=res.resolution.title,
         chunks=[
@@ -593,10 +667,18 @@ def season(
        与「mode=upcoming 实测只召回 2 部」同一个根因。⇒ 路由层拿它答
        「下季看什么」会返回空列表，**要在那里给话术，不要在这里放宽窗口**。
     """
+    with _conn() as c:
+        return _season_payload(c, year, month, limit, include_nsfw)
+
+
+def _season_payload(c, year: int | None, month: int | None,
+                    limit: int, include_nsfw: bool) -> schemas.SeasonResponse:
+    """档期查询的本体。⚠️ 抽出来是为了让 POST /api/ask 的 season 分支复用 ——
+    复制一份的话两条路径迟早对「哪些算这一季」给出不同答案。"""
     today = datetime.datetime.now(datetime.UTC).date()
     lo, hi = recommend.cour_window(year or today.year, month or today.month)
 
-    with _conn() as c, c.cursor() as cur:
+    with c.cursor() as cur:
         cur.execute("""
             SELECT subject_id, name, name_cn, air_date, form, fav_done, score,
                    count(*) OVER () AS total
