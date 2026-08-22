@@ -49,7 +49,9 @@ OUT_DIR = ROOT / "data" / "raw" / "moegirl_char"
 OUT_MANIFEST = OUT_DIR / "manifest.jsonl"
 
 
-def pick_targets(top_n: int, exclude_pageids: set[int] | frozenset = frozenset()):
+def pick_targets(top_n: int, exclude_pageids: set[int] | frozenset = frozenset(),
+                 since_year: int | None = None,
+                 root_year: dict[int, int] | None = None):
     """选热度前 top_n 部作品的角色标题，并带上它们的 series_root。
 
     ⚠️ 一个角色可能同时属于多部作品（《Fate》系列尤其明显），所以作用域是
@@ -78,9 +80,20 @@ def pick_targets(top_n: int, exclude_pageids: set[int] | frozenset = frozenset()
     for root, v in tmap.items():
         page_roots[str(v["pageid"])].add(int(root))
 
-    ranked = sorted(links.items(), key=lambda kv: -heat.get(kv[0], 0))[:top_n]
+    ranked = sorted(links.items(), key=lambda kv: -heat.get(kv[0], 0))
+    chosen = dict(ranked[:top_n])
+    # ⚠️ **时间维度是「或」不是「与」**：新番热度天然低（候选集 done>=50 的
+    #    口径决定的，见「季度更新」①），按热度排根本进不了前 N —— 而
+    #    「最近几年的番」恰恰是用户最可能问的。两个口径取并集。
+    if since_year and root_year:
+        for pid, v in ranked:
+            if pid in chosen:
+                continue
+            if any(root_year.get(r, 0) >= since_year
+                   for r in page_roots.get(pid, ())):
+                chosen[pid] = v
     targets: dict[str, set[int]] = defaultdict(set)
-    for pid, v in ranked:
+    for pid, v in chosen.items():
         for t in v["chars"]:
             targets[t] |= page_roots.get(pid, set())
     if exclude_pageids:
@@ -92,12 +105,14 @@ def pick_targets(top_n: int, exclude_pageids: set[int] | frozenset = frozenset()
         if dropped:
             print(f"⚠️ 排除 {len(dropped)} 个「角色与作品同名」的页面："
                   f"{'、'.join(dropped[:5])}")
-    return targets, [v["title"] for _, v in ranked]
+    return targets, [v["title"] for v in chosen.values()]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--top", type=int, default=500, help="取热度前 N 部作品的角色页")
+    ap.add_argument("--since-year", type=int, default=None,
+                    help="额外纳入 air_year >= 该年份的作品（与 --top 取并集）")
     ap.add_argument("--delay", type=float, default=DEFAULT_DELAY,
                     help="请求间隔秒数。⚠️ 7 秒是铁律，不要调低")
     ap.add_argument("--dry-run", action="store_true", help="只算账不发请求")
@@ -108,14 +123,21 @@ def main() -> int:
     with db.connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT pageid FROM moegirl_page WHERE kind = 'series'")
         series_pages = {r[0] for r in cur.fetchall()}
-    targets, works = pick_targets(args.top, series_pages)
+        cur.execute("SELECT coalesce(series_root, subject_id), max(air_year) "
+                    "FROM anime_profile WHERE air_year IS NOT NULL GROUP BY 1")
+        root_year = dict(cur.fetchall())
+    targets, works = pick_targets(args.top, series_pages,
+                                  args.since_year, root_year)
     sizes = json.loads(SIZES.read_text(encoding="utf-8")) if SIZES.exists() else {}
     OUT_DIR.mkdir(parents=True, exist_ok=True)
 
     unknown = [t for t in targets if t not in sizes]
     known_alive = [t for t in targets if sizes.get(t)]
     have = {f.name.split(".")[0] for f in OUT_DIR.glob("*.html.gz")}
-    print(f"热度前 {args.top} 部作品（{works[0]} … {works[-1]}）")
+    scope_desc = f"热度前 {args.top} 部"
+    if args.since_year:
+        scope_desc += f" + {args.since_year} 年以来的作品"
+    print(f"{scope_desc} —— 共 {len(works)} 部（{works[0]} … {works[-1]}）")
     print(f"候选角色标题 {len(targets):,} 个")
     print(f"  已知存在 {len(known_alive):,} · 已知红链 "
           f"{sum(1 for t in targets if t in sizes and not sizes[t]):,} · "
@@ -136,7 +158,9 @@ def main() -> int:
     with KeepAwake(), httpx.Client(headers={"User-Agent": UA}, timeout=60,
                                    follow_redirects=True) as c:
         if unknown:
-            CHUNK = 1000
+            # ⚠️ 每 CHUNK 个标题存一次盘。调小是为了压低**最坏损失** ——
+            #    重试用尽后整批会作废，实测 503 那次丢了 900 个已解析的结果。
+            CHUNK = 500
             for i in range(0, len(unknown), CHUNK):
                 part = unknown[i:i + CHUNK]
                 found = resolve_titles(c, part, args.delay)

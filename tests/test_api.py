@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server.main import API, app
-from src import db
+from src import db, retrieve
 
 
 @pytest.fixture(scope="module")
@@ -383,3 +383,34 @@ def test_season_defaults_to_current_cour(client):
     b = client.get(f"{API}/season").json()
     assert b["month"] in (1, 4, 7, 10)
     assert b["window_start"] <= b["window_end"]
+
+
+# ============================================================
+# 泛称不参与作用域投票（2026-08-22）—— 走库，不走 LLM
+# ============================================================
+def test_generic_name_does_not_outvote_real_character(db_conn):
+    """🚨 「女主角」和「司波深雪」平票会把问句拖进反问。
+
+    实测根因：dump 里确实有角色叫「女主角」（撞《宝可梦进化》），于是
+    司波深雪→魔法科(1票) vs 女主角→宝可梦进化(1票) → 并列 → ambiguous，
+    而用户明明已经点了具体角色名。
+    ⚠️ 这类 bug 只在「泛称 + 真名字」同时出现时才触发 —— 单测真名字发现不了。
+    """
+    res = retrieve.resolve(db_conn, "女主角司波深雪的最新进度")
+    assert res.state is retrieve.State.OK
+    assert "魔法科" in (res.title or "")
+
+
+def test_generic_name_still_usable_when_alone(db_conn):
+    """⚠️ 全是泛称时要退回用它们 —— 否则「这部动画的主人公是谁」会从
+    「反问是哪一部」退化成「没认出来」，后者对用户更没用。"""
+    res = retrieve.resolve(db_conn, "这部动画的主人公是谁")
+    assert res.state is retrieve.State.AMBIGUOUS
+
+
+def test_subject_name_still_wins_over_generic(db_conn):
+    """回归：有作品名时本来就该由作用域直接消解，这条路径不能被改坏
+    （retrieve.resolve 里那段注释记的正是这个案例）。"""
+    res = retrieve.resolve(db_conn, "冰之城墙这个漫画的主人公是谁")
+    assert res.state is retrieve.State.OK
+    assert "冰之城墙" in (res.title or "")

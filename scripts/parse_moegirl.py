@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import gzip
+import html
 import json
 import re
 import statistics as st
@@ -368,6 +369,12 @@ def restore_language_variants(root) -> None:
             continue
         t = ((d.get("disabled") or {}).get("t")) or ""
         t = re.sub(r"<[^>]+>", "", t)
+        # ⚠️ **还要解 HTML 实体。** data-mw 属性里是 JSON 化的 wikitext，
+        #    `&` 在里面写作 `&amp;` —— 不解码的话正文里会留下
+        #    「White &amp; Black」这种，实测角色页 48 条、作品页 52 条。
+        #    ⚠️ 顺序必须在**去标签之后**：先解码的话 `&lt;b&gt;`
+        #    会变成真的 `<b>`，接着被当标签删掉，反而丢字。
+        t = html.unescape(t)
         # ⚠️ 属性里放的是 **wikitext 片段**，不是 HTML —— 只去标签会留下
         #    「想風]]」「蒼空の炎]]」这类残尾。内链取显示名（[[A|B]] → B）。
         t = re.sub(r"\[\[(?:[^\[\]|]*\|)?([^\[\]|]*)\]\]", r"\1", t)

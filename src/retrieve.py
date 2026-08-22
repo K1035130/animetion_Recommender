@@ -119,6 +119,23 @@ MENTION_MAX = 16
 #    那条结论是在**没有 ① 直取**的实验里得到的，前提不含点名场景。
 #    G.5g 说 alias 路径是「确定性的解法」，**能被 rerank 挤掉就不是确定性的**。
 #    ⇒ 保底只保「在不在」，**不保排第几** —— 排序仍然全归 rerank。
+# 🚨 **泛称不参与作用域投票。** 它们被收进了 alias（dump 里确实有角色叫这个），
+#    但对「是哪部作品」零指代力，却会和真角色名平票、把问句拖进反问。
+#    实测：「女主角司波深雪的最新进度」→
+#      司波深雪 → 魔法科(1票)  vs  女主角 → 宝可梦进化(1票)  → 并列 → 反问，
+#    而用户明明已经点了具体角色名。
+#    📌 这是 I.1 那条「主角重名 6.4%（アリス×9、主人公×9）」的活体样本。
+# ⚠️ **只能靠语义列举，不能按「撞几部」筛** —— 实测撞得最多的全是真名字
+#    （爱丽丝 26 部 · マリー 25 · 莉莉 23），而「女主角」只撞 1 部。
+# ⚠️ **不删 alias 行**：那是数据，删了某些角色就再也检索不到（有作品的角色
+#    本名就叫「主人公」）。这里只在**投票**这一步忽略它们 —— 全是泛称时
+#    仍然退回用它们，否则「这部动画的主人公是谁」会变成 UNKNOWN。
+GENERIC_NAMES = frozenset({
+    "主人公", "主角", "女主角", "男主角", "主人翁", "男主", "女主",
+    "旁白", "叙述者", "玩家", "プレイヤー", "ナレーター", "ナレーション",
+    "无名", "名前なし", "村民", "路人", "群众", "众人",
+})
+
 PIN_RESERVE = 4
 
 # ── OP/ED 题的 songs 保底席位 ────────────────────────────────────
@@ -425,8 +442,12 @@ def resolve(conn: psycopg.Connection, question: str) -> Resolution:
         #    反问多花一次点击，猜错是自信地讲了另一部作品的剧情，
         #    而用户很可能看不出来。实测「拉姆是谁」（撞 4 部）、
         #    「三笠对艾伦」（艾伦撞 6 部）都会走到这里。
+        # ⚠️ 泛称先摘出去（见 GENERIC_NAMES）。全是泛称时退回用它们 ——
+        #    「这部动画的主人公是谁」不该因此变成 UNKNOWN。
+        voting = [m for m in mentions
+                  if m.text not in GENERIC_NAMES] or mentions
         votes: dict[int, set[str]] = {}
-        for m in mentions:
+        for m in voting:
             votes.setdefault(m.series_root, set()).add(m.text)
         ranked_roots = sorted(votes.items(), key=lambda kv: -len(kv[1]))
         if len(ranked_roots) > 1 and len(ranked_roots[0][1]) == len(ranked_roots[1][1]):

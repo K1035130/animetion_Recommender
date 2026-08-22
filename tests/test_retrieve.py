@@ -11,6 +11,7 @@ import pytest
 
 from src import llm, recommend, related
 from src.retrieve import (
+    GENERIC_NAMES,
     MIN_KEEP,
     MIN_SCORE,
     PIN_RESERVE,
@@ -302,3 +303,20 @@ def test_songs_seat_absent_is_a_noop():
     assert songs_seat("《大闹天宫》的片头曲是什么？", order) is None
     assert ([c.chunk_id for c in _apply_pin_reserve(order, final=8, seat=None)]
             == [c.chunk_id for c in _apply_pin_reserve(order, final=8)])
+
+
+# ============================================================
+# 泛称不参与作用域投票（2026-08-22）
+# ============================================================
+def test_generic_names_are_semantic_not_frequency_based():
+    """⚠️ 泛称只能靠**语义列举**，不能按「撞几部作品」自动筛。
+
+    实测撞得最多的全是真名字：爱丽丝 26 部 · マリー 25 · 莉莉 23 · 田中 16，
+    而真正的泛称「女主角」只撞 1 部（《宝可梦进化》）。
+    这条测试防的是有人把 GENERIC_NAMES 改成按 df 自动生成 —— 那会把
+    爱丽丝这类真名字全部误杀，而漏掉「女主角」。
+    行为层面的验证在 tests/test_api.py（需要连库）。
+    """
+    assert "爱丽丝" not in GENERIC_NAMES
+    assert "田中" not in GENERIC_NAMES
+    assert {"主人公", "女主角", "男主角"} <= GENERIC_NAMES

@@ -201,12 +201,43 @@ def resolve_titles(client: httpx.Client, titles: list[str],
         # ⚠️ 必须用 POST。GET 会 414 URI Too Long —— 中文标题 percent-encode 后
         #    每个汉字 9 字节，50 个标题轻松超过 URL 长度上限。
         #    MediaWiki 的 action=query 是读操作但同样接受 POST。
-        r = client.post(API, data={
-            "action": "query", "prop": "info", "redirects": "1",
-            "titles": "|".join(batch), "format": "json", "formatversion": "2",
-        })
-        r.raise_for_status()
-        d = r.json()
+        # 🚨 **必须重试，一次 5xx 不能让整批作废。** 实测 2026-08-22：
+        #    抓角色页时 API 返回 503，raise_for_status() 直接抛出 ——
+        #    当时那一批已经解析到 900/1000，结果全丢，白等 2 分钟。
+        #    ⚠️ 对方是公益站点，5xx 说明它正吃力 ⇒ **退避要长**（15/30/60 秒），
+        #       不能像限流那样几百毫秒重试，那是在给它雪上加霜。
+        #    ⚠️ 只重试 5xx / 429；4xx 是我们请求有问题，重试多少次都一样。
+        d = None
+        for attempt in range(4):
+            # ⚠️ **传输层异常也要重试，不只是 HTTP 状态码。** 第一版只判了
+            #    status_code，结果下一跑就栽在 httpx.ReadTimeout 上 ——
+            #    那是 post() 直接抛出的，根本走不到状态码判断。
+            #    最早 prop=info 撞的 DNS 失败（getaddrinfo failed = ConnectError）
+            #    也是同一类。TransportError 是它们共同的基类。
+            try:
+                r = client.post(API, data={
+                    "action": "query", "prop": "info", "redirects": "1",
+                    "titles": "|".join(batch), "format": "json",
+                    "formatversion": "2",
+                })
+            except httpx.TransportError as exc:
+                if attempt == 3:
+                    raise
+                wait = 15 * (2 ** attempt)
+                bar.write(f"  {type(exc).__name__}，{wait}s 后重试"
+                          f"（第 {attempt + 1}/3 次）")
+                time.sleep(wait)
+                continue
+            if r.status_code < 500 and r.status_code != 429:
+                r.raise_for_status()
+                d = r.json()
+                break
+            if attempt == 3:
+                r.raise_for_status()          # 退避完还是不行，如实炸出来
+            wait = 15 * (2 ** attempt)
+            bar.write(f"  API {r.status_code}，{wait}s 后重试"
+                      f"（第 {attempt + 1}/3 次）")
+            time.sleep(wait)
         if "error" in d:
             raise RuntimeError(f"API 报错: {d['error']}")
         q = d.get("query", {})
