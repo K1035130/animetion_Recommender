@@ -67,6 +67,72 @@ _SEASON_TRIGGERS = ("番", "季度", "季番", "播出", "开播", "上映", "�
                     "当季", "新番", "在播", "有哪些", "有什么")
 
 
+# ── 英文触发词与时间表达（第四部分「英文提问支持」①）──────────────
+#
+# ⚠️ **英文单独一份表，不要把中文那份翻译过去。** 两边触发词的性质不同：
+#    中文的「番」「季度」几乎只用于档期语境；而英文的 season 在动画语境里
+#    **压倒性地指「某部作品的第几季」**（Season 2），不是日历季度。
+#    这条不对称直接决定了 _EN_REL_COUR 里为什么没有 "last season"。
+#
+# ⚠️ 英文一律在 casefold 后的串上匹配，且**必须带 \b 词边界** ——
+#    没有词边界的话 "may" 会命中 "maybe"、"fall" 会命中 "fallen"。
+#    这与 retrieve._latin_word_boundary 是同一类问题的同一个解法。
+_EN_SEASON_TRIGGERS = (
+    "anime", "airing", "aired", "air date", "season", "seasonal",
+    "premiere", "premiered", "broadcast", "simulcast", "lineup",
+    "watching", "came out", "coming out",
+)
+_EN_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+           "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+           "twelve": 12, "fifteen": 15, "twenty": 20, "thirty": 30}
+_EN_MONTH = {"january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3,
+             "mar": 3, "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6,
+             "july": 7, "jul": 7, "august": 8, "aug": 8, "september": 9,
+             "sept": 9, "sep": 9, "october": 10, "oct": 10, "november": 11,
+             "nov": 11, "december": 12, "dec": 12}
+_EN_SEASON_WORD = {"spring": 4, "summer": 7, "fall": 10, "autumn": 10,
+                   "winter": 1}
+
+_MO_RE = "|".join(sorted(_EN_MONTH, key=len, reverse=True))
+_SE_RE = "|".join(_EN_SEASON_WORD)
+_NU_RE = "|".join(sorted(_EN_NUM, key=len, reverse=True))
+_YR_RE = r"(?:19|20)\d{2}"
+
+_EN_M_Y = re.compile(rf"\b({_MO_RE})\b\.?\s*(?:of\s+)?({_YR_RE})\b")
+_EN_Y_M = re.compile(rf"\b({_YR_RE})\s+({_MO_RE})\b")
+_EN_S_Y = re.compile(rf"\b({_SE_RE})\b\s*(?:of\s+)?({_YR_RE})\b")
+_EN_Y_S = re.compile(rf"\b({_YR_RE})\s+({_SE_RE})\b")
+_EN_Y = re.compile(rf"\b({_YR_RE})\b")
+_EN_AGO = re.compile(rf"\b(\d{{1,2}}|{_NU_RE})\s+years?\s+ago\b")
+_EN_DECADE_AGO = re.compile(r"\b(?:a|one)\s+decade\s+ago\b")
+_EN_REL_Y = {"this year": 0, "last year": -1, "next year": 1}
+# 🚨 **英文的 season 有两个义项，必须靠介词分开。**
+#    日历义：「what anime is coming out next season」
+#    续作义：「will there be a next season **of** Steins;Gate」
+#            「what happened last season **in** Attack on Titan」
+#    ⇒ 用**正则 + 否定预查**而不是子串包含：`of` / `in` / `for` 跟在后面
+#      就判为续作义，让它落回 ask。
+#    ⚠️ classify() 是**纯函数、零 DB**（模块注释里的设计约束），
+#      没法靠「句子里有作品名」来消歧，介词是唯一能用的确定性信号。
+_EN_OF = r"(?!\s+(?:of|in|for)\b)"
+# ⚠️ **有意不收 "last season" / "previous season"**，即使有介词护栏：
+#    英文里裸的 "last season" 压倒性地指某部作品的上一季，而
+#    "what aired last season" 这种日历义写法远没有 "this/next season" 常见。
+#    ⇒ 宁可漏认，不要静默劫走剧情题。中文的「上一季」歧义同样存在，
+#      但「季度」的日历义强得多，暂不动 _REL_COUR。
+_EN_REL_COUR = ((re.compile(rf"\bnext season\b{_EN_OF}"), 1),
+                (re.compile(rf"\bthe season after next\b{_EN_OF}"), 2))
+_EN_THIS_COUR = (re.compile(rf"\bthis season\b{_EN_OF}"),
+                 re.compile(rf"\bcurrent season\b{_EN_OF}"),
+                 re.compile(r"\bcurrently airing\b"))
+
+
+def _shift_cour(today: datetime.date, n: int) -> tuple[int, int]:
+    """在 (1,4,7,10) 上平移 n 个季度，跨年由整除/取模自然进位。"""
+    idx = _COUR_MONTHS.index(_COUR[today.month]) + n
+    return today.year + idx // 4, _COUR_MONTHS[idx % 4]
+
+
 def _cn_int(s: str) -> int | None:
     """把「十」「十年」「二十」这类中文数字转成 int。只处理 100 以内。"""
     if s.isdigit():
@@ -92,24 +158,45 @@ def parse_cour(question: str, today: datetime.date | None = None
 
     ⚠️ **必须有季度类触发词才认**，否则「2016 年的作画怎么样」这种也会被
        劫到 season 分支去 —— 那是个剧情/评价类问题，答案不在档期表里。
+
+    ⚠️ **中英两条阶梯并行，同级里中文先判。** 两边的模式互不匹配
+       （中文那几条都要「年」「月」「前」这类汉字，英文那几条都带 \b 词边界），
+       所以混合输入「2016年的 anime」不会两边同时命中；真同时命中时
+       以中文为准，与问句主体语言一致。
+
+    ⚠️ 触发词门槛是为**自动分派**设的（防止剧情题被劫走）。
+       按钮路径（route="season"）本该跳过它 —— 那是 relax_voice 的对偶，
+       见第四部分「英文提问支持」与 season 静默回落当季那条。
     """
     # ⚠️ 用 UTC，与 GET /api/season 的缺省口径一致 —— 两处对「今天是哪个季度」
     #    的理解必须相同，否则同一句「这个季度」在两条路径上会指向不同的档期。
     today = today or datetime.datetime.now(datetime.UTC).date()
-    if not any(k in question for k in _SEASON_TRIGGERS):
+    q = question.casefold()
+    if not (any(k in question for k in _SEASON_TRIGGERS)
+            or any(k in q for k in _EN_SEASON_TRIGGERS)):
         return None
 
+    # ── ① 绝对年 + 月 ──────────────────────────────────────
     m = _Y_M.search(question)
     if m:
         mon = int(m.group(2))
         if 1 <= mon <= 12:
             return int(m.group(1)), _COUR[mon]
+    for rx, yi, mi in ((_EN_M_Y, 2, 1), (_EN_Y_M, 1, 2)):
+        m = rx.search(q)
+        if m:
+            return int(m.group(yi)), _COUR[_EN_MONTH[m.group(mi)]]
 
+    # ── ② 绝对年 + 季节 ────────────────────────────────────
     m = _Y_S.search(question)
     if m:
         return int(m.group(1)), _SEASON_WORD[m.group(2)]
+    for rx, yi, si in ((_EN_S_Y, 2, 1), (_EN_Y_S, 1, 2)):
+        m = rx.search(q)
+        if m:
+            return int(m.group(yi)), _EN_SEASON_WORD[m.group(si)]
 
-    # 相对年份：「十年前的这个季度」「去年春季」
+    # ── ③ 相对年份：「十年前的这个季度」「ten years ago today」──
     year = None
     m = _AGO.search(question)
     if m:
@@ -117,8 +204,20 @@ def parse_cour(question: str, today: datetime.date | None = None
         if n is not None:
             year = today.year - n
     if year is None:
+        m = _EN_AGO.search(q)
+        if m:
+            g = m.group(1)
+            year = today.year - (int(g) if g.isdigit() else _EN_NUM[g])
+        elif _EN_DECADE_AGO.search(q):
+            year = today.year - 10
+    if year is None:
         for word, delta in _REL_Y.items():
             if word in question:
+                year = today.year + delta
+                break
+    if year is None:
+        for word, delta in _EN_REL_Y.items():
+            if word in q:
                 year = today.year + delta
                 break
 
@@ -126,21 +225,27 @@ def parse_cour(question: str, today: datetime.date | None = None
         for word, mon in _SEASON_WORD.items():
             if word in question:
                 return year, mon
+        for word, mon in _EN_SEASON_WORD.items():
+            if re.search(rf"\b{word}\b", q):
+                return year, mon
         return year, _COUR[today.month]        # 「十年前的这个季度」
 
-    # 只写了年份 + 季度触发词：「2016 年有哪些番」→ 当季对应的月
-    m = _Y.search(question)
+    # ── ④ 只写了年份 + 触发词：「2016 年有哪些番」/「anime from 2016」──
+    m = _Y.search(question) or _EN_Y.search(q)
     if m:
         return int(m.group(1)), _COUR[today.month]
 
-    # 相对季度：「下一季」「上个季度」。⚠️ 要在「这个季度」之前判。
+    # ── ⑤ 相对季度：「下一季」「next season」。⚠️ 要在 ⑥ 之前判。──
     for word, n in _REL_COUR.items():
         if word in question:
-            idx = _COUR_MONTHS.index(_COUR[today.month]) + n
-            return today.year + idx // 4, _COUR_MONTHS[idx % 4]
+            return _shift_cour(today, n)
+    for rx, n in _EN_REL_COUR:
+        if rx.search(q):
+            return _shift_cour(today, n)
 
-    # 「这个季度」「当季新番」
-    if any(k in question for k in ("这个季度", "本季", "当季", "这一季")):
+    # ── ⑥ 「这个季度」「this season」────────────────────────
+    if (any(k in question for k in ("这个季度", "本季", "当季", "这一季"))
+            or any(rx.search(q) for rx in _EN_THIS_COUR)):
         return today.year, _COUR[today.month]
     return None
 

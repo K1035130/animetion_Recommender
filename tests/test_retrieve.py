@@ -21,6 +21,7 @@ from src.retrieve import (
     _substrings,
     songs_seat,
 )
+from src.textproc import norm_name, norm_name_gaps
 
 
 def mk(cid: int, score: float, *, pinned: bool = False) -> Chunk:
@@ -97,22 +98,64 @@ def test_pin_does_not_get_promoted():
 
 # ── 词边界（_latin_word_boundary）────────────────────────────────
 
-@pytest.mark.parametrize(("q", "name", "ok"), [
-    ("python实现", "py", False),      # 从英文词中间截出 → 挡掉
-    ("excel表格", "el", False),
-    ("eva的结局", "eva", True),        # 独立出现的真别名 → 放行
+@pytest.mark.parametrize(("raw", "name", "ok"), [
+    # ── 假阳性必须继续挡住（原有 5 项，改成从**原始问句**出发）──────
+    ("帮我写一个快速排序的 Python 实现", "py", False),   # 英文词中间截出
+    ("帮我写一个快速排序的 Python 实现", "hon", False),
+    ("怎么把 Excel 表格导出成 CSV", "ex", False),
+    ("怎么把excel表格导出", "el", False),                # 中英直接相连，无 gap
+    ("eva的结局", "eva", True),                          # 独立出现的真别名
     ("看eva", "eva", True),
-    ("蕾姆是谁", "蕾姆", True),          # 中文不受词边界约束
+    ("蕾姆是谁", "蕾姆", True),                           # 中文不受词边界约束
+    # ── 🚨 英文问句回归：修之前这三条全是 False ──────────────────
+    ("What happens at the end of Steins;Gate?", "steinsgate", True),
+    ("Explain the ending of Attack on Titan", "attackontitan", True),
+    ("Who is Mikasa Ackerman?", "mikasaackerman", True),
 ])
-def test_latin_word_boundary(q, name, ok):
-    """🚨 回归：拉丁字母别名必须落在词边界上。
+def test_latin_word_boundary(raw, name, ok):
+    """🚨 双向回归：既要挡住词中截取，又不能把英文问句全灭。
 
-    实测「帮我写一个快速排序的 Python 实现」曾命中 py/hon，
-    于是一个与动画无关的问题被自信地解析成了某部作品。
+    **挡住的那一侧**：实测「帮我写一个快速排序的 Python 实现」曾命中
+    py/hon，于是一个与动画无关的问题被自信地解析成了某部作品。
     ⚠️ 中文没有词边界，而蕾姆/拉姆/三笠全是 2 字，不能套同一条规则。
+
+    **放行的那一侧**：norm_name 会删掉所有空白，于是英文问句里的标题
+    前后都贴着别的单词，与 py/hon 在 norm 串上**长得一模一样**。
+    实测修之前 resolve() 对英文 6/6 全灭，且只有整句仅剩标题时才认得出。
+    ⇒ 判据必须回到**原文**有没有分隔符，也就是 norm_name_gaps 的 gaps。
+
+    ⚠️ 参数从**原始问句**出发而不是直接给 norm 串 —— 直接给 norm 串就
+       绕过了 gaps 的产生过程，这个 bug 恰恰藏在那一步里。
     """
-    start = q.find(name)
-    assert _latin_word_boundary(q, start, start + len(name), name) is ok
+    norm_q, gaps = norm_name_gaps(raw)
+    start = norm_q.find(name)
+    assert start != -1, f"{name!r} 不在 {norm_q!r} 里，用例本身写错了"
+    assert _latin_word_boundary(norm_q, gaps, start, start + len(name), name) is ok
+
+
+# ── norm_name / norm_name_gaps 防漂移 ───────────────────────────
+
+def test_norm_name_gaps_agrees_with_norm_name():
+    """⚠️ 两个函数必须给出同一个归一化串。
+
+    norm_name 定义了 alias 表 26 万行的键，norm_name_gaps 现在是它的
+    唯一实现处。哪天有人为了省事把实现复制回 norm_name，这条就红 ——
+    与 clients.close_all() 那条「该关谁只能有一个定义处」同构。
+    """
+    for s in ["Fate/stay night", "ＦＡＴＥ／ＳＴＡＹ　ＮＩＧＨＴ", "蕾姆",
+              "三笠·阿克曼", "What happens at the end of Steins;Gate?",
+              "", "   ", "！？。", "EVA"]:
+        assert norm_name_gaps(s)[0] == norm_name(s)
+
+
+def test_norm_name_gaps_marks_dropped_separators():
+    """gaps[i] = 原文里紧挨 norm[i] 之前丢掉过东西；长度恒为 len+1。"""
+    norm_q, gaps = norm_name_gaps("Attack on Titan")
+    assert norm_q == "attackontitan"
+    assert len(gaps) == len(norm_q) + 1
+    assert gaps[norm_q.index("on")] is True        # "on" 前面原来是空格
+    assert gaps[norm_q.index("titan")] is True
+    assert gaps[1] is False                        # "ttack" 内部没有分隔符
 
 
 def test_substrings_are_deduped_and_bounded():

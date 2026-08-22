@@ -148,3 +148,71 @@ def test_ask_branch_still_works(client):
                                         "top_k": 3}).json()
     assert d["route"] == "ask"
     assert d["voice"] is None and d["season"] is None
+
+
+# ── 英文时间表达（第四部分「英文提问支持」①）────────────────────
+
+@pytest.mark.parametrize(("q", "want"), [
+    # 绝对年月 / 年季
+    ("what anime aired in July 2016", (2016, 7)),
+    ("what aired in 2016 July", (2016, 7)),
+    ("summer 2016 anime", (2016, 7)),
+    ("anime from the winter of 2017", (2017, 1)),
+    ("what anime aired in fall 2016", (2016, 10)),
+    # 裸年份 + 触发词
+    ("what anime came out in 2016", (2016, 7)),
+    # 相对年份
+    ("what anime were people watching ten years ago today", (2016, 7)),
+    ("what anime aired 10 years ago", (2016, 7)),
+    ("what anime aired a decade ago", (2016, 7)),
+    ("anime airing last year", (2025, 7)),
+    ("new anime next year", (2027, 7)),
+    ("what anime aired in the spring three years ago", (2023, 4)),
+    # 相对/当前季度
+    ("what is airing this season", (2026, 7)),
+    ("what anime is coming out next season", (2026, 10)),
+])
+def test_parse_cour_english(q, want):
+    """英文时间表达同样是**有限模式**，用正则不用模型。
+
+    ⚠️ 交给 LLM 会得到不稳定的日期，而日期错了整个结果就错 ——
+       与中文那一侧同一条理由（见 router 模块注释）。
+    """
+    assert router.parse_cour(q, TODAY) == want
+
+
+@pytest.mark.parametrize("q", [
+    # 🚨 有触发词但**没有时间表达** → 不能劫走，它们是剧情/评价题
+    "best anime ending of all time",
+    "what is the ending of Steins;Gate",
+    "which anime has the best animation",
+    # 🚨 "last season" 在英文里几乎总是指「某部作品的上一季」
+    "what happened last season in Attack on Titan",
+    "will there be a next season of Steins;Gate",
+    "what happened this season in Attack on Titan",
+    "is the current season of One Piece good",
+    # ⚠️ 词边界：may 不能命中 maybe，fall 不能命中 fallen
+    "maybe fallen angels is a good anime",
+])
+def test_parse_cour_english_negatives(q):
+    """负例比正例更值钱：路由错了是静默的，用户只会觉得系统笨。"""
+    assert router.parse_cour(q, TODAY) is None
+
+
+def test_english_question_routes_to_season():
+    """端到端：上一轮那句中文问题的英文对应版本必须落 season。"""
+    route, reason = router.classify(
+        "What anime were people watching ten years ago today?", TODAY)
+    assert route == "season"
+    assert "2016" in reason and "7" in reason
+
+
+def test_next_season_of_a_show_is_not_a_cour_query():
+    """🚨 回归：'next season of X' 问的是续作，不是档期。
+
+    ⚠️ classify() 是纯函数、零 DB，没法靠「句里有作品名」消歧
+       ⇒ 唯一能用的确定性信号是**介词**：season 后面跟 of/in/for
+         就判为续作义。这条钉住那个护栏，防止有人把否定预查删掉。
+    """
+    assert router.classify("will there be a next season of Steins;Gate",
+                           TODAY)[0] == "ask"

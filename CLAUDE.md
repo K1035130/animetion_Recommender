@@ -288,6 +288,11 @@ I.2 ① 的设计）—— **不要据此改常量，等 B.1 人工题库**，�
 ```
 M  CLAUDE.md
 M  scripts/fetch_char_pages.py    pageid 去重（54 个 pageid 被 118 个标题指向）
+M  src/textproc.py                新增 norm_name_gaps；norm_name 委托给它
+M  src/retrieve.py                _latin_word_boundary 改用 gaps 判边界
+M  tests/test_retrieve.py         词边界 5 → 10 项 + 2 项防漂移
+M  src/router.py                  英文触发词表 + 英文时间正则（season 分支）
+M  tests/test_router.py           英文 24 项（总 146 → 177）
 ```
 
 
@@ -312,8 +317,8 @@ M  scripts/fetch_char_pages.py    pageid 去重（54 个 pageid 被 118 个标�
 不过去 —— 触发案例见第四部分「同 IP 衍生折叠」。
 `alias` **263,690 行**（subject 38,378 + character 196,669 + **person 28,643**）。
 `person` **8,215** · `voice_role` **145,306**（sql/009，见第四部分「声优配役」）。
-测试 **146 项**（18 打分一致性 + **24 接口** + **43 检索层** + 9 解析器 + 17 声优
-+ 30 路由 + 5 客户端收尾）。
+测试 **177 项**（18 打分一致性 + **24 接口** + **50 检索层** + 9 解析器 + 17 声优
++ **54 路由** + 5 客户端收尾）。
 ⚠️ 分项是逐个文件 `--collect-only` 数出来的 —— 2026-08-20 发现过「总数对而
 分项错」（加测试时只改了总数），所以改这行时别估。
 ⚠️ **解析器那 9 项用 `pytest.importorskip("lxml")`**（lxml 在 etl 组），
@@ -1772,6 +1777,111 @@ INNER JOIN 天然把它们排除 —— 这 28,643 行别名不会污染作品/�
 ```
 ⚠️ 所以两层的作用正好相反又互补：**投票层有害（零指代力却能平票）、
 召回层有用（语料里就有这个词）**。当初若按「删 alias 行」的思路修就错了。
+
+### ✅ 词边界与 norm_name 的冲突（2026-08-22 修）—— 拉丁名字整体被否掉
+
+🚨 **两条各自正确的规则复合成了一个静默故障。** `norm_name` 删掉所有空白
+（对的，让「Fate/stay night」与「fate stay night」落到同一个键）；
+`_latin_word_boundary` 要求拉丁别名落在词边界上（也是对的，实测挡掉过
+`Python 实现`→py/hon、`导出成 CSV`→el/ex）。
+**但后者依赖的边界，正是前者删掉的东西**：
+
+```
+「What happens at the end of Steins;Gate?」
+  → whathappensattheendofsteinsgate
+  → steinsgate 前面贴着 of 的 'f' → 判为词中截取 → 否决
+```
+
+⚠️ **影响面比「英文提问」大** —— 中文问句里同样中招，只要拉丁别名是
+**更长拉丁串的一部分**：
+
+| 问句 | 修前 | 修后 |
+|---|---|---|
+| `CLANNAD AFTER STORY 的结局` | ❌ `[]` | ✅ clannad |
+| `Fate stay night Unlimited Blade Works 的结局` | ❌ `[]` | ✅ fatestaynight |
+| `Villkiss Michael Mode是谁？` | ❌ `[]` | ✅ villkiss + michael |
+| `GIRLS BAND CRY 讲了什么` | ✅ | ✅ **本来就没坏** |
+
+📌 **判据不是「有没有中文名」**（那是 1,380 部 / 12.0%，含 434 部热门：
+Fate/Zero · BanG Dream! It's MyGO!!!!! · CLANNAD · OVERLORD）。
+**整段拉丁标题被 CJK 包住时一直是好的**，一坏就坏在用户多打一个英文词
+——而副标题/篇章名恰恰是这批作品的常态。
+
+**修法**：`textproc.norm_name_gaps()` 记录「原文里紧挨 norm[i] 之前丢掉过
+分隔符」，边界判据改成「原文有分隔符 **或** 相邻字符非拉丁」（两支是或）。
+⚠️ **不能改成「别去掉空格」** —— alias 26 万行的键就是无空格形态，
+改归一化等于全表重灌，还会让变体重新分裂成多个键。
+⚠️ `norm_name` **委托**给 `norm_name_gaps`，不留第二份实现（它定义着
+alias 的键，漂移就是静默漏召回）——与 `clients.close_all()` 同一条纪律。
+
+**验证（顺带记一个省 CU 的做法）**：`norm_name` 行为经 **313,575 条**对拍
+（含 2 万随机 unicode）**不一致 0**；918 题中文对拍 **917 题逐条相同**，
+唯一差异是上表 Villkiss 那条（是修复不是回归）。
+💡 918 题原本要 ~1,836 次 Neon 往返，**实际只花了 2 条 SQL** ——
+既然 `norm_name` 逐字节没变，两版拿到的 DB 行必然相同，差异 100% 在纯
+Python 段 ⇒ **把 alias 行批量捞回本地回放**。以后做这类判据 A/B 都该这么干。
+
+### ⬜ 英文提问支持 —— 上面那条修完之后剩下的三个缺口
+
+📌 修完词边界后英文实测 `resolve()` 从 **6/6 全灭** 变成 4 条正确
+（Steins;Gate / Attack on Titan / Mikasa Ackerman / ending of Attack on Titan）。
+剩下三件事，**建议一起决定，不要零敲碎打**：
+
+**① ✅ 路由层的 season 分支已认英文（2026-08-22）。**
+`_EN_SEASON_TRIGGERS` + 英文时间正则，24 项测试。零模型、零延迟。
+```
+What anime were people watching ten years ago today?
+  → season · 2016 年 7 月番共 134 部（你的名字。/ 灵能百分百 / 声之形）
+```
+覆盖：`July 2016` · `summer of 2016` · `from 2016` · `ten years ago` ·
+`10 years ago` · `a decade ago` · `last/next year` · `this/next season`。
+
+⚠️ **英文单独一份表，不要把中文那份翻译过去。** 中文的「番」「季度」
+几乎只用于档期语境；英文的 season **压倒性地指「某部作品的第几季」**。
+🚨 **分界线是介词**：`next season` 是档期，`next season **of** X` 是续作，
+`last season **in** Attack on Titan` 也是续作 ⇒ 用否定预查
+`(?!\s+(?:of|in|for)\b)` 挡掉。⚠️ 而 `classify()` 是**纯函数、零 DB**
+（模块注释里的设计约束），没法靠「句里有作品名」消歧，介词是唯一可用的
+确定性信号。⚠️ 裸的 `last season` **有意不收**（即使有护栏）——
+它的续作义太强，而 `what aired last season` 这种日历义写法远没那么常见。
+⚠️ 英文匹配一律带 `\b` 词边界：否则 `may` 命中 `maybe`、`fall` 命中
+`fallen` —— 与 `retrieve._latin_word_boundary` 是同一类问题的同一个解法。
+
+⬜ **剩下两条分支仍不认英文**：
+  - **voice**：`voice.wants()` 的触发词全是中文。⚠️ 而且**加了也只能用一半** ——
+    实测英文声优名只有**日式语序**的罗马字在库里
+    （`hanazawakana` ✅ / `kanahanazawa` ❌ / `kuginorie` ❌），
+    这是覆盖问题，词表修不了。且 `voice.find_person()` **没有词边界保护**，
+    直接放英文进去会撞出假阳性（缺口 ② 的形态）。
+  - **ask**：`resolve()` 已经能认英文作品名（见上一条修复），但
+    `route_reason` / `answer` 仍是中文 —— 英文 UI 是另一件事，见下。
+  - 让模型抽结构。⚠️ 若走这条，**抽「可验证的结构」不要抽「意图标签」**：
+    抽出的作品名要拿去 alias 里验，验不上就回落；意图标签没法验，
+    错了是静默的。这才是与第 15 节原则 2 不冲突的用法。
+
+**② 短拉丁别名撞英文虚词**（`GENERIC_NAMES` 的英文形态）：
+```
+'...watching ten years ago...' → ten → 福星小子 · ago → 虚拟小姐在看着你
+'...as a Slime'               → asa ← "as"+"a" 拼出来的，原文不是一个词
+```
+实测 25 个常见英文虚词 **8 个撞上别名**，全在 3 字符档；2–3 字符纯拉丁
+别名共 1,029 行（占拉丁别名 1.8%）。
+⚠️ **必须语义列举，不能按「撞几部」自动筛** —— 与泛称那条同一个坑。
+📌 **现在零影响**（纯中文问句不含拉丁，触发不到），所以不急。
+
+**③ `MENTION_MAX = 16` 卡住长英文标题。** `fullmetalalchemist` 是 18 字符，
+子串枚举不出来 ⇒ 仍是 UNKNOWN。这个常量按中文标题标定（中文标题字符数
+天然短）。放宽到 ~24 的代价只是子串变多（SQL 是 `= ANY` 索引查找），
+但**会同时影响中文路径**，要单独测一轮再动。
+
+⚠️ **在动 ①② 之前先想清楚「要不要入站翻译」** —— 若决定把英文问句翻成
+中文再走管道，路由层就跑在译文上，① 自动消失。但翻译的收益**必须先测**：
+它的形状与 HyDE 一模一样（每次请求多一次确定的 LLM 调用换未测量的收益），
+而 HyDE 实测是 NDCG 0.638 → 0.471（p=0.012）被否决的。
+💡 现成的实验很便宜：150 题自动标注评测集翻成英文重跑 = 干净 A/B。
+⚠️ 且**实体链接不该靠翻译**：alias 里本来就有 8,931 行拉丁 subject 别名，
+直接匹配零成本零延迟，比 MT 猜标题准（`Fullmetal Alchemist Brotherhood`
+译成什么中文是不确定的）——与 G.5g「点名走 alias 直取」同一条。
 
 ### ⬜ 同 IP 衍生折叠 —— `/api/related` 32% 的结果是噪声
 

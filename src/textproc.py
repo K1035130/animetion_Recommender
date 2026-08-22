@@ -70,6 +70,53 @@ def dict_fingerprint() -> str:
 _DROP_CATEGORIES = ("P", "S", "Z", "C")
 
 
+def norm_name_gaps(s: str) -> tuple[str, tuple[bool, ...]]:
+    """norm_name 的完整形态：归一化结果 + **被丢掉的分隔符原来在哪儿**。
+
+    返回 `(norm, gaps)`，`len(gaps) == len(norm) + 1`。`gaps[i]` 为真表示
+    原文里紧挨 `norm[i]` 之前**至少丢掉过一个**标点或空白；`gaps[len(norm)]`
+    是末尾还有没有被丢掉的东西。
+
+    🚨 **为什么需要它：两条各自正确的规则复合起来把英文问句全灭了。**
+       norm_name 去掉所有空白 —— 这是对的，让「Fate/stay night」与
+       「fate stay night」落到同一个键；`_latin_word_boundary` 要求拉丁
+       别名落在词边界上 —— 这也是对的，挡掉 py / hon 那类词中截取。
+       但**后者依赖的边界，正是前者删掉的东西**：
+
+           「What happens at the end of Steins;Gate?」
+             → whathappensattheendofsteinsgate
+             → steinsgate 前面是 of 的 'f' → 判为词中截取 → 否决
+
+       实测英文问句 resolve() **6/6 全部 UNKNOWN**，而 alias 里
+       `steinsgate` / `attackontitan` / `mikasaackerman` 这些键**都在**
+       （拉丁别名 subject 8,931 · character 43,175 · person 6,681，各占 23%）。
+       症状的指纹很清楚：**只有整句仅剩标题时才认得出** ——
+       'Attack on Titan' → ok，'Attack on Titan ending' → unknown。
+
+    ⚠️ **中文问句永远不会暴露这个 bug**：中文别名 `not name.isascii()`
+       时边界判据第一行就放行了，规则 2 根本不参与。所以它能一直潜伏到
+       第一次有人用英文提问。
+
+    ⚠️ **修法是记住 gap，不是「别去掉空格」。** alias 表 26 万行的键就是
+       无空格形态，改归一化等于全表重灌，还会让「fate stay night」这类
+       变体重新分裂成多个键 —— 那是 norm_name 存在的全部理由。
+    """
+    s = unicodedata.normalize("NFKC", s)
+    s = s.casefold()
+    kept: list[str] = []
+    gaps: list[bool] = []
+    dropped = False
+    for ch in s:
+        if unicodedata.category(ch)[0] in _DROP_CATEGORIES:
+            dropped = True
+            continue
+        kept.append(ch)
+        gaps.append(dropped)
+        dropped = False
+    gaps.append(dropped)
+    return "".join(kept), tuple(gaps)
+
+
 def norm_name(s: str) -> str:
     """别名归一化，用于 alias 表的精确匹配。
 
@@ -77,10 +124,12 @@ def norm_name(s: str) -> str:
     （「ＥＶＡ」→「EVA」、「Ⅱ」→「II」），再统一小写并去掉所有
     标点与空白。这样「Fate/stay night」「fate stay night」
     「ＦＡＴＥ／ＳＴＡＹ　ＮＩＧＨＴ」会落到同一个键上。
+
+    ⚠️ **实现委托给 norm_name_gaps，不要在这里复制一份。** 这个函数定义了
+       alias 表 26 万行的键，两份实现一旦漂移就是静默的漏召回 ——
+       与 `clients.close_all()`「该关谁只能有一个定义处」同一条纪律。
     """
-    s = unicodedata.normalize("NFKC", s)
-    s = s.casefold()
-    return "".join(ch for ch in s if unicodedata.category(ch)[0] not in _DROP_CATEGORIES)
+    return norm_name_gaps(s)[0]
 
 
 # 按书写系统切段。⚠️ 不能直接把整段文本喂给 jieba：

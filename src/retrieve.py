@@ -319,7 +319,8 @@ def _substrings(norm_q: str) -> list[str]:
     return out
 
 
-def _latin_word_boundary(norm_q: str, start: int, end: int, name: str) -> bool:
+def _latin_word_boundary(norm_q: str, gaps: tuple[bool, ...],
+                         start: int, end: int, name: str) -> bool:
     """纯拉丁/数字的别名必须落在词边界上。中日文名不受此限。
 
     🚨 **实测抓到的假阳性，不是防御性编程。** 10 条与动画无关的日常问句里
@@ -335,13 +336,27 @@ def _latin_word_boundary(norm_q: str, start: int, end: int, name: str) -> bool:
 
     ⚠️ **中文不能用同一条规则**：中文没有词边界，而「蕾姆」「拉姆」「三笠」
        全是 2 字，按边界判会把真角色名一起杀掉。
+
+    🚨 **`gaps` 不是可选的优化，没有它这条规则会把英文问句全部否掉。**
+       norm_q 已经被 norm_name 删掉了所有空白，于是
+       「...end of Steins;Gate」里 `steinsgate` 前面直接贴着 of 的 'f' ——
+       看起来和 python 里截出来的 `py` 一模一样。两者的唯一区别在原文里：
+       前者原来隔着一个空格，后者没有。`gaps[i]` 记的就是这件事。
+       实测修之前英文 resolve() 6/6 全灭，详见 textproc.norm_name_gaps。
+
+    ⚠️ **仍然要保留字符相邻的那一支判断**（`norm_q[start-1]` 那两行）：
+       gap 只回答「原文有没有分隔符」，而「把excel表格」这种中英直接相连、
+       原文本来就没有分隔符的写法，得靠「前一个字符不是拉丁字母数字」放行。
+       两支是或的关系，缺哪一支都会漏。
     """
     if not name.isascii() or not name.isalnum():
         return True
-    before_ok = start == 0 or not (norm_q[start - 1].isascii()
-                                   and norm_q[start - 1].isalnum())
-    after_ok = end >= len(norm_q) or not (norm_q[end].isascii()
-                                          and norm_q[end].isalnum())
+    before_ok = (start == 0 or gaps[start]
+                 or not (norm_q[start - 1].isascii()
+                         and norm_q[start - 1].isalnum()))
+    after_ok = (end >= len(norm_q) or gaps[end]
+                or not (norm_q[end].isascii()
+                        and norm_q[end].isalnum()))
     return before_ok and after_ok
 
 
@@ -354,7 +369,7 @@ def find_mentions(conn: psycopg.Connection, question: str) -> list[Mention]:
        （蒙奇·D·路飞 / 三笠·阿克曼），用错函数会**静默漏掉一大批**
        —— 与「查询词必须走同一套 jieba」是同一条纪律，写自检脚本时就踩过。
     """
-    norm_q = textproc.norm_name(question)
+    norm_q, gaps = textproc.norm_name_gaps(question)
     if len(norm_q) < MENTION_MIN:
         return []
 
@@ -393,7 +408,7 @@ def find_mentions(conn: psycopg.Connection, question: str) -> list[Mention]:
     taken: list[tuple[int, int]] = []
     out: list[Mention] = []
     for start, end, norm_name in spans:
-        if not _latin_word_boundary(norm_q, start, end, norm_name):
+        if not _latin_word_boundary(norm_q, gaps, start, end, norm_name):
             continue
         if any(not (end <= ts or start >= te) for ts, te in taken):
             continue                      # 与已选片段重叠 → 跳过（长的已经赢了）
