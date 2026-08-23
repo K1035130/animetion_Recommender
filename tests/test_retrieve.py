@@ -19,6 +19,7 @@ from src.retrieve import (
     _apply_pin_reserve,
     _latin_word_boundary,
     _substrings,
+    _with_sources,
     songs_seat,
 )
 from src.textproc import norm_name, norm_name_gaps
@@ -363,3 +364,25 @@ def test_generic_names_are_semantic_not_frequency_based():
     assert "爱丽丝" not in GENERIC_NAMES
     assert "田中" not in GENERIC_NAMES
     assert {"主人公", "女主角", "男主角"} <= GENERIC_NAMES
+
+
+# ── 出处链接（_with_sources）─────────────────────────────────────
+
+def test_with_sources_appends_note_and_links():
+    """🚨 链接是**代码拼的不是模型生成的**，所以这里必须逐字节可断言。
+
+    让 LLM 写 URL 会得到一个「看起来完全正确」的假地址 —— 用户不会逐个
+    点开验证，而错链接和对链接长得一模一样。这条测试钉住"不经过模型"。
+    """
+    out = _with_sources("答案正文", [("三笠·阿克曼", "https://example.org/a"),
+                                     ("进击的巨人", "https://example.org/b")])
+    assert out.startswith("答案正文\n\n")
+    assert "AI 检索可能有遗漏" in out
+    assert "[三笠·阿克曼](https://example.org/a)" in out
+    assert "[进击的巨人](https://example.org/b)" in out
+
+
+def test_with_sources_is_noop_without_links_or_text():
+    """没有萌娘出处时不要留一句空的提示 —— dump 角色简介就没有对应条目。"""
+    assert _with_sources("答案正文", []) == "答案正文"
+    assert _with_sources(None, [("x", "y")]) is None

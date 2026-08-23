@@ -152,7 +152,20 @@ DROP_CLASS = re.compile(
     # ⚠️ 萌娘百科的导航框**不叫** navbox，叫 menu-*。猜标准 class 名会全漏 ——
     #    实测泄漏成这样：「乔纳森·乔斯达 • 迪奥·布兰度乔瑟夫·乔斯达 • 卡兹空条承太郎…」
     #    它们混在 section 0（前言）里，是纯链接串，对检索是噪声。
-    r"menu-(item|content|popout|title)|six divs)\b")
+    r"menu-(item|content|popout|title)|six divs|"
+    # ⚠️ **专题导航模板的 chrome**（2026-08-23）。与 six divs / menu-* 同一族：
+    #    萌娘用栅格 class 拼「专题」横幅，里面是站务公告而不是条目内容 ——
+    #      <div class="seven columns hint"><div class="toggle-template-container">
+    #        <p>欢迎您一同参与建设名侦探柯南的相关条目♥编辑交流群：24733986</p>
+    #    实测 84 个柯南条目、12 个崩坏3 条目的 (前言) 都以它开头。
+    #
+    # 🚨 **判据必须是 class 不是文本前缀。** 同一批「多页共享同一段开头」的
+    #    chunk 里，**只有约 3% 真的在模板 chrome 内**；其余 97% 祖先只有 body，
+    #    是编者手写在正文里的散文（「注：印象色表示独唱」「日文版由集英社出版」
+    #    「动画第二话结尾的分数排名…堀北的成绩」——最后这条是**真剧情**）。
+    #    按前缀批量剥会把它们一起杀掉 —— 与 F 节「『游戏中的结局』差点被当
+    #    噪声清掉」同一个坑，那次是靠人工看了一眼才留住 CLANNAD 那条 0.982。
+    r"toggle-template-\w*|columns hint|ztdh)\b")
 
 # 这些章节整节丢掉：对剧情问答零价值，且几乎全是链接/模板残渣。
 # ⚠️ **CAST / STAFF / 主题曲 这类必须在这里挡**，剥表格挡不住它们 ——
@@ -512,6 +525,46 @@ def chunk_blocks(blocks: list[tuple[str, int, bool]]) -> list[tuple[str, int, bo
     return chunks
 
 
+# ── 套话式「(前言)」（2026-08-23）──────────────────────────────
+#
+# 🚨 **实测：24 道作品级问题里，套话前言占了前 8 席位的 8.2%，而且是集中爆发** ——
+#    《我们的重制人生》4/8 席、《一人之下》3/8 席全是「XX 是《YY》的登场角色」。
+#    机制是**短文本 + 标题词**：45~60 字的句子里作品名占了很大比重，向量相似度
+#    虚高，于是同一部作品的几十个角色页整片挤进前 8，把真剧情挤出去
+#    （《一人之下》一部作品就有 57 条这种前言）。
+#
+# 📌 **信息是冗余的**：内容 = 角色名 + 日文读音 + 属于哪部作品；前两样在 alias
+#    里、第三样在 plot_chunk_scope 里，对剧情问答零增量。
+#
+# ⚠️ **三条保护，都是抽样时实测逼出来的**：
+#    ① 只在**该页还有别的 chunk** 时删 —— 否则那个角色整个从检索里消失
+#      （实测全库 13 页只有这一条）。
+#    ② **提到主角/主人公的不删**：第四部分「泛称」那条量过
+#      「《魔法科高校的劣等生》的女主角是谁 → 0.999 命中『司波深雪…女主角』」，
+#      **泛称在召回层是有用信号**，只在作用域投票时才有害。
+#    ③ **必须是单句**：抽样见过「辩护律师：绫里千寻…尾并田美散是…登场角色。
+#      登场于《逆转裁判3》。」—— 前半截是人物关系表残渣，删掉会丢真数据。
+#      要求整条只有一句（句号只许出现在末尾）就能把它挡在外面。
+LEDE_MAX = 80
+LEDE_DEF = re.compile(r"是[^。]{0,60}(登场角色|登場人物|的角色|创作的漫画)")
+LEDE_KEEP = re.compile(r"主角|主人公")
+
+
+def _is_boilerplate_lede(c: dict) -> bool:
+    t = (c.get("text") or "").strip()
+    if c.get("section") != "(前言)" or not t or len(t) > LEDE_MAX:
+        return False
+    if LEDE_KEEP.search(t) or "。" in t[:-1]:
+        return False
+    return bool(LEDE_DEF.search(t))
+
+
+def _drop_boilerplate_lede(chunks: list[dict]) -> list[dict]:
+    """⚠️ `kept or chunks` 就是保护 ① —— 整页只剩这一条时原样退回。"""
+    kept = [c for c in chunks if not _is_boilerplate_lede(c)]
+    return kept or chunks
+
+
 def parse_page(html: str) -> list[dict]:
     doc = lxml_html.fromstring(html)
     clean_tree(doc)
@@ -575,7 +628,7 @@ def parse_page(html: str) -> list[dict]:
                 "spoiler_box": boxed,
                 "spoiler_level": 1 if (hm > 0 or boxed) else 0,
             })
-    return out
+    return _drop_boilerplate_lede(out)
 
 
 def main() -> None:

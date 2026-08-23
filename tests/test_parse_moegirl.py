@@ -131,3 +131,38 @@ def test_table_cell_limit_is_finite():
     """⚠️ 上限是有限值而不是取消 —— 40/200/无上限三档产出相同，
     保留有限上限是为了给极端结构留个兜底。"""
     assert 4 < pm.TABLE_MAX_CELLS < 10**6
+
+
+# ── 套话式 (前言)（2026-08-23）──────────────────────────────────
+
+@pytest.mark.parametrize(("text", "drop", "why"), [
+    ("伊丽莎白（日语：エリザベス）是由空知英秋创作的漫画《银魂》及其衍生作品的登场角色。",
+     True, "纯套话：名字 + 日文读音 + 属于哪部作品，三样都在 alias/scope 里"),
+    ("姬蒲（日语：姫蒲（ひめがま））是由A-1 Pictures制作的原创动画《Lycoris Recoil》的登场角色。",
+     True, "同上"),
+    ("楠幸村是平坂读创作的轻小说《我的朋友很少》及其衍生的动画等作品的登场角色，女主角之一。",
+     False, "🚨 保护②：泛称在**召回层是有用信号**（女主角是谁 → 0.999 命中）"),
+    ("张楚岚是米二创作的漫画《一人之下》及其衍生作品的男主角。",
+     False, "保护②"),
+    ("辩护律师：绫里千寻见面：美柳勇希学生、恋人：美柳千奈美尾并田美散是Capcom所创作的游戏《逆转裁判》及其衍生作品的登场角色。登场于《逆转裁判3》。",
+     False, "🚨 保护③：前半截是人物关系表残渣，多句判据把它挡在外面"),
+    ("《进击的巨人》是由谏山创创作的一部漫画，于讲谈社《别册少年Magazine》连载，讲述人类与巨人的战斗。",
+     False, "作品页开篇摘要，不是角色定义句"),
+])
+def test_boilerplate_lede(text, drop, why):
+    """🚨 实测：24 道作品级问题里套话前言占前 8 席位的 8.2%，且集中爆发
+    （《我们的重制人生》4/8 席、《一人之下》3/8 席）。机制是短文本 + 标题词
+    让向量相似度虚高。⚠️ 三条保护缺一不可，理由见 _is_boilerplate_lede 注释。
+    """
+    assert pm._is_boilerplate_lede({"section": "(前言)", "text": text}) is drop, why
+
+
+def test_boilerplate_lede_never_empties_a_page():
+    """保护①：整页只有这一条时原样退回 —— 否则那个角色整个从检索里消失。
+
+    ⚠️ 实测全库有 13 页属于这种情况。
+    """
+    only = [{"section": "(前言)", "text": "伊丽莎白是《银魂》及其衍生作品的登场角色。"}]
+    assert len(pm._drop_boilerplate_lede(only)) == 1
+    withmore = [*only, {"section": "经历", "text": "正文" * 60}]
+    assert len(pm._drop_boilerplate_lede(withmore)) == 1

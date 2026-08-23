@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import re
+import urllib.parse
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum
@@ -794,6 +795,60 @@ def _candidate_labels(conn: psycopg.Connection,
     return out
 
 
+# ── 出处链接（2026-08-23 Kevin 提出）────────────────────────────
+#
+# 🚨 **链接必须由代码拼，绝不能写进 prompt 让 LLM 生成。** 模型不知道 URL，
+#    只会编出一个「看起来完全正确」的地址 —— 这是最难被发现的一类幻觉：
+#    用户不会逐个点开验证，而错链接和对链接长得一模一样。
+#    ⇒ 与第 15 节原则 2 同一条：能确定性算出来的，就不要交给模型判。
+#
+# 📌 **顺带满足 E.1 的授权要求**：萌娘百科是 CC BY-NC-SA，公开展示正文
+#    必须署名。此前只有「回答里含萌娘内容」而没有指回原条目，这一条补上了。
+MOEGIRL_BASE = "https://zh.moegirl.org.cn/"
+SOURCE_NOTE = "AI 检索可能有遗漏，如果需要更详细的资料可以查阅以下条目："
+MAX_SOURCES = 5
+
+
+def source_links(conn: psycopg.Connection,
+                 chunks: Sequence[Chunk]) -> list[tuple[str, str]]:
+    """最终送进 LLM 的 chunk 出自哪些萌娘条目 → [(标题, URL)]，按出现顺序去重。
+
+    ⚠️ 只查最终那几条（≤ FINAL），不是整个召回池 —— 列出用户其实没看到的
+       条目会让「出处」这个词失去意义。
+    ⚠️ `bangumi_char` 那部分语料来自 dump，没有对应的萌娘条目，天然不在结果里。
+    """
+    ids = [c.chunk_id for c in chunks if c.source == "moegirl"]
+    if not ids:
+        return []
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT c.chunk_id, p.title
+              FROM plot_chunk c
+              JOIN moegirl_page p ON p.pageid = c.pageid
+             WHERE c.chunk_id = ANY(%s)
+        """, (ids,))
+        title_of = dict(cur.fetchall())
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for cid in ids:                      # 按 chunk 顺序 = 按相关度顺序
+        t = title_of.get(cid)
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        out.append((t, MOEGIRL_BASE + urllib.parse.quote(t.replace(" ", "_"))))
+        if len(out) >= MAX_SOURCES:
+            break
+    return out
+
+
+def _with_sources(text: str | None, links: Sequence[tuple[str, str]]) -> str | None:
+    """把出处追加到回答末尾。⚠️ 纯字符串拼接，不经过模型。"""
+    if not text or not links:
+        return text
+    items = " · ".join(f"[{t}]({u})" for t, u in links)
+    return f"{text}\n\n{SOURCE_NOTE}{items}"
+
+
 def ask(conn: psycopg.Connection, question: str, *,
         spoiler: bool = False, final: int = FINAL,
         allow_fallback: bool = True,
@@ -916,4 +971,7 @@ def ask(conn: psycopg.Connection, question: str, *,
     text, served_by = llm.answer(question, pairs, allow_fallback=allow_fallback,
                                  history=_trim(hist))
     meta.update(llm.descriptor(served_by))
-    return Answer(State.OK, text, chunks, res, meta)
+    links = source_links(conn, chunks)
+    if links:
+        meta["sources"] = [{"title": t, "url": u} for t, u in links]
+    return Answer(State.OK, _with_sources(text, links), chunks, res, meta)
