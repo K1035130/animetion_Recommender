@@ -152,20 +152,30 @@ DROP_CLASS = re.compile(
     # ⚠️ 萌娘百科的导航框**不叫** navbox，叫 menu-*。猜标准 class 名会全漏 ——
     #    实测泄漏成这样：「乔纳森·乔斯达 • 迪奥·布兰度乔瑟夫·乔斯达 • 卡兹空条承太郎…」
     #    它们混在 section 0（前言）里，是纯链接串，对检索是噪声。
-    r"menu-(item|content|popout|title)|six divs|"
-    # ⚠️ **专题导航模板的 chrome**（2026-08-23）。与 six divs / menu-* 同一族：
-    #    萌娘用栅格 class 拼「专题」横幅，里面是站务公告而不是条目内容 ——
-    #      <div class="seven columns hint"><div class="toggle-template-container">
-    #        <p>欢迎您一同参与建设名侦探柯南的相关条目♥编辑交流群：24733986</p>
-    #    实测 84 个柯南条目、12 个崩坏3 条目的 (前言) 都以它开头。
-    #
-    # 🚨 **判据必须是 class 不是文本前缀。** 同一批「多页共享同一段开头」的
-    #    chunk 里，**只有约 3% 真的在模板 chrome 内**；其余 97% 祖先只有 body，
-    #    是编者手写在正文里的散文（「注：印象色表示独唱」「日文版由集英社出版」
-    #    「动画第二话结尾的分数排名…堀北的成绩」——最后这条是**真剧情**）。
-    #    按前缀批量剥会把它们一起杀掉 —— 与 F 节「『游戏中的结局』差点被当
-    #    噪声清掉」同一个坑，那次是靠人工看了一眼才留住 CLANNAD 那条 0.982。
-    r"toggle-template-\w*|columns hint|ztdh)\b")
+    r"menu-(item|content|popout|title)|six divs)\b")
+
+# ── 专题模板 chrome（2026-08-23）─────────────────────────────────
+#
+# 🚨 **这三个 class 必须带长度上限，不能进 DROP_CLASS。**
+#    `toggle-template-button` 是 mw-collapsible 折叠面板：
+#      名侦探柯南页  → 包着 34 字的站务公告（是 chrome）
+#      数码宝贝无限地带 → **包着整篇正文 14,284 字**（是内容）
+#    首版把它无条件放进 DROP_CLASS，实测**删掉 584,805 字 / 126 个页面受损**，
+#    最重的一页 86 条 chunk → 1 条，4 个页面被清空。
+#    ⚠️ 而当时「总字数 −3.6%」看起来完全正常 —— 被同批的套话过滤掩盖了。
+#    ⇒ **凡是「有时是 chrome、有时是内容」的容器，判据必须带体量。**
+#      教训与 F.4 ④ 的 `TABLE_MAX_CELLS` 完全同构：那次也是密度判据认得出
+#      散文容器、被一条硬上限一票否决，只不过这次方向反过来。
+# ⚠️ **`toggle-template-button` 不在名单里，这是实测逼出来的第二次收缩。**
+#    它是折叠面板的**内容体**，装什么完全看条目：
+#      崩坏3      版本公告     842 / 1,070 / 1,150 字   ← chrome
+#      逆转裁判    每章剧情     1,724 ~ 2,582 字         ← **真剧情**
+#      数码宝贝    整篇正文     14,284 字                ← 内容
+#    两类只隔 574 字，**任何绝对阈值都会两头都错** —— 与 B.4「rerank 分噪声
+#    1e-3，绝对地板在物理上调不稳」同一类问题。⇒ 只留结构上恒为导航的那几个。
+#    代价：崩坏3 那 12 页的版本公告留在语料里（已知残留，不值得为它冒险）。
+CHROME_CLASS = re.compile(r"\b(toggle-template-container|columns hint|ztdh)\b")
+CHROME_MAX_CHARS = 2000     # 实测分界：chrome 最大 1,150（崩坏3 公告）· 内容最小 14,284（数码宝贝）
 
 # 这些章节整节丢掉：对剧情问答零价值，且几乎全是链接/模板残渣。
 # ⚠️ **CAST / STAFF / 主题曲 这类必须在这里挡**，剥表格挡不住它们 ——
@@ -409,6 +419,13 @@ def clean_tree(root) -> None:
                 p.remove(el)
     for el in root.xpath(".//*[@class]"):
         if DROP_CLASS.search(el.get("class") or ""):
+            p = el.getparent()
+            if p is not None:
+                p.remove(el)
+    # ⚠️ chrome 类必须**先判体量再删**，理由见 CHROME_CLASS 的注释。
+    for el in root.xpath(".//*[@class]"):
+        if (CHROME_CLASS.search(el.get("class") or "")
+                and len("".join(el.itertext())) <= CHROME_MAX_CHARS):
             p = el.getparent()
             if p is not None:
                 p.remove(el)

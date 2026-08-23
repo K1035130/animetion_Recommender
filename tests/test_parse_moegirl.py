@@ -166,3 +166,46 @@ def test_boilerplate_lede_never_empties_a_page():
     assert len(pm._drop_boilerplate_lede(only)) == 1
     withmore = [*only, {"section": "经历", "text": "正文" * 60}]
     assert len(pm._drop_boilerplate_lede(withmore)) == 1
+
+
+# ── 专题模板 chrome（CHROME_CLASS）─────────────────────────────
+
+def _chrome(inner: str, cls: str = "mw-collapsible toggle-template-container") -> str:
+    return f'<div class="{cls}"><p>{inner}</p></div>'
+
+
+def test_chrome_banner_is_dropped():
+    """站务公告属于模板 chrome，不是条目内容。
+
+    实测 84 个柯南条目、12 个崩坏3 条目的 (前言) 都以这类横幅开头，
+    它们让同一 IP 下几十个页面的开头**完全相同**，检索时互相抬轿。
+    """
+    banner = "欢迎您一同参与建设名侦探柯南的相关条目♥编辑交流群：24733986"
+    body = "《名侦探柯南》是由青山刚昌创作的漫画，讲述高中生侦探工藤新一" * 3
+    out = " ".join(_texts(_page(_sec(0, "", _chrome(banner) + f"<p>{body}</p>"))))
+    assert "编辑交流群" not in out, "站务公告应被 CHROME_CLASS 删掉"
+    assert "青山刚昌" in out, "同一节里的正文必须原样保留"
+
+
+def test_chrome_rule_never_eats_long_content():
+    """🚨 回归：584,805 字那次事故。
+
+    首版把 `toggle-template-button` 无条件放进 DROP_CLASS —— 而它是
+    mw-collapsible 的**内容体**，装什么完全看条目：
+        名侦探柯南   站务公告        34 字      ← chrome
+        崩坏3       版本公告        842~1,150 ← chrome
+        逆转裁判     **每一章的剧情** 1,724~2,582
+        数码宝贝     **整篇正文**     14,284
+    实测 126 个页面受损、4 页被清空，《逆转裁判》86 条 chunk → 21 条。
+
+    ⚠️ 加长度阈值那一版被逆转裁判证伪：chrome 最大 1,150、内容最小 1,724，
+       **只隔 574 字**，任何绝对阈值都会两头都错（与 B.4「1e-3 地板调不稳」同构）。
+    ⇒ 最终只保留结构上恒为导航的 container/columns hint/ztdh，
+       **`toggle-template-button` 必须不在名单里**。这条测试就锁这一点。
+    """
+    plot = "成步堂龙一发现了此案真相，把真凶山野从证人席上揪了出来。" * 40
+    html = _page(_sec(0, "", _chrome(plot, "mw-collapsible toggle-template-button")))
+    assert "成步堂龙一" in " ".join(_texts(html)), (
+        "toggle-template-button 里可能是真剧情，不能无条件删")
+    # 体量上限同样不能救它 —— 判据必须是 class 而不是长度
+    assert not pm.CHROME_CLASS.search("mw-collapsible toggle-template-button")
