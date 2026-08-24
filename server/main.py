@@ -421,8 +421,16 @@ def ask(req: schemas.AskRequest) -> schemas.AskResponse:
     """流程 C · 剧情问答。四步管道见 src/retrieve.py 的模块注释。
 
     ⚠️ **这是请求路径上第一个会调模型的端点**（前三周的推荐链路全程零模型）。
-       一次请求打三个外部服务：embedding → rerank → LLM，实测端到端 3–6 秒。
+       一次请求打三个外部服务：embedding → rerank → LLM。
+       **实测端到端 10–45 秒**（2026-08-23 抽样 7 道，此前记的「3–6 秒」已不成立）。
+       分层实测（安兹那道，19.8 s）：
+           resolve/pinned/recall (SQL)   0.59 s    3.0%
+           embed_query (API)             1.68 s    8.5%
+           rerank (API, 53 条)            2.01 s   10.1%
+           LLM 生成 371 字               15.54 s   78.4%   ← 瓶颈
+       ⇒ **检索层一共才 4.3 秒，优化它没有意义**；要快只能上流式输出。
        ⇒ 与 /recommend 的 235 ms 不是一个量级，前端必须给 loading 态。
+    📌 voice / season 两条分支**不调模型**，实测 0.3–0.4 秒。
 
     ⚠️ **四种状态都返回 200，不要把它们做成 4xx。** 它们是正常的业务结果
        （反问 / 没语料 / 没认出），不是错误：G.4 明确要求「认出来但没语料」时

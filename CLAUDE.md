@@ -35,10 +35,24 @@ CLAUDE.md 只保留**每次开工需要的**：现状、操作手册（A–D）�
 
 ## 📍 当前进度（更新于 2026-08-23）
 
-**语料层已收工**：阶段 06 角色页两批全部灌完，解析层又清过一轮噪声
-（模板 chrome + 套话前言）。声优问答、意图路由、英文档期查询都已上线。
-🔴 **下一件事是跑那轮评分测试** —— 语料与 prompt 现在都定型了。
+**语料层已收工**：阶段 06 角色页两批全部灌完，解析层又清过两轮噪声
+（模板 chrome + 套话前言 · 元信息章节豁免 heimu 门控）。
+声优问答、意图路由、英文档期查询都已上线。
+✅ **60 题打分表已填完并出分（2026-08-23 晚）** —— 结果写在
+**[week5-eval-report.md §7](docs/week5-eval-report.md)**。**第 5 周到此全部收口。**
+🎯 **检索命中 30.8% → 50.0%**（检索侧两轮可比），而且 **12 道 `n→y` 逐条归因到
+四项已知改动**（剧情简介席位 5 · SONGS_SEAT 4 · 阶段 06 角色页 2 · 元信息豁免 1）。
+🚨 **但脚本报的「幻觉 84.6%」不能按字面用 —— 那是量具问题，见下面「评测判据已漂」那条。**
 阶段 05 检索层 ①②③④ 的实现细节与 bug 记在 **I 节**；G 节保留为设计依据。
+
+📌 **送进 LLM 的资料现在有三个来源**，不只是 `plot_chunk`：
+```
+plot_chunk        向量召回 + alias 直取，走 rerank 排序      chunks
+作品简介          anime_profile.summary，剧情梗概类问句触发    aux ← 2026-08-23 加
+related 关联查询   staff/studios 结构化字段，零模型            aux
+```
+⚠️ **后两者不在 `chunks` 里，而是挂在 `Answer.aux`** —— 凡是新增"送进 LLM 的
+信息源"都必须挂上去，否则打分表看不见它（第四部分「评测口径 bug」那一节）。
 
 ```
 POST /api/ask       流程 C 剧情问答，四步管道         src/retrieve.py
@@ -63,49 +77,42 @@ POST /api/ask       ⬆️ 现在是**单一入口**：自动分派 voice / seas
 
 ### ▶️ 下次开工从这里接（2026-08-23 收工）
 
-## 🔴 手头唯一的活：跑那一轮评分测试
+## ✅ 评分测试已收口 —— 下一件是**流程 B 找番**
 
-**语料与 prompt 都已定型**，这是第 5 周工作流最后一项没收口的东西。
+第 5 周工作流 B 五项全部完成，第二轮 60 题重测也已出分（**§7**）。
+⇒ **检索与生成侧的冻结解除了**，可以继续改。
 
 ```bash
-# ① 150 题自动标注检索评测（客观可判，无需人工）
-uv run --group etl python scripts/eval_retrieval_named.py --n 150 --seed 0
-
-# ② 60 题可回答率（人工打分）
-#    ⚠️ **必须走 --only，不能用全量 build** —— 全量会同时覆盖
-#       docs/eval-answerability-sheet.md（基线，含 Kevin 08-19 填好的标签）
-#       和 data/interim/eval_answerability_raw.json。`--out` 只重定向 markdown，救不了 RAW。
-uv run --group etl python scripts/eval_answerability.py build     --n 60 --seed 0 --only "$(seq -s, 1 60)" --out docs/eval-answerability-rescore-v4.md
-uv run --group etl python scripts/eval_answerability.py score      # 填完之后
+# 重新出分（score 只读打分表，零成本、可反复跑）
+uv run --group etl python scripts/eval_answerability.py score --sheet docs/eval-answerability-rescore-v5.md
+uv run --group etl python scripts/eval_answerability.py score --sheet docs/eval-answerability-sheet.md   # 基线对照
 ```
 
-🔴 **要填的是 `docs/eval-answerability-rescore-v5.md`**（60 题，全空，指纹
-`prompts=871d63553987ad3e` 全 60 题统一 ⇒ 生成侧内部可比）。
+📌 **指纹口径（引用 §7 数字时必须带上）**：本轮 `prompts=871d63553987ad3e` ·
+基线 `07cc60bcd5216704`（08-19）。embedding / reranker / LLM 模型三者未变
+⇒ **检索侧可并排，生成侧不可**。基线三件套备份在 `data/interim/eval_backup_20260823/`。
 
-⚠️ **它是分两次生成后合并的**：先出全 60 题，随后**剧情简介席位**（见第四部分
-那一节）改变了剧情梗概 1–12 的上下文，那 12 道单独重跑并合了回去；其余 48 题
-**一字未变**（正则触发，实测 60 题里只有 1–12 命中）。合并时**题面逐条核对一致**
-（合错块比不合更糟）。`data/interim/eval_answerability_raw_rescore.json` 已同步成
-对应的 60 题版。
-```bash
-# 那 12 道的重跑命令（已执行，留档）
-uv run --group etl python scripts/eval_answerability.py build --n 60 --seed 0     --only 1,2,3,4,5,6,7,8,9,10,11,12 --out <临时文件>
-# 填完之后
-uv run --group etl python scripts/eval_answerability.py score     --sheet docs/eval-answerability-rescore-v5.md
-```
-⚠️ **`score` 只读打分表、不读 `data/interim` 的 raw JSON**（那个目录不入 git，
-脚本注释里写了理由），所以 `--only` 覆盖 raw 不影响评分。
-📌 raw 备份：`..._v5_60q.json` 是**加席位之前**那一版（1–12 正是本次 A/B 的 base 侧，
-有保留价值）· `..._v4_dbe7c7.json` 是 v4。
-⚠️ v4 那份已经作废两次（语料改了 + prompt 指纹改了两轮），原始数据备份在
-`data/interim/eval_answerability_raw_rescore_v4_dbe7c7.json`。
-✅ **报告口径已定（Kevin 2026-08-23）：不重跑生成侧，注明指纹和日期。**
-当前指纹：`prompts=871d63553987ad3e`；基线是 `07cc60bcd5216704`（08-19）。
-🚨 **两者不同 ⇒ 生成侧不可并排比较**；检索侧可以（embedding 指纹未变）。
-
-📌 基线三件套已备份在 `data/interim/eval_backup_20260823/`。
+**下一件** → **流程 B 找番**（G.1 路径①）—— 单一入口只差它这一条分支，
+做完前端才好放第四个按钮（别放没实现的按钮，用户点一次就再也不点了）。
 
 ---
+
+### 🚨 评测判据已漂：「幻觉」这个数现在是错的（2026-08-23，未修）
+
+`eval_answerability.py` 把**「未命中却给了答案」判为幻觉**、把**「拒答」判为
+`answer: r`**。这两条定义于旧 prompt 时代，而 08-23 那次 `ANSWER_SYSTEM` 改动
+（「已知剧情推进到」）的**设计目的**恰恰是把拒答转成有据的部分回答 ⇒
+
+```
+幻觉        22.2% → 84.6%     26 道逐条读完，**0 道是编造**
+路由类拒答   25%   → 0%       那 8 道其实都在拒答，只是拒答里带了解释
+```
+
+🚨 **这与「打分表看不见 `aux`」是同一族的问题：不是系统变差，是量具没跟上系统。**
+两次都只在**人去读原文**时才暴露 —— 指标本身看起来完全正常，只是含义已经漂了。
+⇒ ⬜ 建议改判据（**会改变指标定义，等 Kevin 拍板**）：
+「幻觉」应判**回答里有没有资料支持不了的实质断言**；
+「正确拒答」应把带解释的拒答算进去。完整论证见 **§7.3**。
 
 ## ✅ 阶段 06 已收工（2026-08-23 灌库完成）
 
@@ -182,9 +189,29 @@ pages, chunks, scope = B.load_corpus(known, None, "character", ex)
 ✅ 元信息章节豁免 heimu 门控     406 行 · 《神枪少女》播出时间从答不出 → 排第 1 (0.968)
 ✅ 评测口径 bug                打分表只渲染 chunks，注入的资料**从来没显示过**
 🚫 FINAL 8 → 16 已否决          实测中性：+1.00 条/题，0 题变差、0~1 题变好
+✅ 60 题第二轮打分出分          检索命中 30.8% → 50.0% · 12 道 n→y 全部可归因（§7）
+🚨 评测判据已漂                「幻觉」84.6% 是量具问题，26 道逐条读完 0 道编造（§7.3）
 ```
 
-**三件值得单独记的事：**
+**今天最该记的两条（都是"看不见的东西"）：**
+
+🚨 **「资料里没有」可能只是你看不见它。** 两处同源：
+① `anime_profile.summary` **从来不在检索池里** —— 问「讲了什么故事」时最权威的
+   那份文本，检索层根本够不着（第四部分「剧情简介席位」）；
+② 打分表**只渲染 `chunks`**，`related` 注入的资料一直没显示过 —— 打分的人
+   看到「资料里没有」却发现模型答出来了，会判成「模型在编」，而那是有出处的
+   真资料（第四部分「评测口径 bug」）。
+⇒ **问「答案不在资料里」之前，先问「资料清单是不是完整的」。**
+
+🚨 **一个字的 heimu 封杀了整条 176 字的元信息**（第四部分「元信息章节豁免」）。
+判据写的是 `hm > 0`，而同一文件的注释描述的是「按比例决定」——
+**注释与实现不符，而注释那版才是对的**。
+📌 顺带撞出第二个静默陷阱：`spoiler_level` 没进灌库 digest ⇒ 改了标注而正文
+不变时，灌库判为「未变化」静默跳过，解析层改对了库里纹丝不动，且不报错。
+
+---
+
+**08-22/23 那三件值得单独记的事：**
 
 🚨 **清噪声那次删掉了 584,805 字正文**（126 页受损、4 页清空），详见第四部分
 「解析层清噪声」。**根因是验证方式**：只看「总字数 −3.6%」就报「符合预期」，
@@ -259,7 +286,7 @@ rerank 打分，零 LLM 成本）：只有 **38% 的题**真会变多、平均 *
 ✅ **路由分派上线**（`src/router.py` + `POST /api/ask` 的 `route` 字段）——
    单一入口那条待办的最后一步，见第四部分。
 
-**下一步** → 见本文开头「🔴 手头唯一的活：跑那一轮评分测试」。
+**下一步** → 见本文开头「✅ 评分测试已收口 —— 下一件是流程 B 找番」。
 之后是**流程 B 找番**（G.1 路径①）—— 单一入口现在只差它这一条分支，
 做完之后前端才好放第四个按钮。
 
@@ -379,13 +406,25 @@ I.2 ① 的设计）—— **不要据此改常量，等 B.1 人工题库**，�
 ⚠️ 线上（server/）**不要**调，容器常驻时复用 client 正是我们要的；
 `build_embeddings.py` 那句阶段性 `embed.close_client()` 也不要换（语义不同，见 A.7）。
 
-**未提交**（Kevin 自己提交）—— 08-22 那批已入库
-（`1754330` 声优 · `7e296d7` 路由 · `f6fe7b9` 年份+泛称）：
+**已入库**（`b4521b6`，2026-08-23 Kevin 提交）：
 ```
-M  CLAUDE.md                     本轮的记录
-M  scripts/parse_moegirl.py      CHROME_CLASS 收缩 + CHROME_MAX_CHARS
-M  tests/test_parse_moegirl.py   chrome 规则 2 项（总 186 → 188）
+CLAUDE.md · src/retrieve.py · scripts/parse_moegirl.py
+scripts/build_plot_chunks.py · scripts/eval_answerability.py
+tests/test_parse_moegirl.py · tests/test_retrieve.py
+docs/eval-answerability-rescore-v5.md
 ```
+内容 = 剧情简介席位 + 元信息章节豁免 heimu 门控 + digest 覆盖 spoiler_level
++ 评测口径修复（`Answer.aux`）+ 60 题打分表。
+
+**未提交**（收工时这一轮的文档同步）：
+```
+M  CLAUDE.md         测试分项修正 · 剧透标注现值 · 今天的两条教训 · 前端待办
+M  server/main.py    /ask 的延迟记录 3–6 秒 → 10–45 秒（含分层实测）
+```
+⚠️ **库已经改过了**（406 行 `spoiler_level`，正文与向量未动、¥0）——
+库的状态与代码提交是**分开的两件事**，换机器/回滚代码时别只看 git。
+⚠️ **库已经改过了**（406 行 `spoiler_level`，正文与向量未动、¥0）——
+代码没提交但库是新的，**换机器/回滚代码时记得这两者的状态是分开的**。
 📌 **08-22 / 08-23 的其余改动已入库**：`8171f2e`（英文词边界 + season 路由）·
 `e5fe78f`（prompt / 出处链接 / 解析清噪声 / 评测表头通用化）。
 
@@ -407,17 +446,23 @@ M  tests/test_parse_moegirl.py   chrome 规则 2 项（总 186 → 188）
 其中**角色页 42,183 条**（`moegirl_page.kind='character'` **7,362 页**，阶段 06 两批已灌完，
 且已过一轮解析层清噪声）·
 覆盖系列根 6,131 个 · **覆盖作品 79.3% · 热度加权 97.3%**。
+剧透标注 **19,381 条**（占萌娘 chunk 30.9%）—— 2026-08-23 元信息章节豁免后的现值，
+见第四部分那一节。
 ⚠️ **这两个覆盖率是低估的**（2026-08-21 实测）：另有 **703 部作品、占全库热度
 4.95%** 的语料其实就在库里，只是 `series_root` 没折叠衍生条目、作用域映射
 不过去 —— 触发案例见第四部分「同 IP 衍生折叠」。
 `alias` **263,690 行**（subject 38,378 + character 196,669 + **person 28,643**）。
 `person` **8,215** · `voice_role` **145,306**（sql/009，见第四部分「声优配役」）。
-测试 **215 项**（18 打分一致性 + 24 接口 + **52 检索层** + **18 解析器** + 17 声优
+测试 **215 项**（18 打分一致性 + 24 接口 + **69 检索层** + **28 解析器** + 17 声优
 + **54 路由** + 5 客户端收尾）。
 ⚠️ 分项是逐个文件 `--collect-only` 数出来的 —— 2026-08-20 发现过「总数对而
 分项错」（加测试时只改了总数），所以改这行时别估。
-⚠️ **解析器那 18 项用 `pytest.importorskip("lxml")`**（lxml 在 etl 组），
-`uv run pytest` 只跑 103 项，要 `uv run --group etl python -m pytest` 才满 112。
+⚠️ **解析器那 28 项用 `pytest.importorskip("lxml")`**（lxml 在 etl 组）。
+🚨 **判据不是数字是 skip**：缺 lxml 时它们**被跳过而不是失败**，于是「全绿」
+可能只是没跑 —— 看跑完那行有没有 `skipped`，或者直接用
+`uv run --group etl python -m pytest`。
+（此前这里记的「只跑 103 项 / 满 112」两个数在 2026-08-23 实测已不成立 ——
+**记数字会过时，记判据不会**，这正是上一条警告的同一个教训。）
 
 📌 **2026-08-18：语料已全部转为中文** —— 作品 summary 日文残留 **39 / 10,864 (0.36%)**、
 角色 chunk **560 / 69,417 (0.81%)**。做法见 **H 节**，灌库过程见 **H.7**。
