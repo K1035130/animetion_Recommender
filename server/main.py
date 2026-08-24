@@ -31,6 +31,7 @@ from server import schemas
 from src import (
     db,
     embed,
+    find,
     llm,
     questionnaire,
     recommend,
@@ -416,6 +417,60 @@ def anime_detail(subject_id: int) -> schemas.AnimeDetail:
     )
 
 
+def _off_topic_response(reason: str) -> schemas.AskResponse:
+    """`llm.classify_intent()` 判"这不是动画相关的问题"时的统一回复。
+
+    ⚠️ 与 `find_gate()` 那句"描述有些模糊不清"是**两种不同的失败**，
+    不要合并成一句：这里是"这似乎不是本系统能回答的问题"，
+    find_gate 那句是"是找番但描述不够具体"——两条失败信息混在一起，
+    用户会分不清自己该怎么改问法。
+    """
+    return schemas.AskResponse(
+        route="ask", route_reason=reason, state="unknown",
+        answer="这似乎不是关于动画的问题呢，要不要换个和番剧、角色相关的问法？",
+        series_root=None, title=None, chunks=[], candidates=[],
+        meta={"intent": "off_topic"},
+    )
+
+
+def _find_response(route: str, reason: str, query: str,
+                   hits: list[find.FindHit]) -> schemas.AskResponse:
+    """把找番结果包成 AskResponse。**零 LLM 调用**——文案是代码拼接的列表，
+    不是生成的，与 season 分支「head + 拼行」同一套做法（不给 LLM 开
+    第二条"编排展示文案"的口子，展示层就该是纯拼接）。
+
+    被两处复用：按钮强制 `route=find`，以及 ask 分支 resolve() 完全没认出
+    任何作品时的最后一步兜底（见 ask() 内的调用点）。
+
+    ⚠️ **措辞刻意不说"找到了"——只说"语义上接近"。** 语义检索对任何输入
+       都能返回一个 top-k（cos 排序不存在"零结果"），而实测两者的余弦分布
+       **有重叠**：离题查询「今天天气怎么样」top1=0.540、「晚饭吃什么好」
+       top1=0.500，都高于/接近在题查询的下界；样本太小（n=7 随手测的）不足以
+       标定一个可靠的绝对地板——与 B.4 那次「rerank 分噪声 ~1e-3，绝对地板
+       在物理上调不稳」同一类坑，**不要在证据不足时先编一个数字**。
+       ⇒ 用词软化到"仅供参考"代替设阈值：宁可对真正在题的查询也谦虚一点，
+         也不要对离题查询显得胸有成竹——「自信地答错很贵」同一条纪律。
+    ⬜ 真要做置信地板，需要一批标注过"在题/离题"的查询做 A/B，量出分布
+       是否可分——目前只有本条 docstring 里这 7 条随手测的数，不够。
+    """
+    lines = [f"{h.name}（{h.air_year}）" if h.air_year else h.name for h in hits]
+    return schemas.AskResponse(
+        route="find", route_reason=reason, state="ok",
+        answer=("没有认出你问的是哪部具体作品，语义上比较接近的番（仅供参考，"
+                "不保证真的是你要找的）：" + NL_.join([""] + lines)),
+        series_root=None, title=None, chunks=[], candidates=[],
+        # ⚠️ 不写 zero_model —— 这条分支调了一次 embedding，
+        #    与 voice/season 那两条**真正**零模型的分支不是一回事。
+        meta={"embed_only": True},
+        find=schemas.FindResponse(
+            query=query,
+            items=[schemas.FindHit(subject_id=h.subject_id, name=h.name,
+                                   air_year=h.air_year, match=h.match)
+                  for h in hits],
+        ),
+    )
+
+
 @app.post(f"{API}/ask", response_model=schemas.AskResponse)
 def ask(req: schemas.AskRequest) -> schemas.AskResponse:
     """流程 C · 剧情问答。四步管道见 src/retrieve.py 的模块注释。
@@ -450,10 +505,44 @@ def ask(req: schemas.AskRequest) -> schemas.AskResponse:
         route, reason = router.classify(req.question)
     else:
         route, reason = req.route, "由调用方指定"
-    fell_back = ""          # 非空 = 从 voice/season 回落过来的，原因写在里面
+    fell_back = ""          # 非空 = 从 voice/season/find 回落过来的，原因写在里面
+
+    # ── 意图校验（2026-08-24 加，Kevin 定）：整个请求只调一次 ────────
+    # 🚨 起因是实测发现除 voice 外的按钮分支会"自信地答非所问"——season
+    #    按钮问剧情问题会无视问句直接展示当季新番列表，find 按钮问声优问题
+    #    会硬凑一堆题材相近的番，两者都没有 voice 那种"找不到就回落"的天然
+    #    信号。同时发现自动分派下 `resolve()` 会被短别名字符串巧合命中
+    #    （"今天心情不好"→"今**天心**情"撞上角色「天心」），把纯闲聊答成
+    #    了某个角色的问答——这一层完全在模型之前，`route.classify()` 那套
+    #    触发词规则也管不到。⇒ 补一道 `llm.classify_intent()`（Qwen/Qwen3-8B，
+    #    与主力问答模型分开，成本可忽略），覆盖自动分派与按钮强制两种情况
+    #    （Kevin 定："auto + 所有按钮都校验"）。
+    # ⚠️ **auto 模式下直接采信/改判，按钮模式下只用来"拦不对的"，不用来
+    #    "静默改判到另一个具体分支"**：自动分派本来就是猜的，用更细的判断
+    #    替换它没有额外代价；但按钮是用户的显式指令，被一次不保证对的分类
+    #    静默改判到别的分支，比"退回通用问答"风险更高——`voice.find_person()`
+    #    的自身空结果检测已经证明这一点：实测"不存在的声优xyzq"被
+    #    classify_intent 误判成 off_topic，若拿它去覆盖 voice 分支的空结果
+    #    回落，会把原本更准确的"没有找到这个名字的声优"换成一句更含糊的
+    #    离题提示，是纯倒退（2026-08-24 实测抓到并改回）。⇒ **voice 分支的
+    #    空结果回落完全不看 intent**，season/find 因为没有等价的自身空结果
+    #    信号，才需要在分支入口处直接用 intent 校验。
+    try:
+        intent, _served = llm.classify_intent(req.question)
+    except llm.LLMError:
+        intent = None       # 校验挂了：信任原路由，不因为这道关失败而拒绝服务
+
+    if req.route == "auto":
+        if intent == "off_topic":
+            return _off_topic_response("意图判断认为这不是动画相关的问题")
+        if intent is not None and intent != route:
+            # router.classify() 只会猜 voice/season/ask 三种，从不会猜 find——
+            # LLM 的判断更细，直接采用（这正是 [7] 类问题在 resolve() 之前
+            # 就被挡下来的位置）。
+            route, reason = intent, f"LLM 判断意图为 {intent}"
 
     with _conn() as c:
-        # ── voice：某声优配过哪些角色。零模型。 ────────────────────
+        # ── voice：某声优配过哪些角色。零模型（intent 校验除外）。────
         if route == "voice":
             # ⚠️ 按钮路径用**宽松判据**：用户点了「声优」就是显式指令，
             #    不需要任何触发词 —— 「花泽香菜」这类裸名字正是自动分派
@@ -478,33 +567,75 @@ def ask(req: schemas.AskRequest) -> schemas.AskResponse:
                 )
             # ⚠️ 空结果**回落而不是 404** —— 用户点错按钮很常见，
             #    硬失败会让他以为功能坏了。回落要在 route_reason 里说清楚。
+            #    🚨 **这里不用 intent 短路 off_topic**（与 season/find 不同）：
+            #    "没有找到这个名字的声优"本身就是准确、有信息量的回答，
+            #    实测 classify_intent 会把"不存在的声优xyzq"这类带明显人名
+            #    形态的乱码误判成 off_topic —— 用一个不保证对的分类结果去
+            #    覆盖一个已经算准确的结论，纯属倒退（这条是 2026-08-24 实测
+            #    抓到的真实回归，改回这样才修好）。
             fell_back = "没有找到这个名字的声优。"
             route, reason = "ask", "没找到这个声优，改按剧情问答处理"
 
-        # ── season：按档期浏览。零模型。 ──────────────────────────
+        # ── season：按档期浏览。零模型（intent 校验除外）。──────────
         if route == "season":
-            cour = router.parse_cour(req.question)
-            payload = _season_payload(c, *(cour or (None, None)),
-                                      limit=req.top_k * 3, include_nsfw=False)
-            if payload.items:
-                head = (f"{payload.year} 年 {payload.month} 月番共 "
-                        f"{payload.total} 部，按热度列出前 {len(payload.items)} 部：")
-                lines = [f"{it.name_cn or it.name}（{it.air_date}）"
-                         for it in payload.items]
-                return schemas.AskResponse(
-                    route="season", route_reason=reason, state="ok",
-                    answer=head + NL_.join([""] + lines),
-                    series_root=None, title=None, chunks=[], candidates=[],
-                    meta={"zero_model": True}, season=payload,
-                )
-            # ⚠️ **当季/未来天生稀薄**（候选集 done>=50 挡住新番，
-            #    「下一季」实测 0 部）—— 这里给话术，不要去放宽档期窗口，
-            #    放宽只会把上一季的旧番混进来冒充新番。
-            fell_back = (f"{payload.year} 年 {payload.month} 月番在库内没有收录作品"
-                         "——新番的收藏数还不够，暂时进不了候选集。")
-            route = "ask"
-            reason = ("该档期在库内没有收录作品（新番收藏数不足，"
-                      "见「季度更新」①），改按剧情问答处理")
+            # ⚠️ 没有 voice 那种"找不到就是空结果"的天然信号——_season_payload
+            #    对任何输入都会返回"当季列表"，必须在这里提前拦，不能等它
+            #    跑完再判断对不对。
+            if intent is not None and intent != "season":
+                if intent == "off_topic":
+                    return _off_topic_response("意图判断认为这不是动画相关的问题")
+                fell_back = "这道题看起来不像是新番/档期类问题。"
+                route, reason = "ask", (f"按钮选择是 season，意图判断认为更像 "
+                                        f"{intent}，改按剧情问答处理")
+            else:
+                cour = router.parse_cour(req.question)
+                payload = _season_payload(c, *(cour or (None, None)),
+                                          limit=req.top_k * 3, include_nsfw=False)
+                if payload.items:
+                    head = (f"{payload.year} 年 {payload.month} 月番共 "
+                            f"{payload.total} 部，按热度列出前 {len(payload.items)} 部：")
+                    lines = [f"{it.name_cn or it.name}（{it.air_date}）"
+                             for it in payload.items]
+                    return schemas.AskResponse(
+                        route="season", route_reason=reason, state="ok",
+                        answer=head + NL_.join([""] + lines),
+                        series_root=None, title=None, chunks=[], candidates=[],
+                        meta={"zero_model": True}, season=payload,
+                    )
+                # ⚠️ **当季/未来天生稀薄**（候选集 done>=50 挡住新番，
+                #    「下一季」实测 0 部）—— 这里给话术，不要去放宽档期窗口，
+                #    放宽只会把上一季的旧番混进来冒充新番。
+                fell_back = (f"{payload.year} 年 {payload.month} 月番在库内没有收录作品"
+                             "——新番的收藏数还不够，暂时进不了候选集。")
+                route = "ask"
+                reason = ("该档期在库内没有收录作品（新番收藏数不足，"
+                          "见「季度更新」①），改按剧情问答处理")
+
+        # ── find：流程 B 语义找番（G.1 路径①）。**按钮强制走这里**。────
+        # ⚠️ 与 season 同一个理由：语义检索没有天然空结果信号，必须提前拦。
+        if route == "find":
+            if intent is not None and intent != "find":
+                if intent == "off_topic":
+                    return _off_topic_response("意图判断认为这不是动画相关的问题")
+                fell_back = "这道题看起来不像是找番类问题。"
+                route, reason = "ask", (f"按钮选择是 find，意图判断认为更像 "
+                                        f"{intent}，改按剧情问答处理")
+            else:
+                hits = find.find(c, req.question, top_k=req.top_k,
+                                 retries=retrieve.REQUEST_EMBED_RETRIES,
+                                 timeout=retrieve.REQUEST_EMBED_TIMEOUT)
+                if hits:
+                    return _find_response("find", "按语义找番查询", req.question, hits)
+                fell_back = "没有找到符合描述的番。"
+                route, reason = "ask", "找番没有结果，改按剧情问答处理"
+
+        # ── ask 分支自身也要挡 off_topic ──────────────────────────
+        # ⚠️ auto 模式在最上面已经短路过了（route 不可能带着 off_topic
+        #    走到这里）；这里补的是**显式 route=ask** 且校验认为离题的情况
+        #    ——不补的话，「今天心情不好」这类问题在 route=auto 时被挡住，
+        #    换成 route=ask 强制却又漏了，前后不一致。
+        if route == "ask" and intent == "off_topic" and not fell_back:
+            return _off_topic_response("意图判断认为这不是动画相关的问题")
 
         # ── ask：流程 C 剧情问答（内含 related 补充上下文）──────────
         try:
@@ -517,6 +648,53 @@ def ask(req: schemas.AskRequest) -> schemas.AskResponse:
             raise HTTPException(503, f"向量检索不可用：{exc}") from exc
         except llm.LLMError as exc:
             raise HTTPException(503, f"生成不可用：{exc}") from exc
+
+        # ── find：resolve() 完全没认出任何作品/角色时的最后一步兜底 ──────
+        # ⚠️ G.1 路径①：「没认出是哪部」本身就是找番的触发条件，不是死路——
+        #    第四部分「单一入口」④「以上都不命中 → 流程 B 语义找番」，
+        #    只是这一层要等 resolve() 真的查过库才知道该不该触发：
+        #    AMBIGUOUS/NO_CORPUS 都已经认出了具体作品，找番帮不上忙，
+        #    还会掩盖"你是指哪一部"这个更有用的反问，所以只在 UNKNOWN 触发。
+        # ⚠️ **只在 fell_back 为空时触发**——voice/season 回落到这里时已经
+        #    带着更具体的失败原因（「没有找到这个名字的声优」之类），找番
+        #    在这里插一段语义检索结果反而会把那句更有用的话挤掉，与「回落
+        #    原因必须出现在 answer 里」那条纪律冲突。
+        # ⚠️ 不额外花一次 embedding——retrieve() 内部非 OK 状态时**从不调
+        #    embed_query**（短路早于那一步），这里是本轮请求唯一的一次编码。
+        # 🚨 **先过一道 LLM 门控，不直接跑 find()**（Kevin 2026-08-24 定）：
+        #    find() 的语义检索对任何输入都会返回一个 top-k（cos 排序不存在
+        #    "零结果"），实测离题查询（「今天天气怎么样」）与在题查询的余弦
+        #    分数**有重叠**，手调一个绝对地板是 B.4 那个"调不稳"的坑，样本
+        #    也不够标定。⇒ 交给 llm.find_gate() 判断这句话是不是一段找番
+        #    描述，判"否"就给一句套话请用户说具体点，不跑语义检索。
+        if not fell_back and res.state is retrieve.State.UNKNOWN:
+            try:
+                is_findable, _served = llm.find_gate(req.question)
+            except llm.LLMError:
+                is_findable = None    # 门控挂了：不猜，退回原来的"没认出"
+            if is_findable is True:
+                try:
+                    hits = find.find(c, req.question, top_k=req.top_k,
+                                     retries=retrieve.REQUEST_EMBED_RETRIES,
+                                     timeout=retrieve.REQUEST_EMBED_TIMEOUT)
+                except embed.EmbedError:
+                    hits = []   # 找番也挂了：退回原来的"没认出"，别炸整个请求
+                if hits:
+                    return _find_response(
+                        "find", "resolve() 没认出任何作品，"
+                                "LLM 判断这是一段找番描述，改按流程 B 语义找番",
+                        req.question, hits)
+            elif is_findable is False:
+                return schemas.AskResponse(
+                    route="ask",
+                    route_reason="resolve() 没认出任何作品，"
+                                "LLM 判断问题描述不够具体，未触发找番",
+                    state="unknown",
+                    answer="描述有些模糊不清，能再具体一点吗？"
+                          "比如题材、设定、人物关系或者剧情走向。",
+                    series_root=None, title=None, chunks=[], candidates=[],
+                    meta={"find_gate": False},
+                )
 
         # ⚠️ 候选的年份要在连接还开着的时候取。同名重制版（《多罗罗》1969/2019，
         #    全库 81 例）不带年份就是两个一模一样的选项，用户无从选择。
@@ -642,6 +820,34 @@ def get_voice(
         person_id=p.person_id, name=p.name, name_cn=p.name_cn,
         n_roles=p.n_roles,
         items=[schemas.VoiceRoleItem(**vars(r)) for r in items],
+    )
+
+
+@app.get(f"{API}/find", response_model=schemas.FindResponse)
+def get_find(
+    q: str = Query(min_length=1, max_length=200),
+    top_k: int = Query(default=find.TOP_K_DEFAULT, ge=1, le=20),
+    include_nsfw: bool = False,
+) -> schemas.FindResponse:
+    """流程 B · 找番（G.1 路径①）。用一段描述找作品，不需要先知道片名。
+
+    ⚠️ **这是除 /ask 之外唯一会调模型的端点**——只调 embedding 一次，
+       不调 rerank/LLM，实测延迟量级与 /search 接近（数百毫秒），不是
+       /ask 的 10~45 秒。只用语义腿，不混 BM25——`scripts/eval_find.py`
+       实测过 RRF 融合在转述类查询上是净负收益，见 src/find.py 的模块注释。
+    """
+    with _conn() as c:
+        try:
+            hits = find.find(c, q, top_k=top_k, include_nsfw=include_nsfw,
+                             retries=retrieve.REQUEST_EMBED_RETRIES,
+                             timeout=retrieve.REQUEST_EMBED_TIMEOUT)
+        except embed.EmbedError as exc:
+            raise HTTPException(503, f"向量检索不可用：{exc}") from exc
+    return schemas.FindResponse(
+        query=q,
+        items=[schemas.FindHit(subject_id=h.subject_id, name=h.name,
+                               air_year=h.air_year, match=h.match)
+              for h in hits],
     )
 
 

@@ -164,7 +164,7 @@ AskState = Literal["ok", "ambiguous", "no_corpus", "unknown"]
 #    「单一入口 vs 功能按钮」的结论：两者不是二选一，单一入口涵盖按钮。
 # 📌 route 同时是**评测入口**：四条分支混在一个端点里，「推荐的 NDCG」和
 #    「问答的准确率」会被搅在一起，评测必须能直接打各条子路径。
-AskRoute = Literal["auto", "ask", "voice", "season"]
+AskRoute = Literal["auto", "ask", "voice", "season", "find"]
 
 
 class AskRequest(BaseModel):
@@ -254,6 +254,7 @@ class AskResponse(BaseModel):
     #    （文件按「端点分组」排版，不按依赖序）。改动它们的位置时别忘了 rebuild。
     voice: "VoiceResponse | None" = None
     season: "SeasonResponse | None" = None
+    find: "FindResponse | None" = None
 
 
 # ── 结构化关联查询（src/related.py）────────────────────────────────
@@ -334,6 +335,29 @@ class SeasonResponse(BaseModel):
     # 窗口内的总数（items 受 limit 截断，total 不受）
     total: int
     items: list[SeasonItem]
+
+
+# ── 找番（GET /api/find，流程 B · G.1 路径①）──────────────────────
+# ⚠️ 与 /related、/voice、/season 同一类：不是"推荐"（无个性化偏好向量），
+#    是"用一段描述做语义检索"。零折叠地址复用 recommend_sql 的续作折叠 +
+#    nsfw 过滤（见 src/find.py 模块注释）。**唯一会调模型的零模型端点例外**——
+#    只调 embedding 一次，不调 LLM/rerank，实测延迟量级与 /search 相近。
+
+
+class FindHit(BaseModel):
+    """与 `Recommendation`（第 53 行）同一套约定——单一 `name`
+    （已 COALESCE(name_cn, name)），不单独暴露 name_cn。"""
+
+    subject_id: int
+    name: str
+    air_year: int | None
+    # 语义腿余弦，[-1,1]。⚠️ 量纲不跨请求可比，只用于同一次结果内部排序。
+    match: float
+
+
+class FindResponse(BaseModel):
+    query: str
+    items: list[FindHit]
 
 
 # ⚠️ AskResponse 用字符串注解引用了下面才定义的 VoiceResponse / SeasonResponse，

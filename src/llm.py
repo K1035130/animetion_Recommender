@@ -35,7 +35,7 @@ import os
 import random
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import httpx
 from dotenv import load_dotenv
@@ -51,6 +51,8 @@ TIMEOUT = 120.0          # ⚠️ 比 embedding 的 60s 长：生成几百 token
 TEMPERATURE = 0.0
 MAX_TOKENS_HYDE = 400
 MAX_TOKENS_ANSWER = 800
+MAX_TOKENS_FIND_GATE = 5   # 只要一个 y/n token，见 find_gate()
+MAX_TOKENS_INTENT = 8      # 只要一个英文单词，见 classify_intent()
 
 
 # ============================================================
@@ -69,6 +71,11 @@ class Provider:
     base_url: str             # OpenAI 兼容的 /chat/completions 全路径
     model: str                # 厂商侧的模型 id
     key_env: str = "SILICONFLOW_API_KEY"
+    # 厂商专属请求参数，随 payload 一起发。⚠️ 目前唯一的用途是给 Qwen3 系
+    # 混合思考模型关思考——src/translate.py 早就踩过这个坑
+    # （EXTRA_PARAMS["Qwen/Qwen3-8B"]={"enable_thinking": False}），
+    # 这里复用同一个发现，不是重新猜的。空 dict 时行为与之前完全一致。
+    extra: dict = field(default_factory=dict)
 
 
 # ⬜ **待定（2026-08-16，Kevin 研究中）。** 填之前请求会直接报错，不会静默降级。
@@ -120,6 +127,25 @@ FALLBACKS: tuple[Provider, ...] = (
     ),
 )
 
+# ⚠️ **独立于 PRIMARY/FALLBACKS 链，不走 complete()**（Kevin 2026-08-24 定）。
+#    这个任务（判断问句意图）现在**每一条请求都要跑**——不像 HyDE/answer 是
+#    单次高价值调用，用主力 14B 模型跑分类任务是浪费。Qwen/Qwen3-8B 已经在
+#    src/translate.py 的四模型协作管道里跑过 4 万+ 次，是验证过便宜可靠的选择。
+#    没有配 fallback：分类任务挂了直接退回"不校验、信任原路由"（main.py 里
+#    catch LLMError），比换一个模型再猜一次更省事，也更安全。
+INTENT_PROVIDER = Provider(
+    name="siliconflow/Qwen3-8B",
+    base_url="https://api.siliconflow.cn/v1/chat/completions",
+    model="Qwen/Qwen3-8B",
+    # 🚨 **不关思考，实测单次分类调用 11.38 秒**——Qwen3-8B 是混合思考模型，
+    #    默认会先生成一大段隐藏的思维链再吐最终答案，`max_tokens=8` 只截得住
+    #    可见输出，截不住思考过程。这个坑 src/translate.py 在 2026-08-17 就
+    #    踩过并记了 `EXTRA_PARAMS["Qwen/Qwen3-8B"]={"enable_thinking": False}`，
+    #    这里复用同一个发现。⚠️ 这道校验**每条请求都要跑**，不关思考的话
+    #    延迟会比 /ask 本身还夸张，整个设计就不成立了。
+    extra={"enable_thinking": False},
+)
+
 
 class LLMError(RuntimeError):
     """LLM 请求失败。"""
@@ -145,11 +171,13 @@ def chain(allow_fallback: bool = True) -> list[Provider]:
 
 
 def prompt_digest() -> str:
-    """两条 system prompt 的联合摘要。改任何一条的任何一个字符它都会变。"""
+    """三条 system prompt 的联合摘要。改任何一条的任何一个字符它都会变。"""
     h = hashlib.sha256()
     h.update(HYDE_SYSTEM.encode())
     h.update(b"\x00")                    # 分隔符：防止跨条拼接出同一串字节
     h.update(ANSWER_SYSTEM.encode())
+    h.update(b"\x00")
+    h.update(FIND_GATE_SYSTEM.encode())
     return h.hexdigest()[:16]
 
 
@@ -169,8 +197,9 @@ def descriptor(served_by: Provider) -> dict:
     payload = json.dumps(
         {"provider": served_by.name, "model": served_by.model,
          "temperature": TEMPERATURE,
-         "max_tokens": [MAX_TOKENS_HYDE, MAX_TOKENS_ANSWER],
-         "hyde_system": HYDE_SYSTEM, "answer_system": ANSWER_SYSTEM},
+         "max_tokens": [MAX_TOKENS_HYDE, MAX_TOKENS_ANSWER, MAX_TOKENS_FIND_GATE],
+         "hyde_system": HYDE_SYSTEM, "answer_system": ANSWER_SYSTEM,
+         "find_gate_system": FIND_GATE_SYSTEM},
         sort_keys=True, ensure_ascii=False,
     )
     return {
@@ -231,15 +260,16 @@ def _post(p: Provider, messages: list[dict], max_tokens: int) -> str:
     ⚠️ **错误分类与 embed.py 一致：4xx 不重试（429 除外），5xx 重试。**
        区别只在于「不重试」在这里意味着**换下一个供应商**，而不是彻底停下。
     """
+    payload = {
+        "model": p.model,
+        "messages": messages,
+        "temperature": TEMPERATURE,
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    payload.update(p.extra)      # 见 Provider.extra 的注释——目前只用来关思考
     r = _get_client().post(
-        p.base_url,
-        json={
-            "model": p.model,
-            "messages": messages,
-            "temperature": TEMPERATURE,
-            "max_tokens": max_tokens,
-            "stream": False,
-        },
+        p.base_url, json=payload,
         headers={"Authorization": f"Bearer {api_key(p)}"},
     )
 
@@ -433,6 +463,93 @@ ANSWER_SYSTEM = (
     "展开而复述与问题无关的内容。\n"
     "8. 资料条目前的【】里是角色名或章节名，可用于指代"
 )
+
+# 流程 B 找番的门控（2026-08-24 加，Kevin 提出）——用一次 LLM 判断代替
+# 手写规则/阈值。⚠️ **只判"这句话像不像一段找番描述"，不判是否合规/有害**，
+# 后者不是本项目的问题域。
+FIND_GATE_SYSTEM = (
+    "你是动画找番助手的前置判断器。用户会输入一句话，"
+    "你只需要判断：这句话**是不是**在描述一类动画作品的内容特征"
+    "（题材/设定/人物关系/基调/剧情梗概等），值得拿去做语义检索。\n"
+    "算「是」的例子：主角很强但很低调的番、在异世界开餐厅的故事、"
+    "讲乐队和音乐的动画、扑朔迷离的悬疑推理番。\n"
+    "算「否」的例子：具体的人名/作品名（那应该走别的通道，不是描述）、"
+    "与动画无关的问题（天气/代码/闲聊）、无意义的乱码、过于空泛以至于"
+    "无法检索的话（如「有什么好看的」「随便推荐一个」）。\n"
+    "只回答一个字：「是」或「否」，不要解释、不要标点、不要别的内容。"
+)
+
+
+def find_gate(query: str, *, allow_fallback: bool = True) -> tuple[bool, Provider]:
+    """判断一句话是不是「值得拿去找番」的内容描述。
+
+    ⚠️ **用 LLM 判断而不是手写规则/余弦地板**（Kevin 2026-08-24 定）。
+       起因：`find()` 的语义检索对任何输入都会返回一个 top-k（cos 排序
+       不存在"零结果"），而实测离题查询的余弦分数与在题查询**有重叠**
+       （「今天天气怎么样」top1=0.540，高于不少真实找番查询）——手调一个
+       绝对地板是 B.4 那次"rerank 分噪声 ~1e-3，绝对地板调不稳"的同一个坑，
+       样本太少也标定不出可靠阈值。⇒ 交给 LLM 做这类语义边界判断。
+
+    ⚠️ **解析要宽容但不能默认为真**：只要回答的第一个非空字符是「是」
+       就判 True，其余（含"否"、多余解释、空回答）一律 False —— **失败要
+       安全**：判不清就当作"不够具体"，比自信地展示一堆离题结果更好，
+       与「自信地答错很贵，多问一次很便宜」同一条纪律。
+    """
+    text, served = complete(
+        [{"role": "system", "content": FIND_GATE_SYSTEM},
+         {"role": "user", "content": query}],
+        max_tokens=MAX_TOKENS_FIND_GATE,
+        allow_fallback=allow_fallback,
+    )
+    return text.strip().startswith("是"), served
+
+
+# 意图校验（2026-08-24 加，Kevin 提出）——起因是实测发现除 voice 外的按钮
+# 分支（season/find）选错时会"自信地答非所问"：season 按钮问剧情问题会
+# 无视问题内容直接展示当季新番列表；find 按钮问"三笠的声优是谁"会硬凑一堆
+# 题材相近的番。voice 表现正确纯粹是因为它自己有"找不到人名就回落"的内部
+# 检查，season/find 没有等价机制。⇒ 补一道**每条请求都跑**的判断，覆盖
+# 自动分派与按钮强制两种情况（Kevin 定："auto + 所有按钮都校验"）。
+INTENT_VALUES = ("ask", "voice", "season", "find", "off_topic")
+
+INTENT_SYSTEM = (
+    "你是动画问答系统的意图判断器。用户会输入一句话，"
+    "你需要判断它最符合下面哪一类，只回答对应的英文单词，不要解释、"
+    "不要加标点、不要输出除了那个单词以外的任何内容：\n"
+    "ask         问某部具体作品或角色的剧情/设定/结局/关系等内容\n"
+    "voice       问某位声优配过哪些角色\n"
+    "season      问某个季度/年份有哪些新番，或按档期浏览\n"
+    "find        没有说出具体作品名，而是用一段描述（题材/设定/基调）找番\n"
+    "off_topic   与动画完全无关，或者内容无意义、过于空泛以至于无法处理\n"
+    "只回答 ask / voice / season / find / off_topic 中的一个单词。"
+)
+
+
+def classify_intent(query: str) -> tuple[str | None, Provider]:
+    """判断问句的意图属于 ask/voice/season/find/off_topic 中的哪一类。
+
+    ⚠️ **不走 complete()/PRIMARY-FALLBACKS 链**，直接打 `INTENT_PROVIDER`
+       （Qwen/Qwen3-8B）——这是分类任务，成本要压到最低，且**每条请求都要跑**，
+       用主力问答模型划不来。没有配 fallback：这道关本来就是"锦上添花"的
+       校验层，挂了直接由调用方 catch LLMError 退回"不校验"，不必为它
+       再多打一次别的模型。
+
+    ⚠️ **解析失败要返回 None，不能猜一个默认值**：调用方据此判断"这道校验
+       到底跑没跑成"，与 find_gate() 的"判不清就当否"不是同一回事——那边
+       两个结果（是/否）都是合法业务状态，这边"解析失败"必须能和"判断出
+       off_topic"区分开，否则调用方没法决定要不要信任原路由。
+    """
+    text = _post_with_retry(
+        INTENT_PROVIDER,
+        [{"role": "system", "content": INTENT_SYSTEM},
+         {"role": "user", "content": query}],
+        MAX_TOKENS_INTENT,
+    )
+    low = text.strip().lower()
+    for v in INTENT_VALUES:
+        if low.startswith(v):
+            return v, INTENT_PROVIDER
+    return None, INTENT_PROVIDER
 
 
 def hyde(query: str, *, allow_fallback: bool = True) -> tuple[str, Provider]:
