@@ -189,6 +189,32 @@ SONGS_QUERY = re.compile(
     r"片头|片尾|主题曲|插曲|(?<![A-Za-z])(?:OP|ED)(?![A-Za-z])", re.IGNORECASE)
 SONGS_SEAT = 1
 
+# 剧情梗概类问句 → 注入作品自己的简介（2026-08-23）。
+#
+# 🚨 **根因不是"排序不好"，是 `anime_profile.summary` 从来不在检索池里。**
+#    `plot_chunk` 只装萌娘 prose/songs 与 dump 角色简介，**作品自己的简介
+#    一条都没进去** —— 那恰恰是「讲了什么故事」最权威的答案。
+#    触发案例《秘密内幕～女子警察的逆袭～》：萌娘的「剧情简介」chunk 明明在
+#    作用域里，rerank 排第 6 / 0.0457，**被 MIN_SCORE=0.05 砍掉，差 0.0043**。
+#    ⚠️ 与 B.4 那次 songs 一模一样（层内召回正确、分数被地板砍），
+#       所以修法也一样：**加规则，不调阈值**（rerank 分噪声 ~1e-3，
+#       绝对地板在物理上调不稳）。
+#
+# ⚠️ **为什么喂 summary 而不是萌娘的「剧情简介」章节**（12 道剧情梗概题实测）：
+#       anime_profile.summary        12/12 覆盖（75 ~ 1307 字）
+#       萌娘剧情类章节                9/12
+#       当前前 8 席实际拿到剧情        7/12
+#    而且萌娘那边章节名极度分散（简介 7186 · 剧情简介 1574 · 剧情概要 99 ·
+#    故事简介 97 …），还混着「人物简介」「角色简介」「能力设定」这类不是剧情的 ——
+#    **按章节名批量选就是"按关键词批量删"那个坑**（「游戏中的结局」差点被清掉那次）。
+#    summary 是结构化字段，不需要猜。
+#
+# ⚠️ **必须正则触发，不能无差别注入。** 这是 I.2 ② 那条「低分内容稀释上下文
+#    把 LLM 逼成拒答」的同一种风险 —— 问「三笠是谁」时塞进整篇作品简介是纯噪声。
+SYNOPSIS_QUERY = re.compile(
+    r"讲(了|的)?(什么|啥)|什么故事|故事(梗概|简介|内容)|剧情(简介|梗概|概要|介绍|是什么)"
+    r"|主要(内容|讲)|大概讲|讲述了")
+
 # ① 直取的上限。
 #
 # 🚨 **实测可达，不是理论边界。** 构造一条 235 字、点到 57 个航海王角色的问句，
@@ -290,6 +316,17 @@ class Answer:
     chunks: list[Chunk]
     resolution: Resolution
     meta: dict
+    aux: list[tuple[str | None, str]] = field(default_factory=list)
+    """送进 LLM 但**不来自 `plot_chunk`** 的资料：作品简介、related 关联查询。
+
+    🚨 **加这个字段是因为一个评测口径 bug（2026-08-23）。** 打分表只渲染
+       `chunks`，于是 related 注入的资料**从来没显示过** —— 打分的人看到
+       「资料里没有」却发现模型答出来了，会判成 `retrieval:n + answer:y`，
+       而那恰恰是报告 §4 里最危险的一格（**模型用训练记忆作答**）。
+       实际上那是有出处的真资料，只是表里看不见。
+    ⚠️ 所以凡是新增"送进 LLM 的信息源"，都必须同时挂到这里 —— 与
+       「新增影响输出的配置时要问：它进指纹了吗」是同一条纪律。
+    """
 
 
 # ============================================================
@@ -807,6 +844,54 @@ def _candidate_labels(conn: psycopg.Connection,
 MOEGIRL_BASE = "https://zh.moegirl.org.cn/"
 SOURCE_NOTE = "AI 检索可能有遗漏，如果需要更详细的资料可以查阅以下条目："
 MAX_SOURCES = 5
+BANGUMI_BASE = "https://bgm.tv/subject/"
+
+
+def synopsis_context(conn: psycopg.Connection, question: str,
+                     res: Resolution) -> tuple[tuple[str, str], tuple[str, str]] | None:
+    """剧情梗概类问句 → (给 LLM 的 (section, text), 出处链接)；否则 None。
+
+    见 SYNOPSIS_QUERY 处的完整论证。三条触发条件缺一不可：
+
+    ① 问句是剧情梗概类 —— 无差别注入会稀释上下文（I.2 ②）。
+    ② 作用域是**作品**而不是角色（`character_ids` 为空）。
+       ⚠️ 「张楚岚经历了什么」会解析出角色，此时整篇作品简介是噪声不是答案。
+    ③ 该 series_root 下真有非空 summary（589 部是空的）。
+
+    ⚠️ **取热度最高那部的简介**，不是最早那部。一个 series_root 下 TV／剧场版／
+       OVA 并存时，用户问「XX 讲了什么」问的几乎总是主系列 —— 而热度就是
+       主系列的代理指标。（与 recommend 的 entry 口径**有意不同**：那边取最早
+       播出是为了给系列一个稳定入口，这边要的是最有代表性的那份文本。）
+
+    🚨 **已知缺口：这条路径绕过剧透门控。** `anime_profile.summary` 没有
+       `spoiler_level` 列 —— 它是 Bangumi 条目简介，长条目本来就会概述全剧。
+       实测《银河英雄传说》(1307 字) 在 `spoiler=False` 下把「杨威利遇刺、
+       莱因哈特病逝」都讲了。**这是数据源性质，不是 bug。**
+       ⇒ 与第四部分那条「前端无条件带一句『回答可能包含剧透』」对齐；
+         不靠长度截断来"过滤"结局 —— 结局在后半只是巧合，拿长度当判据
+         与逆转裁判那个 chrome 阈值是同族的错误。
+    """
+    if not (res.series_root and not res.character_ids
+            and SYNOPSIS_QUERY.search(question)):
+        return None
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT subject_id, COALESCE(name_cn, name), summary
+              FROM anime_profile
+             WHERE series_root = %s AND summary IS NOT NULL AND summary <> ''
+             ORDER BY fav_done DESC, subject_id
+             LIMIT 1
+        """, (res.series_root,))
+        row = cur.fetchone()
+    if not row:
+        return None
+    sid, name, summary = row
+    # ⚠️ 拼成一条普通的 (section, text) 走同一个通道 —— 与 related.as_context
+    #    同一条纪律：不给 LLM 开第二个信息入口，否则「资料」在 prompt 里
+    #    就有两种含义。
+    return ("作品简介", summary), (name, BANGUMI_BASE + str(sid))
+
+
 
 
 def source_links(conn: psycopg.Connection,
@@ -945,6 +1030,15 @@ def ask(conn: psycopg.Connection, question: str, *,
     rel = (related.lookup(conn, question, res.series_root)
            if res.series_root else [])
     extra = related.as_context(rel)
+
+    # ── 剧情梗概席位（src/retrieve.py::synopsis_context）───────────
+    # 🚨 `anime_profile.summary` 从来不在检索池里，而它正是「讲了什么故事」
+    #    最权威的答案。走 related 同一个通道，理由见那里的注释。
+    syn = synopsis_context(conn, question, res)
+    syn_pair = syn_link = None
+    if syn:
+        syn_pair, syn_link = syn
+        meta["synopsis"] = {"title": syn_link[0], "chars": len(syn_pair[1])}
     if rel:
         meta["related"] = [
             {"series_root": r.series_root, "title": r.name_cn or r.name,
@@ -955,23 +1049,40 @@ def ask(conn: psycopg.Connection, question: str, *,
     if res.state is State.NO_CORPUS or not chunks:
         # ⚠️ 就算没有剧情语料，关联查询的结果仍然可能回答得了问题 ——
         #    那批事实来自结构化字段，与 plot_chunk 有没有覆盖无关。
-        if not extra:
+        # ⚠️ syn_pair 与 extra 同理：作品**没有 plot_chunk 也可能有 summary**
+        #    （plot_chunk 覆盖 79.3% 的作品，summary 覆盖 94.9%）。
+        #    ⚠️ 这不违反 G.4 状态③「检索为空不要丢给 LLM」—— 那条防的是
+        #       **零资料时模型用训练记忆流畅编造**，而这里资料是真实的、
+        #       有出处的，与 related 在本分支的处理完全同构。
+        aux = [x for x in (syn_pair, extra) if x]
+        if not aux:
             return Answer(State.NO_CORPUS,
                           f"《{res.title}》在资料库里没有可用的剧情语料。",
                           [], res, meta)
-        text, served_by = llm.answer(question, [extra],
+        text, served_by = llm.answer(question, aux,
                                      allow_fallback=allow_fallback,
                                      history=_trim(hist))
         meta.update(llm.descriptor(served_by))
-        return Answer(State.OK, text, [], res, meta)
+        links = [syn_link] if syn_link else []
+        return Answer(State.OK, _with_sources(text, links), [], res, meta,
+                      aux=aux)
 
     pairs = [c.as_llm_pair() for c in chunks]
+    # ⚠️ 简介排在检索结果**之前** —— 它回答的是"整体讲了什么"，而 chunk 是细节。
+    #    实测《一人之下》原先开篇就是碧游村支线，注入后才从张楚岚讲起。
+    if syn_pair:
+        pairs.insert(0, syn_pair)
     if extra:
         pairs.append(extra)
     text, served_by = llm.answer(question, pairs, allow_fallback=allow_fallback,
                                  history=_trim(hist))
     meta.update(llm.descriptor(served_by))
     links = source_links(conn, chunks)
+    # ⚠️ Bangumi 条目排在最前：LLM 用了它的简介，出处却只指向萌娘就是错误归因。
+    if syn_link and syn_link not in links:
+        links = [syn_link] + links
+    aux = [x for x in (syn_pair, extra) if x]
     if links:
         meta["sources"] = [{"title": t, "url": u} for t, u in links]
-    return Answer(State.OK, _with_sources(text, links), chunks, res, meta)
+    return Answer(State.OK, _with_sources(text, links), chunks, res, meta,
+                  aux=aux)

@@ -217,8 +217,26 @@ def write_pages(conn, pages) -> None:
     print(f"moegirl_page：{len(pages)} 页")
 
 
+def _digest(text: str, spoiler_level: int) -> str:
+    """本地侧的 digest —— **必须与 `existing_digests()` 的 SQL 表达式逐字对应。**
+
+    🚨 **`spoiler_level` 必须进 digest（2026-08-23 补）。** 此前只算 `md5(text)`，
+       于是**改剧透标注而文本不变时，灌库会把这些行判为「未变化」静默跳过** ——
+       解析层改对了、库里纹丝不动，且不报错。
+       ⚠️ 与「新增影响输出的配置时要问：它进指纹了吗」是同一条纪律
+       （`llm.descriptor()` 漏 prompt 那次、`embed` 的指纹校验都是这一条）。
+       触发它的是 META_SECTION 那次改动（见 parse_moegirl.py）：413 条 chunk
+       的 `spoiler_level` 1→0 而正文一个字没动。
+    """
+    # ⚠️ **level 放前缀而不是后缀**，且不加分隔符：Postgres 的字符串**不允许含
+    #    NUL**（`chr(0)` 直接报 ProgramLimitExceeded），而普通分隔符都可能在正文
+    #    里出现。level 恒为一位数字 ⇒ 第一个字符就是它、其余全是正文，无歧义。
+    #    ⚠️ 若将来 spoiler_level 变成两位，这里和 SQL 那侧要同时改成定长补零。
+    return hashlib.md5(f"{spoiler_level}{text}".encode()).hexdigest()
+
+
 def existing_digests(conn) -> dict[tuple[int, int], str]:
-    """库里已有 chunk 的 (pageid, chunk_no) → md5(text)。
+    """库里已有 chunk 的 (pageid, chunk_no) → digest(text, spoiler_level)。
 
     ⚠️ **用来跳过没变的行，这不是可选优化。** 2026-08-16 实测教训：
        增量灌库只新增了 601 条，脚本却把全部 20,127 行都 upsert 了一遍
@@ -229,7 +247,8 @@ def existing_digests(conn) -> dict[tuple[int, int], str]:
     """
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT pageid, chunk_no, md5(text) FROM plot_chunk
+            SELECT pageid, chunk_no,
+                   md5(spoiler_level::text || text) FROM plot_chunk
              WHERE source = 'moegirl' AND vec IS NOT NULL AND search_tsv IS NOT NULL
         """)
         return {(r[0], r[1]): r[2] for r in cur.fetchall()}
@@ -239,7 +258,7 @@ def write_chunks(conn, chunks, vectors: dict[str, np.ndarray]) -> int:
     have = existing_digests(conn)
     todo = [r for r in chunks
             if have.get((r["pageid"], r["chunk_no"]))
-            != hashlib.md5(r["text"].encode("utf-8")).hexdigest()]
+            != _digest(r["text"], r["spoiler_level"])]
     skipped = len(chunks) - len(todo)
     if skipped:
         print(f"跳过 {skipped:,} 条未变化的（只写 {len(todo):,} 条）")

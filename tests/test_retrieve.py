@@ -15,12 +15,16 @@ from src.retrieve import (
     MIN_KEEP,
     MIN_SCORE,
     PIN_RESERVE,
+    SYNOPSIS_QUERY,
     Chunk,
+    Resolution,
+    State,
     _apply_pin_reserve,
     _latin_word_boundary,
     _substrings,
     _with_sources,
     songs_seat,
+    synopsis_context,
 )
 from src.textproc import norm_name, norm_name_gaps
 
@@ -386,3 +390,100 @@ def test_with_sources_is_noop_without_links_or_text():
     """没有萌娘出处时不要留一句空的提示 —— dump 角色简介就没有对应条目。"""
     assert _with_sources("答案正文", []) == "答案正文"
     assert _with_sources(None, [("x", "y")]) is None
+
+
+# ── 剧情梗概席位（synopsis_context）──────────────────────────────
+#
+# 🚨 这条规则的根因不是排序不好，是 `anime_profile.summary` **从来不在
+#    检索池里**。触发案例《秘密内幕～女子警察的逆袭～》：萌娘的「剧情简介」
+#    chunk 就在作用域里，rerank 排第 6 / 0.0457，被 MIN_SCORE=0.05 砍掉，
+#    差 0.0043 —— 与 B.4 那次 songs 同构，所以修法也一样：加规则不调阈值。
+
+
+class _FakeCur:
+    """最小 cursor：只认 synopsis_context 那一条查询。"""
+
+    def __init__(self, row):
+        self._row = row
+        self.calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, params=None):
+        self.calls += 1
+
+    def fetchone(self):
+        return self._row
+
+
+class _FakeConn:
+    def __init__(self, row):
+        self.cur = _FakeCur(row)
+
+    def cursor(self):
+        return self.cur
+
+
+ROW = (344422, "秘密内幕～女子警察的逆袭～", "川合麻依后悔了……")
+
+
+def _res(**kw):
+    base = {"state": State.OK, "series_root": 344422,
+            "title": "X", "character_ids": []}
+    base.update(kw)
+    return Resolution(**base)
+
+
+@pytest.mark.parametrize("q, hit", [
+    ("《秘密内幕～女子警察的逆袭～》讲了什么故事？", True),
+    ("《一人之下》讲的什么", True),
+    ("这部动画主要内容是什么", True),
+    ("《银河英雄传说》剧情简介", True),
+    ("讲述了什么", True),
+    ("大概讲了啥", True),
+    ("故事梗概", True),
+    # 不是剧情梗概题 —— 无差别注入会稀释上下文（I.2 ②）
+    ("三笠是谁", False),
+    ("片头曲是什么", False),
+    ("结局是什么", False),
+    ("声优是谁", False),
+    ("和艾伦是什么关系", False),
+    ("什么时候播出的", False),
+])
+def test_synopsis_fires_only_on_plot_questions(q, hit):
+    conn = _FakeConn(ROW)
+    assert (synopsis_context(conn, q, _res()) is not None) is hit
+
+
+def test_synopsis_skipped_when_question_names_a_character():
+    """⚠️ 「张楚岚经历了什么故事」解析出角色 → 整篇作品简介是噪声不是答案。
+
+    这一条与上面那组是**两道独立的门**：问句形态对了，作用域也得对。
+    """
+    conn = _FakeConn(ROW)
+    q = "张楚岚经历了什么故事"
+    assert SYNOPSIS_QUERY.search(q)                       # 问句形态确实命中
+    assert synopsis_context(conn, q, _res(character_ids=[99])) is None
+    assert conn.cur.calls == 0                            # 且没白查一次库
+
+
+def test_synopsis_absent_summary_is_a_noop():
+    """589 部作品 summary 为空 —— 查不到就老实返回 None，不编。"""
+    conn = _FakeConn(None)
+    assert synopsis_context(conn, "讲了什么故事", _res()) is None
+
+
+def test_synopsis_needs_a_scope():
+    conn = _FakeConn(ROW)
+    assert synopsis_context(conn, "讲了什么故事", _res(series_root=None)) is None
+
+
+def test_synopsis_returns_pair_and_bangumi_link():
+    """⚠️ 出处必须指向 Bangumi：LLM 用了它的简介却只标萌娘就是错误归因。"""
+    pair, link = synopsis_context(_FakeConn(ROW), "讲了什么故事", _res())
+    assert pair[0] == "作品简介" and pair[1].startswith("川合麻依")
+    assert link == ("秘密内幕～女子警察的逆袭～", "https://bgm.tv/subject/344422")

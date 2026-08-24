@@ -224,6 +224,10 @@ def build(args) -> int:
                             "pinned": c.pinned, "source": c.source}
                            for c in ans.chunks]
             q["meta"] = ans.meta
+            # 🚨 送进 LLM 的**非 chunk 资料**（作品简介 / related 关联查询）。
+            #    不记的话打分表就看不见它们，而模型确实用了 —— 判分会把
+            #    「有出处的真资料」误判成「模型凭训练记忆编的」（报告 §4 那一格）。
+            q["aux"] = [[sec, txt] for sec, txt in ans.aux]
             print(f"  [{q.get('idx', i):2d}] {q['kind']:5} {q['state']:10} "
                   f"{q['question'][:34]}")
     finally:
@@ -358,7 +362,21 @@ def render(qs: list[dict], header: str | None = None) -> str:
         else:
             lines.append("**没有检索到任何资料**（管道短路，未调用 LLM）\n")
 
-        lines.append("▼ **第一问**：上面的资料里有没有这道题的答案？（y / n）\n")
+        # ⚠️ 与 chunk **同等对待** —— 它们一样进了 prompt 的「资料」段。
+        #    单独列出只是为了让打分的人知道它不来自 plot_chunk（没有 rerank 分）。
+        if q.get("aux"):
+            lines.append(f"**另有 {len(q['aux'])} 条非检索资料**"
+                         "（作品简介 / 关联查询，同样送进了 LLM）：\n")
+            for j, (sec, txt) in enumerate(q["aux"], 1):
+                t = txt.replace("\n", " ")
+                if len(t) > CHUNK_HARD_CAP:
+                    t = (t[:CHUNK_HARD_CAP]
+                         + f"〔⚠️ 本条还有 {len(txt) - CHUNK_HARD_CAP} 字未显示〕")
+                lines.append(f"{j}. `  —  ` 【{sec or '—'}】{t}")
+            lines.append("")
+
+        lines.append("▼ **第一问**：上面的资料里有没有这道题的答案？"
+                     "（y / n）　⚠️ **两段都算**，非检索资料一样是有出处的资料\n")
         lines.append("```")
         lines.append("retrieval: ?")
         lines.append("```\n")
