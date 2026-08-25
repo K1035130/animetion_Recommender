@@ -537,7 +537,8 @@ def _auth_user_payload(c: psycopg.Connection, user_id: int) -> schemas.AuthUser:
 
 
 @app.post(f"{API}/auth/register", response_model=schemas.AuthUser)
-def register(req: schemas.RegisterRequest, response: Response) -> schemas.AuthUser:
+def register(req: schemas.RegisterRequest, request: Request,
+             response: Response) -> schemas.AuthUser:
     """注册。成功后直接种下会话 cookie —— 注册完还要再登录一次是纯粹的摩擦。
 
     ⚠️ **判重走 username_norm 而不是 username**（auth.normalize_username）。
@@ -583,7 +584,8 @@ def register(req: schemas.RegisterRequest, response: Response) -> schemas.AuthUs
 
 
 @app.post(f"{API}/auth/login", response_model=schemas.AuthUser)
-def login(req: schemas.LoginRequest, response: Response) -> schemas.AuthUser:
+def login(req: schemas.LoginRequest, request: Request,
+          response: Response) -> schemas.AuthUser:
     """登录。
 
     🚨 **「用户名不存在」与「密码错误」必须报同一句话。** 分开报等于提供了
