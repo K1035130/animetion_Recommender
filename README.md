@@ -6,7 +6,7 @@ your taste → it predicts how much you'll like this season's releases. Separate
 ask about plots, voice actors or airing seasons, or describe a show you're trying
 to find.
 
-Live at `animetion-recommender.vercel.app` — frontend and API in one Vercel
+Live at `https://animetion-recommender.vercel.app/` — frontend and API in one Vercel
 project, same origin.
 
 > Design decisions, measurements and open questions live in [CLAUDE.md](CLAUDE.md) (Chinese).
