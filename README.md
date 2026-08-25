@@ -18,7 +18,7 @@ always citing the source text it drew on.
 
 ## Overview
 
-**Recommendation.** A short questionnaire produces a preference vector — a
+**Recommendation(ML).** A short questionnaire produces a preference vector — a
 numeric summary of the user's taste — which is then compared against every title
 in the library. Three signals are combined: 308 curated genre tags, an *embedding*
 of each synopsis (a numeric representation of text, arranged so that similar
@@ -26,7 +26,7 @@ descriptions sit close together), and staff and studio credits. No machine-learn
 model runs while a request is being served; all vectors are computed in advance,
 so a recommendation is arithmetic over stored numbers.
 
-**Question answering.** A single input box handles four kinds of question — plot,
+**Question answering(RAG).** A single input box handles four kinds of question — plot,
 voice-actor filmography, broadcast season, and finding a show from a description.
 The request is dispatched by deterministic rules and then confirmed by one
 language-model call, which catches cases where the rules guessed wrong. Plot
@@ -337,13 +337,13 @@ See [LICENSE](LICENSE).
 
 ## 功能概览
 
-**推荐。** 一份简短的问卷会生成偏好向量 —— 用户口味的数值化描述 ——
+**推荐(ML)** 一份简短的问卷会生成偏好向量 —— 用户口味的数值化描述 ——
 再拿它与库中每一部作品比对。三种信号被融合在一起：308 个经过清洗的题材标签、
 每部作品简介的 *embedding*（文本的数值表示，使意思相近的描述在数值上彼此靠近），
 以及制作人员与公司信息。**处理请求的过程中不运行任何模型**：
 所有向量都已预先算好，一次推荐只是对存储数值做算术。
 
-**问答。** 一个输入框处理四类问题 —— 剧情、声优配役、播出档期，
+**问答(RAG)** 一个输入框处理四类问题 —— 剧情、声优配役、播出档期，
 以及根据描述找番。请求先由确定性的规则分派，再由一次语言模型调用复核，
 以拦下规则判断失误的情况。剧情类回答是有依据的：系统先从中文语料中检索段落，
 再要求模型只依据这些段落作答。
