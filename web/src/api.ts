@@ -75,7 +75,7 @@ export interface QuotaStatus {
 
 export interface AuthUser {
   user_id: number
-  email: string
+  username: string
   created_at: string
   rating_count: number
   quota: QuotaStatus
@@ -269,16 +269,16 @@ export const api = {
   //    JS 读不到就意味着 XSS 偷不走）。登录态一律靠 me() 现查。
   me: () => req<AuthUser | null>('/auth/me'),
 
-  register: (email: string, password: string, guestRatings: Answer[] = []) =>
+  register: (username: string, password: string, guestRatings: Answer[] = []) =>
     req<AuthUser>('/auth/register', {
       method: 'POST',
-      body: JSON.stringify({ email, password, guest_ratings: guestRatings }),
+      body: JSON.stringify({ username, password, guest_ratings: guestRatings }),
     }),
 
-  login: (email: string, password: string, guestRatings: Answer[] = []) =>
+  login: (username: string, password: string, guestRatings: Answer[] = []) =>
     req<AuthUser>('/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ email, password, guest_ratings: guestRatings }),
+      body: JSON.stringify({ username, password, guest_ratings: guestRatings }),
     }),
 
   logout: () => req<{ ok: boolean }>('/auth/logout', { method: 'POST' }),

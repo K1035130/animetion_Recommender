@@ -173,19 +173,38 @@ app.add_middleware(
 # ⚠️ 选 cookie 而不是 header 的实质理由：httpOnly 的 token **JS 读不到**，
 #    XSS 偷不走。放 localStorage 的 token 一次 XSS 就全丢。
 COOKIE_NAME = "anime_rec_session"
-# ⚠️ Vercel 运行时会注入 VERCEL=1。本地 http 上不能加 Secure，
-#    否则浏览器直接不存这个 cookie，表现为「登录成功但立刻又是未登录」。
-_COOKIE_SECURE = bool(os.environ.get("VERCEL"))
 
 
-def _set_session(response: Response, user_id: int) -> None:
+def _is_https(request: Request) -> bool:
+    """这次请求是不是走 https —— 决定 cookie 要不要带 Secure。
+
+    🚨 **判据取自请求本身，不取环境变量。** 曾经写成 `bool(os.environ["VERCEL"])`，
+       那等于把安全属性押在「我记得对方平台注入的变量叫这个名字」上：
+       名字记错或平台改名，线上就会**静默**发出不带 Secure 的 cookie ——
+       不报错、功能正常，只是会话 token 允许走明文。
+       用请求的协议判就没有这个假设，本地 http、线上 https 各自天然正确。
+
+    ⚠️ 必须先看 `x-forwarded-proto`：函数跑在反向代理后面，
+       `request.url.scheme` 看到的是代理到函数那一跳（http），
+       不是浏览器到代理那一跳（https）。只看后者会导致线上永远不加 Secure。
+    """
+    proto = request.headers.get("x-forwarded-proto", "")
+    if proto:
+        # 多级代理时是逗号分隔的列表，最左边那个才是最初的客户端协议
+        return proto.split(",")[0].strip().lower() == "https"
+    return request.url.scheme == "https"
+
+
+def _set_session(response: Response, request: Request, user_id: int) -> None:
     response.set_cookie(
         COOKIE_NAME,
         auth.make_token(user_id),
         max_age=int(auth.TOKEN_TTL.total_seconds()),
         httponly=True,              # ⚠️ 见上，别为了「前端想读一下」去掉
         samesite="lax",
-        secure=_COOKIE_SECURE,
+        # ⚠️ 本地 http 上不能加 Secure，否则浏览器直接不存这个 cookie，
+        #    表现为「登录成功但下一个请求又是未登录」。
+        secure=_is_https(request),
         path="/",
     )
 
@@ -504,14 +523,14 @@ def _guest_items(answers: list[schemas.Answer], source: str
 def _auth_user_payload(c: psycopg.Connection, user_id: int) -> schemas.AuthUser:
     with c.cursor() as cur:
         cur.execute(
-            "SELECT email, created_at FROM app_user WHERE user_id = %s", (user_id,))
+            "SELECT username, created_at FROM app_user WHERE user_id = %s", (user_id,))
         row = cur.fetchone()
     if row is None:
         # token 有效但账号已被删 —— 当作未登录处理，别 500。
         raise HTTPException(401, "账号不存在")
-    email, created_at = row
+    username, created_at = row
     return schemas.AuthUser(
-        user_id=user_id, email=email, created_at=created_at.isoformat(),
+        user_id=user_id, username=username, created_at=created_at.isoformat(),
         rating_count=len(ratings.rated_ids(c, user_id)),
         quota=schemas.QuotaStatus(**quota.status(c, user_id)),
     )
@@ -521,15 +540,18 @@ def _auth_user_payload(c: psycopg.Connection, user_id: int) -> schemas.AuthUser:
 def register(req: schemas.RegisterRequest, response: Response) -> schemas.AuthUser:
     """注册。成功后直接种下会话 cookie —— 注册完还要再登录一次是纯粹的摩擦。
 
-    ⚠️ **邮箱先归一化再入库**（auth.normalize_email）。不归一化的话
-       `Kevin@X.com` 与 `kevin@x.com` 是两个账号，而用户认为是同一个 ——
-       数据库的 UNIQUE 约束拦的是字节相同，不是身份相同。
-    📌 MVP 不做邮箱验证（设计文档 §4 已定），所以 unique 只防重复注册，
-       不代表这个邮箱真属于注册者。已知缺口。
+    ⚠️ **判重走 username_norm 而不是 username**（auth.normalize_username）。
+       不归一化的话 `Kevin` 与 `kevin`、甚至全角 `Ｋｅｖｉｎ` 都是不同账号，
+       而用户认为它们是同一个 —— UNIQUE 约束拦的是字节相同，不是身份相同。
+       全角那一支尤其要紧：不折的话，注册一个全角同名账号就能在界面上
+       冒充别人，而约束完全看不出问题。
+    📌 展示用的 `username` 保留用户写的原始大小写。
     """
-    email = auth.normalize_email(req.email)
-    if not auth.valid_email(email):
-        raise HTTPException(422, "邮箱格式不正确")
+    display = req.username.strip()
+    ok, why = auth.valid_username(display)
+    if not ok:
+        raise HTTPException(422, why)
+    norm = auth.normalize_username(display)
     try:
         pw_hash = auth.hash_password(req.password)
     except auth.AuthError as e:
@@ -539,15 +561,15 @@ def register(req: schemas.RegisterRequest, response: Response) -> schemas.AuthUs
         with c.cursor() as cur:
             try:
                 cur.execute(
-                    "INSERT INTO app_user (email, password_hash) VALUES (%s, %s) "
-                    "RETURNING user_id",
-                    (email, pw_hash),
+                    "INSERT INTO app_user (username, username_norm, password_hash) "
+                    "VALUES (%s, %s, %s) RETURNING user_id",
+                    (display, norm, pw_hash),
                 )
             except psycopg.errors.UniqueViolation as e:
-                # ⚠️ 这里**必然会**泄露「该邮箱已注册」—— 注册接口没法不泄露，
+                # ⚠️ 这里**必然会**泄露「该用户名已被占用」—— 注册接口没法不泄露，
                 #    否则用户不知道自己为什么注册不了。登录接口则相反，
                 #    必须模糊化（见 login）。
-                raise HTTPException(409, "该邮箱已注册") from e
+                raise HTTPException(409, "该用户名已被占用") from e
             user_id = cur.fetchone()[0]
 
         # 游客转正：把 localStorage 里已有的评分带进来，不让用户白答一遍问卷。
@@ -556,7 +578,7 @@ def register(req: schemas.RegisterRequest, response: Response) -> schemas.AuthUs
                 c, user_id, _guest_items(req.guest_ratings, "questionnaire"))
         payload = _auth_user_payload(c, user_id)
 
-    _set_session(response, user_id)
+    _set_session(response, request, user_id)
     return payload
 
 
@@ -564,28 +586,30 @@ def register(req: schemas.RegisterRequest, response: Response) -> schemas.AuthUs
 def login(req: schemas.LoginRequest, response: Response) -> schemas.AuthUser:
     """登录。
 
-    🚨 **「邮箱不存在」与「密码错误」必须报同一句话。** 分开报等于提供了
-       一个账号枚举接口：攻击者能批量试出哪些邮箱注册过本站。
-    ⚠️ 邮箱不存在时**也要做一次哈希校验**（对着一个假串），否则两条路径的
+    🚨 **「用户名不存在」与「密码错误」必须报同一句话。** 分开报等于提供了
+       一个账号枚举接口：攻击者能批量试出哪些用户名注册过本站。
+    ⚠️ 用户名不存在时**也要做一次哈希校验**（对着一个假串），否则两条路径的
        响应时间差几十毫秒，用时间差一样能枚举出账号 —— 消息一致但时间不一致，
        等于没防。
+    ⚠️ 查询走 `username_norm`，所以大小写、全角写法都能登进来 ——
+       注册时归一化了，登录时不归一化就会出现「注册成功却登不上」。
     """
-    email = auth.normalize_email(req.email)
+    norm = auth.normalize_username(req.username)
     with _conn() as c:
         with c.cursor() as cur:
             cur.execute(
-                "SELECT user_id, password_hash FROM app_user WHERE email = %s",
-                (email,))
+                "SELECT user_id, password_hash FROM app_user WHERE username_norm = %s",
+                (norm,))
             row = cur.fetchone()
 
         if row is None:
             # 时间侧信道对齐：走一次同样开销的校验再失败。
             auth.verify_password(auth.DUMMY_HASH, req.password)
-            raise HTTPException(401, "邮箱或密码不正确")
+            raise HTTPException(401, "用户名或密码不正确")
 
         user_id, pw_hash = row
         if not auth.verify_password(pw_hash, req.password):
-            raise HTTPException(401, "邮箱或密码不正确")
+            raise HTTPException(401, "用户名或密码不正确")
 
         with c.cursor() as cur:
             cur.execute(
@@ -605,7 +629,7 @@ def login(req: schemas.LoginRequest, response: Response) -> schemas.AuthUser:
                 c, user_id, _guest_items(req.guest_ratings, "manual"))
         payload = _auth_user_payload(c, user_id)
 
-    _set_session(response, user_id)
+    _set_session(response, request, user_id)
     return payload
 
 

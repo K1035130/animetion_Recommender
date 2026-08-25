@@ -14,7 +14,7 @@ export default function AuthDialog({
 }) {
   const { login, register, answered } = useSession()
   const [mode, setMode] = useState<Mode>(initialMode)
-  const [email, setEmail] = useState('')
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -24,8 +24,8 @@ export default function AuthDialog({
     setBusy(true)
     setError(null)
     try {
-      if (mode === 'login') await login(email.trim(), password)
-      else await register(email.trim(), password)
+      if (mode === 'login') await login(username.trim(), password)
+      else await register(username.trim(), password)
       onClose()
     } catch (err) {
       setError(String((err as Error).message ?? err))
@@ -73,13 +73,18 @@ export default function AuthDialog({
         )}
 
         <label className="mb-3 block">
-          <span className="mb-1 block text-xs text-(--color-muted)">邮箱</span>
+          <span className="mb-1 block text-xs text-(--color-muted)">
+            用户名{mode === 'register' && '（2–20 字，可用中文）'}
+          </span>
           <input
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
+            type="text"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
             required
-            autoComplete="email"
+            maxLength={20}
+            // ⚠️ 用 username 而不是 email —— 浏览器/密码管理器靠这个值决定
+            //    自动填什么，写错的话它会往用户名框里填邮箱。
+            autoComplete="username"
             className="w-full rounded-lg border border-(--color-line) bg-(--color-page) px-3 py-2 text-sm outline-none focus:border-(--color-brand)"
           />
         </label>
@@ -119,7 +124,9 @@ export default function AuthDialog({
         </button>
 
         <p className="mt-4 text-[11px] leading-relaxed text-(--color-muted)">
-          我们只存邮箱和密码哈希，不存昵称头像等任何其他信息。
+          只存用户名和密码哈希，不收邮箱、不存任何其他个人信息。
+          <br />
+          ⚠️ 也因此<strong>没有找回密码的途径</strong>，请记好。
         </p>
       </form>
     </div>

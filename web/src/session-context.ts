@@ -19,8 +19,8 @@ export interface SessionValue {
   answered: number
   setAnswer: (id: number, choice: Choice, score?: number) => void
   clearAnswers: () => Promise<void>
-  login: (email: string, password: string) => Promise<void>
-  register: (email: string, password: string) => Promise<void>
+  login: (username: string, password: string) => Promise<void>
+  register: (username: string, password: string) => Promise<void>
   logout: () => Promise<void>
   /** /ask 成功后回传剩余配额，免得再查一次 /auth/me。 */
   setQuotaRemaining: (n: number) => void

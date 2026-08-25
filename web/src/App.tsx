@@ -74,8 +74,8 @@ function AccountMenu({ onOpenAuth }: { onOpenAuth: () => void }) {
 
   return (
     <div className="flex items-center gap-2.5 text-xs">
-      <span className="hidden text-(--color-muted) sm:inline" title={user.email}>
-        {user.email}
+      <span className="hidden text-(--color-muted) sm:inline" title={user.username}>
+        {user.username}
       </span>
       <span
         className="rounded-full bg-(--color-brand)/12 px-2 py-0.5 text-(--color-brand)"

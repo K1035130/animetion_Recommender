@@ -370,7 +370,11 @@ class FindResponse(BaseModel):
 
 
 class RegisterRequest(BaseModel):
-    email: str = Field(max_length=254)
+    # ⚠️ 这里只卡一个宽松的字符上限防滥用，真正的规则（长度/字符集/保留名）
+    #    在 auth.valid_username() 一处判 —— 复制到 Field 约束里就是两个定义处。
+    #    上限取 USERNAME_MAX 的两倍余量：归一化（NFKC）可能改变长度，
+    #    按原始串卡死会误伤，最终长度由 valid_username 说了算。
+    username: str = Field(min_length=1, max_length=64)
     # 上下限与 src/auth.py 的 PASSWORD_MIN/MAX 一致。
     # ⚠️ 上限不是安全要求，是防「有人 POST 一个 1 MB 的密码」把 argon2 拖死。
     password: str = Field(min_length=8, max_length=128)
@@ -380,7 +384,7 @@ class RegisterRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: str = Field(max_length=254)
+    username: str = Field(max_length=64)
     password: str = Field(max_length=128)
     # 登录时同样可以带上本地评分。⚠️ 合并规则是**云端为准、本地只补空缺**
     # （ratings.merge_guest 的 DO NOTHING）—— 账号是跨设备的事实来源，
@@ -402,7 +406,8 @@ class QuotaStatus(BaseModel):
 
 class AuthUser(BaseModel):
     user_id: int
-    email: str
+    # ⚠️ 回传的是**原样的 username**（保留用户写的大小写），不是 username_norm。
+    username: str
     created_at: str
     # 已同步到账号的评分条数，前端可用来提示「已保存 N 部」。
     rating_count: int

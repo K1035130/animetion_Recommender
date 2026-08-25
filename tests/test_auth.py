@@ -18,7 +18,6 @@ from fastapi.testclient import TestClient
 from server.main import API, app
 from src import auth, db, quota
 
-
 # ============================================================
 # 纯函数：密码与 JWT（不碰库，不需要 real_auth）
 # ============================================================
@@ -99,27 +98,50 @@ def test_token_alg_none_rejected():
 
 
 @pytest.mark.parametrize("raw,expect", [
-    ("  Kevin@X.COM ", "kevin@x.com"),
-    ("a@b.co", "a@b.co"),
-    ("MiXeD@Case.Org", "mixed@case.org"),
+    ("  Kevin ", "kevin"),                  # 首尾空白 + 大小写
+    ("kevin", "kevin"),
+    ("MiXeDcAsE", "mixedcase"),
+    ("小明", "小明"),                        # CJK 不受大小写折叠影响
 ])
-def test_normalize_email(raw, expect):
+def test_normalize_username(raw, expect):
     """不归一化的话 UNIQUE 约束形同虚设 —— 它拦的是字节相同，不是身份相同。"""
-    assert auth.normalize_email(raw) == expect
+    assert auth.normalize_username(raw) == expect
 
 
-def test_normalize_email_keeps_plus_and_dots():
-    """⚠️ 只归一化大小写与空白。删点/去 + 号是 Gmail 特有的规则，
-    套到别家域名上会把两个不同的人合成一个账号 —— 宁可一个人两个号。"""
-    assert auth.normalize_email("a.b+tag@example.com") == "a.b+tag@example.com"
+def test_normalize_username_folds_fullwidth():
+    """🚨 全角必须折成半角。不折的话注册一个全角同名账号就能在界面上
+    冒充别人，而唯一约束完全看不出问题 —— 静默的身份混淆。"""
+    assert auth.normalize_username("Ｋｅｖｉｎ") == auth.normalize_username("kevin")
 
 
-@pytest.mark.parametrize("email,ok", [
-    ("a@b.co", True), ("no-at-sign", False), ("a b@c.co", False),
-    ("a@b", False), ("", False),
+def test_normalize_username_folds_unicode_composition():
+    """`é` 有组合与预组合两种写法，字节不同但看起来一模一样。
+    NFKC 把它们统一 —— 否则同样是一个可冒充的缺口。"""
+    assert auth.normalize_username("café") == auth.normalize_username("café")
+
+
+@pytest.mark.parametrize("name,ok", [
+    ("kevin", True), ("小明", True), ("a_b-c", True), ("用户2024", True),
+    ("k", False),                       # 太短
+    ("x" * 21, False),                  # 太长
+    ("has space", False),               # 空格：会让 URL/日志/@提及处处要转义
+    ("bad!char", False),
+    ("", False),
 ])
-def test_valid_email(email, ok):
-    assert auth.valid_email(email) is ok
+def test_valid_username(name, ok):
+    assert auth.valid_username(name)[0] is ok
+
+
+@pytest.mark.parametrize("name", ["admin", "Admin", "ＡＤＭＩＮ", "root", "api"])
+def test_reserved_usernames_rejected(name):
+    """⚠️ 判据是**归一化之后**的形式，所以大小写和全角变体都挡得住。"""
+    ok, why = auth.valid_username(name)
+    assert not ok and "保留" in why
+
+
+def test_username_length_counted_after_normalization():
+    """⚠️ NFKC 会改变长度。按原始串算的话，有人能用全角凑出超长名字。"""
+    assert auth.valid_username("Ｋ" * 21)[0] is False
 
 
 # ============================================================
@@ -135,16 +157,17 @@ def client():
 @pytest.fixture
 def account():
     """建一个临时账号，用完连级联数据一起删。"""
-    email = f"t-{uuid.uuid4().hex[:12]}@pytest.local"
+    username = f"pytest-{uuid.uuid4().hex[:10]}"
     password = "test-password-123"
     conn = db.connect()
     with conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO app_user (email, password_hash) VALUES (%s,%s) RETURNING user_id",
-            (email, auth.hash_password(password)))
+            "INSERT INTO app_user (username, username_norm, password_hash) "
+            "VALUES (%s,%s,%s) RETURNING user_id",
+            (username, auth.normalize_username(username), auth.hash_password(password)))
         uid = cur.fetchone()[0]
     conn.commit()
-    yield {"user_id": uid, "email": email, "password": password, "conn": conn}
+    yield {"user_id": uid, "username": username, "password": password, "conn": conn}
     with conn.cursor() as cur:
         cur.execute("DELETE FROM app_user WHERE user_id = %s", (uid,))
     conn.commit()
@@ -188,55 +211,66 @@ def test_me_returns_null_for_guest(client):
 
 @pytest.mark.real_auth
 def test_register_login_logout_flow(account):
-    email = f"flow-{uuid.uuid4().hex[:12]}@pytest.local"
+    username = f"Flow-{uuid.uuid4().hex[:10]}"      # 故意带大写，验证原样保留
     with TestClient(app) as c:
         r = c.post(f"{API}/auth/register",
-                   json={"email": email, "password": "a-good-password"})
+                   json={"username": username, "password": "a-good-password"})
         assert r.status_code == 200
-        assert r.json()["email"] == email
-        assert c.get(f"{API}/auth/me").json()["email"] == email
+        # ⚠️ 展示的是原样大小写，不是归一化后的小写。
+        assert r.json()["username"] == username
+        assert c.get(f"{API}/auth/me").json()["username"] == username
 
         assert c.post(f"{API}/auth/logout").status_code == 200
         assert c.get(f"{API}/auth/me").json() is None
 
         r = c.post(f"{API}/auth/login",
-                   json={"email": email, "password": "a-good-password"})
+                   json={"username": username, "password": "a-good-password"})
         assert r.status_code == 200
-        assert c.get(f"{API}/auth/me").json()["email"] == email
+        assert c.get(f"{API}/auth/me").json()["username"] == username
 
     conn = db.connect()
     with conn.cursor() as cur:
-        cur.execute("DELETE FROM app_user WHERE email = %s", (email,))
+        cur.execute("DELETE FROM app_user WHERE username_norm = %s",
+                    (auth.normalize_username(username),))
     conn.commit()
     conn.close()
 
 
 @pytest.mark.real_auth
-def test_login_email_case_insensitive(client, account):
-    """注册时归一化了，登录时也必须归一化 —— 否则用户用大写邮箱就登不进去。"""
+def test_login_username_case_insensitive(client, account):
+    """注册时归一化了，登录时也必须归一化 —— 否则用户换个大小写就登不进去。"""
     r = client.post(f"{API}/auth/login", json={
-        "email": account["email"].upper(), "password": account["password"]})
+        "username": account["username"].upper(), "password": account["password"]})
     assert r.status_code == 200
     client.post(f"{API}/auth/logout")
 
 
 @pytest.mark.real_auth
-def test_wrong_password_and_unknown_email_are_indistinguishable(client, account):
+def test_wrong_password_and_unknown_user_are_indistinguishable(client, account):
     """🚨 两者必须报**同一句话**：分开报等于提供了一个账号枚举接口。"""
     bad_pw = client.post(f"{API}/auth/login", json={
-        "email": account["email"], "password": "definitely-wrong"})
+        "username": account["username"], "password": "definitely-wrong"})
     no_user = client.post(f"{API}/auth/login", json={
-        "email": f"nobody-{uuid.uuid4().hex[:8]}@pytest.local",
+        "username": f"nobody-{uuid.uuid4().hex[:8]}",
         "password": "definitely-wrong"})
     assert bad_pw.status_code == no_user.status_code == 401
     assert bad_pw.json()["detail"] == no_user.json()["detail"]
 
 
 @pytest.mark.real_auth
-def test_duplicate_email_rejected(client, account):
+def test_duplicate_username_rejected(client, account):
+    """⚠️ 大小写不同也算重复 —— 判重走 username_norm。"""
     r = client.post(f"{API}/auth/register", json={
-        "email": account["email"].upper(), "password": "another-password"})
+        "username": account["username"].upper(), "password": "another-password"})
     assert r.status_code == 409
+
+
+@pytest.mark.real_auth
+def test_register_rejects_invalid_username(client):
+    for bad in ("k", "has space", "admin"):
+        r = client.post(f"{API}/auth/register",
+                        json={"username": bad, "password": "a-good-password"})
+        assert r.status_code == 422, bad
 
 
 # ── 配额 ─────────────────────────────────────────────────────
@@ -340,7 +374,7 @@ def test_guest_merge_does_not_overwrite_cloud(client, account):
     client.cookies.clear()
 
     r = client.post(f"{API}/auth/login", json={
-        "email": account["email"], "password": account["password"],
+        "username": account["username"], "password": account["password"],
         "guest_ratings": [
             {"subject_id": 328609, "choice": "seen", "score": 1.0},   # 冲突：不该覆盖
             {"subject_id": 1851, "choice": "pass"},                   # 空缺：应写入

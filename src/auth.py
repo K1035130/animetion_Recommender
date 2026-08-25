@@ -13,12 +13,16 @@
    与 `build_embeddings.py` 在花钱之前先检查 `SILICONFLOW_API_KEY`
    是同一条纪律（在造成损失之前失败）。
 
-⚠️ **邮箱一律经 `normalize_email()` 之后再进库/查库。**
-   不归一化的话 `Kevin@X.com` 与 `kevin@x.com` 是两个账号，而用户认为
-   它们是同一个 —— 数据库的 UNIQUE 约束在这种情况下形同虚设
-   （它拦的是字节相同，不是身份相同）。
+⚠️ **用户名一律经 `normalize_username()` 之后再进库/查库。**
+   不归一化的话 `Kevin` 与 `kevin` 是两个账号，而用户认为它们是同一个 ——
+   数据库的 UNIQUE 约束在这种情况下形同虚设（它拦的是字节相同，
+   不是身份相同）。
    📌 与 `textproc.norm_name` 定义 alias 的键是同构的问题：
       **凡是「用来判断两个东西是不是同一个」的字符串，都必须先归一化。**
+   📌 所以库里是两列：`username`（原样展示）+ `username_norm`（判重与查询）。
+      归一化只在这里有一个定义处 —— **不要改用 Postgres 的 lower()
+      函数索引**，那会变成两个定义处，而 `casefold()` 与 `lower()`
+      在边缘 case 上并不等价。
 
 ⚠️ **token 里只放 user_id，不放邮箱/权限/昵称。**
    JWT 是**签名**的不是加密的，任何人都能 base64 解开看内容。
@@ -30,6 +34,7 @@
 import datetime
 import os
 import re
+import unicodedata
 
 import jwt
 from argon2 import PasswordHasher
@@ -64,11 +69,24 @@ TOKEN_TTL = datetime.timedelta(days=30)
 PASSWORD_MIN = 8
 PASSWORD_MAX = 128
 
-# 只做形态上的粗筛，不做 RFC 5322 那套完整语法。
-# ⚠️ 真正判断邮箱有效性的唯一办法是发一封信过去，而 MVP 不做邮箱验证
-#    （设计文档 §4）—— 所以这里的正则**不承担验证责任**，
-#    只是挡住明显的手滑（没有 @、带空格）。别把它写复杂，那是假的安全感。
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+USERNAME_MIN = 2
+USERNAME_MAX = 20
+
+# `\w` 在 Python 的默认（Unicode）模式下涵盖各语言字母、数字和下划线，
+# 所以「小明」「kevin_2024」「あきら」都合法 —— 这是个中文站，
+# 限成纯 ASCII 没道理。另外放行连字符。
+# ⚠️ **不放行空格与标点**：用户名要在 URL、日志、@提及里出现，
+#    带空格的标识符每一处都得额外转义，而收益为零。
+_USERNAME_RE = re.compile(r"^[\w-]+$", re.UNICODE)
+
+# 保留名：避免有人注册成 admin 之后在界面上冒充官方身份。
+# ⚠️ 判据是**归一化之后**的形式，否则 `Admin`、`ＡＤＭＩＮ`（全角）
+#    都能绕过 —— NFKC 会把全角折成半角，正是为此。
+RESERVED_USERNAMES = frozenset({
+    "admin", "administrator", "root", "system", "official", "staff",
+    "support", "help", "moderator", "mod", "null", "undefined", "anonymous",
+    "me", "self", "api", "guest",
+})
 
 
 class AuthError(Exception):
@@ -94,19 +112,42 @@ def secret() -> str:
     return s
 
 
-def normalize_email(email: str) -> str:
-    """小写 + 去首尾空白。**入库与查库都必须走这里。**
+def normalize_username(username: str) -> str:
+    """判重与登录查询用的形式。**入库与查库都必须走这里。**
 
-    ⚠️ 只归一化大小写与空白，**不动 + 号别名、不删点**（Gmail 的
-       `a.b+x@gmail.com` 与 `ab@gmail.com` 实际是同一个信箱）——
-       那是 Gmail 特有的规则，套到别家域名上会把两个不同的人合成一个账号。
-       宁可让同一个人有两个账号，也不能让两个人共用一个。
+    三步，每一步都对应一类「看起来一样但字节不同」：
+
+        strip()      首尾空白 —— 复制粘贴时最常带进来的东西
+        NFKC         全角 `Ｋｅｖｉｎ` → `Kevin`、组合字符 `é` 的两种写法
+                     统一成一种。⚠️ 不做这步的话，注册一个全角同名账号
+                     就能在界面上冒充别人，而唯一约束完全拦不住
+        casefold()   比 lower() 更彻底的大小写折叠（德语 ß → ss）；
+                     选它而不是 lower() 正是因为要覆盖这些边缘 case
+
+    ⚠️ 返回值只用来**比较和存 `username_norm`**，展示一律用原始的
+       `username` 列 —— 用户写 `Kevin` 就该看到 `Kevin`，不是 `kevin`。
     """
-    return email.strip().lower()
+    return unicodedata.normalize("NFKC", username.strip()).casefold()
 
 
-def valid_email(email: str) -> bool:
-    return bool(_EMAIL_RE.match(email)) and len(email) <= 254
+def valid_username(username: str) -> tuple[bool, str]:
+    """校验用户名，返回 (是否合法, 不合法时的原因)。
+
+    ⚠️ **长度按归一化后算**：NFKC 会改变长度（全角折半角、`①` → `1`），
+       按原始串算的话有人能用全角凑出一个超长的名字。
+    """
+    norm = normalize_username(username)
+    if not norm:
+        return False, "用户名不能为空"
+    if len(norm) < USERNAME_MIN:
+        return False, f"用户名至少 {USERNAME_MIN} 个字符"
+    if len(norm) > USERNAME_MAX:
+        return False, f"用户名最多 {USERNAME_MAX} 个字符"
+    if not _USERNAME_RE.match(norm):
+        return False, "用户名只能包含字母、数字、下划线和连字符"
+    if norm in RESERVED_USERNAMES:
+        return False, "该用户名已被保留，请换一个"
+    return True, ""
 
 
 def hash_password(password: str) -> str:

@@ -152,9 +152,9 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   }, [])
 
   const login = useCallback(
-    async (email: string, password: string) => {
+    async (username: string, password: string) => {
       // 把本地评分一起带上：服务端按「云端为准、本地只补空缺」合并。
-      const u = await api.login(email, password, toAnswers(answersRef.current))
+      const u = await api.login(username, password, toAnswers(answersRef.current))
       const { items } = await api.getRatings()
       adopt(u, items)
     },
@@ -162,8 +162,8 @@ export function SessionProvider({ children }: { children: React.ReactNode }) {
   )
 
   const register = useCallback(
-    async (email: string, password: string) => {
-      const u = await api.register(email, password, toAnswers(answersRef.current))
+    async (username: string, password: string) => {
+      const u = await api.register(username, password, toAnswers(answersRef.current))
       const { items } = await api.getRatings()
       adopt(u, items)
     },
