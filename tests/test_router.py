@@ -102,15 +102,16 @@ def test_known_limitation_person_plus_cour():
 def _stub_voice_llm(monkeypatch):
     """⚠️ voice 分支 2026-08-25 起会调一次生成，**本文件不该真的等它**。
 
-    这里测的是「路由选对了没有」，而真实生成实测单次 26~37 秒 —— 三条
-    voice 用例就是一分半，且引入了模型行为漂移。与 test_ask_intent.py
-    同一条纪律：把 llm.* 全部换成替身，只留路由逻辑真跑。
+    这里测的是「路由选对了没有」，不该为此每条用例都真的打一次外部 API：
+    慢（换 8B 之后单次仍要 5~7 秒，换之前是 26~37 秒），而且引入模型行为
+    漂移 —— 生成内容变了会让**路由**用例莫名其妙地红。
+    与 test_ask_intent.py 同一条纪律：把 llm.* 全部换成替身，只留路由真跑。
     📌 生成本身的 wiring（成功用 LLM 的话 / 失败回落成表格）由
        tests/test_voice.py 覆盖。
     """
     monkeypatch.setattr(
         llm, "voice_answer",
-        lambda q, ctx, **kw: ("（测试替身：LLM 组织的回答）", llm.INTENT_PROVIDER))
+        lambda q, ctx, **kw: ("（测试替身：LLM 组织的回答）", llm.VOICE_PROVIDER))
 
 
 def test_ask_returns_route(client):

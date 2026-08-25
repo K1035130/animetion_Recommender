@@ -222,7 +222,7 @@ def test_ask_voice_answer_comes_from_llm(client, monkeypatch):
     _no_intent_call(monkeypatch)
     monkeypatch.setattr(
         llm, "voice_answer",
-        lambda q, ctx, **kw: ("这是 LLM 写的回答", llm.INTENT_PROVIDER))
+        lambda q, ctx, **kw: ("这是 LLM 写的回答", llm.VOICE_PROVIDER))
 
     d = client.post(f"{API}/ask", json={
         "question": "花泽香菜配过哪些角色", "route": "voice"}).json()
@@ -261,7 +261,7 @@ def test_ask_voice_recent_switches_order(client, monkeypatch):
     """「最近」要真的切到年份序 —— 判据是 meta，不是靠肉眼看列表。"""
     _no_intent_call(monkeypatch)
     monkeypatch.setattr(llm, "voice_answer",
-                        lambda q, ctx, **kw: ("ok", llm.INTENT_PROVIDER))
+                        lambda q, ctx, **kw: ("ok", llm.VOICE_PROVIDER))
 
     def order_of(question):
         return client.post(f"{API}/ask", json={

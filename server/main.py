@@ -838,6 +838,8 @@ def _ask_impl(req: schemas.AskRequest) -> schemas.AskResponse:
     📌 season 分支**不调生成模型**（只有那道意图校验），实测 0.3–1.1 秒。
     📌 **voice 分支 2026-08-25 起会调一次生成**（把配役表讲成一段话，
        见 llm.voice_answer）—— 它此前也在这一档，现在不是了。
+       实测 **5.7–6.5 秒**（走 `llm.VOICE_PROVIDER` = Qwen3-8B，
+       不是主力 14B；选型 A/B 见 CLAUDE.md「为什么最后换成了 8B」）。
        ⚠️ 但**资料仍然是零模型来的**（一条 SQL），LLM 只负责组织语言 ⇒
           生成失败时退回展示配役表，不像流程 C 那样必须 503。
 

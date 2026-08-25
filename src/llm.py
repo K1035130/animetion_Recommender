@@ -667,17 +667,58 @@ VOICE_SYSTEM = (
     "写法，用户已经能看到那张表了，他要的是你**读完之后的话**。\n"
     "   全文控制在 150 字上下，宁可少说几个也不要拖长。\n"
     "5. 资料里写着「（角色名缺失）」的，是库里没有存这个角色的名字。"
-    "**不要猜一个名字填上去** —— 跳过它，或者如实说明这条记录缺角色名。\n"
+    "**不要猜一个名字填上去**；同时**绝对不要把「（角色名缺失）」这几个字"
+    "照抄进回答** —— 那是内部占位符，写出来像是系统出了故障。\n"
+    "   正确的处理是跳过这些条目，或者把它们合并成一句话，例如"
+    "「另外还有《A》《B》等几部，资料里没有记录角色名」。\n"
     "6. 不要复述「以下按…排列」这类关于资料本身的说明，直接讲内容。\n"
     "7. 不要写开场白和结尾套话，直接开始回答。"
 )
 
 
-def voice_answer(question: str, context: tuple[str, str], *,
-                 allow_fallback: bool = True) -> tuple[str, Provider]:
+# 🚨 **独立于 PRIMARY/FALLBACKS 链，不走 complete()**（Kevin 2026-08-25 定，
+#    实测选型）。与 INTENT_PROVIDER 同一个模式，但**有意不复用那个常量** ——
+#    一个是分类、一个是生成，将来任一方换模型时不该牵动另一方。
+#
+# ⚠️ **选它的依据是 A/B 实测，不是"小模型更快"这个直觉**（G.5f 的教训：
+#    Hunyuan 按延迟选进来，结果把菲利斯的能力安到冈部头上）。
+#    两轮对照（3 问句 × 2 轮，判据：延迟 / 有没有抄成清单 / 回答里的《作品名》
+#    是否全部出现在资料里 / 有没有把「（角色名缺失）」占位符照抄进回答）：
+#
+#      第一轮   14B 均 22.4s，资料外作品 1     8B 均 5.4s，资料外作品 1
+#      第二轮   14B 均 17.9s，资料外作品 2     8B 均 7.9s，资料外作品 **0**
+#
+#    🎯 **8B 不只是更快，客观判据上还更干净**：14B 两轮稳定把
+#    《钢之炼金术师 FULLMETAL ALCHEMIST》截短成《钢之炼金术师》，
+#    而 8B 老实写全名。人工读三条也没问题，且 temperature=0 下两轮输出
+#    几乎逐字相同（14B 波动明显更大）。
+#    ⚠️ 服务端负载波动很大（14B 两轮均值就差了 4.5s），所以**倍数比绝对值
+#       可信**：两轮里 8B 分别快 4.1× 和 2.3×，方向一致。
+#
+# ⚠️ **没有配 fallback，这是有意的**：生成挂了 main.py 会回落到展示配役表
+#    本身（一个完整可用的答案），比再换一个模型猜一次更省事也更安全 ——
+#    与 INTENT_PROVIDER 那条「挂了就不校验」同构。
+VOICE_PROVIDER = Provider(
+    name="siliconflow/Qwen3-8B",
+    base_url="https://api.siliconflow.cn/v1/chat/completions",
+    model="Qwen/Qwen3-8B",
+    # 🚨 **必须关思考。** Qwen3-8B 是混合思考模型，不关的话会先生成一大段
+    #    隐藏思维链，延迟优势直接消失（translate.py 2026-08-17、
+    #    classify_intent 2026-08-24 都踩过，后者单次 11.38 秒）。
+    #    上面那些实测数字全部是在关掉思考的前提下测的。
+    extra={"enable_thinking": False},
+)
+
+
+def voice_answer(question: str,
+                 context: tuple[str, str]) -> tuple[str, Provider]:
     """把 voice.as_context() 的配役表讲成一段自然语言回答。
 
     context: voice.as_context() 的返回值 (section, text)。
+
+    ⚠️ **走 VOICE_PROVIDER 而不是 complete()** —— 见上面那段选型实测。
+       所以这里没有 `allow_fallback` 参数：这条链上就没有 fallback，
+       挂了由调用方回落到展示配役表。
 
     ⚠️ **只传 text，不把 section 拼进 user 消息。** section 是
        「声优配役（来自数据库的结构化字段，非剧情语料）」这句元信息，
@@ -689,9 +730,10 @@ def voice_answer(question: str, context: tuple[str, str], *,
        那条说的是流程 C，那里没有 LLM 就真的没有回答。
     """
     _section, text = context
-    return complete(
+    out = _post_with_retry(
+        VOICE_PROVIDER,
         [{"role": "system", "content": VOICE_SYSTEM},
          {"role": "user", "content": f"资料：\n{text}\n\n问题：{question}"}],
-        max_tokens=MAX_TOKENS_VOICE,
-        allow_fallback=allow_fallback,
+        MAX_TOKENS_VOICE,
     )
+    return out, VOICE_PROVIDER
