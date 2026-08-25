@@ -48,7 +48,13 @@ const SORTS: [SortBy, string][] = [
   ['done', '热度'],
 ]
 
-export default function AccountPage({ onOpenAuth }: { onOpenAuth: () => void }) {
+export default function AccountPage({
+  onOpenAuth,
+  onLoggedOut,
+}: {
+  onOpenAuth: () => void
+  onLoggedOut: () => void
+}) {
   const { user, loading } = useSession()
 
   if (loading) {
@@ -73,7 +79,7 @@ export default function AccountPage({ onOpenAuth }: { onOpenAuth: () => void }) 
 
   return (
     <div className="mx-auto h-full max-w-3xl overflow-y-auto px-4 py-6">
-      <AccountCard />
+      <AccountCard onLoggedOut={onLoggedOut} />
       <SecuritySection />
       <RatedList />
     </div>
@@ -90,16 +96,43 @@ function Centered({ children }: { children: React.ReactNode }) {
 
 // ── 账号信息 ──────────────────────────────────────────────────
 
-function AccountCard() {
-  const { user, answered } = useSession()
+function AccountCard({ onLoggedOut }: { onLoggedOut: () => void }) {
+  const { user, answered, logout } = useSession()
+  const [busy, setBusy] = useState(false)
   if (!user) return null
+
+  async function signOut() {
+    setBusy(true)
+    try {
+      // ⚠️ 必须走 session 的 logout()，别自己调 api.logout() —— 它会**先
+      //    flush 未同步的评分再登出**，绕过去的话防抖窗口里那批分就丢了。
+      await logout()
+      // 登出后本页会变成「需要登录后查看」的死胡同，交给 App 切回首页。
+      onLoggedOut()
+    } catch {
+      setBusy(false)
+    }
+  }
 
   const created = user.created_at.slice(0, 10)
   return (
     <section className="mb-5 rounded-2xl border border-(--color-line) bg-(--color-surface) p-5">
-      <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-        <h1 className="text-xl font-semibold">{user.username}</h1>
-        <span className="text-xs text-(--color-muted)">注册于 {created}</span>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
+          <h1 className="text-xl font-semibold">{user.username}</h1>
+          <span className="text-xs text-(--color-muted)">注册于 {created}</span>
+        </div>
+        {/* 登出从顶栏挪到这里。⚠️ 有意**不**复用 secondaryBtn：那是
+            「修改用户名/密码」的样式，登出跟它们并列会显得是同一类操作，
+            而这里它只是卡片上的一个次级动作。 */}
+        <button
+          onClick={() => void signOut()}
+          disabled={busy}
+          className="inline-flex min-h-11 shrink-0 items-center justify-center gap-2 rounded-lg border border-(--color-line) px-4 py-2 text-sm text-(--color-muted) transition hover:border-(--color-brand) hover:text-(--color-brand) disabled:opacity-40"
+        >
+          <LogoutIcon />
+          {busy ? '登出中…' : '登出'}
+        </button>
       </div>
       <div className="mt-3 flex flex-wrap gap-2 text-xs">
         <Stat label="已打分" value={`${answered} 部`} />
@@ -211,6 +244,25 @@ function LockIcon() {
     >
       <rect x="3" y="11" width="18" height="11" rx="2" />
       <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </svg>
+  )
+}
+
+function LogoutIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden
+      className="h-4 w-4"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+      <path d="m16 17 5-5-5-5" />
+      <path d="M21 12H9" />
     </svg>
   )
 }

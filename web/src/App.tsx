@@ -25,7 +25,7 @@ export default function App() {
       {/* ⚠️ 顶栏不套 max-w-3xl：内容区居中是对的，但导航跟着居中会让
           「← 首页 / 动漫推荐」在宽屏上悬在半空，看着像浮层而不是页头。 */}
       <nav className="shrink-0 border-b border-(--color-line) bg-(--color-page)/95 backdrop-blur">
-        <div className="flex items-center gap-2.5 px-5 py-3">
+        <div className="flex items-center gap-2.5 px-5 py-2">
           {view === 'home' ? (
             <span className="text-lg font-semibold">动漫推荐</span>
           ) : (
@@ -55,7 +55,12 @@ export default function App() {
         {view === 'home' && <Home onEnter={setView} />}
         {view === 'recommend' && <RecommendHub />}
         {view === 'ask' && <AskPanel onOpenAuth={() => setAuthOpen(true)} />}
-        {view === 'account' && <AccountPage onOpenAuth={() => setAuthOpen(true)} />}
+        {view === 'account' && (
+          <AccountPage
+            onOpenAuth={() => setAuthOpen(true)}
+            onLoggedOut={() => setView('home')}
+          />
+        )}
       </main>
 
       {authOpen && <AuthDialog onClose={() => setAuthOpen(false)} />}
@@ -70,17 +75,17 @@ function AccountMenu({
   onOpenAuth: () => void
   onOpenAccount: () => void
 }) {
-  const { user, loading, logout } = useSession()
+  const { user, loading } = useSession()
 
   // ⚠️ 冷启动查登录态时不要渲染「登录」按钮 —— 已登录用户会看到它闪一下
   //    再变成邮箱，像是被登出过。
-  if (loading) return <span className="text-xs text-(--color-muted)">…</span>
+  if (loading) return <span className="text-sm text-(--color-muted)">…</span>
 
   if (!user) {
     return (
       <button
         onClick={onOpenAuth}
-        className="rounded-lg border border-(--color-line) px-3 py-1.5 text-sm text-(--color-muted) transition hover:border-(--color-brand) hover:text-(--color-brand)"
+        className="inline-flex min-h-11 items-center rounded-lg border border-(--color-line) px-4 py-2 text-sm text-(--color-muted) transition hover:border-(--color-brand) hover:text-(--color-brand)"
       >
         登录
       </button>
@@ -88,28 +93,27 @@ function AccountMenu({
   }
 
   return (
-    <div className="flex items-center gap-2.5 text-xs">
-      {/* ⚠️ 用户名现在是**进个人中心的入口**，所以不能再 `hidden sm:inline`
-          —— 那样小屏上就完全没有入口了。改成始终显示 + 长名字截断。 */}
+    <div className="flex items-center gap-2.5 text-sm">
+      {/* ⚠️ 用户名是**进个人中心的唯一入口**（登出已经挪进去了），所以
+          ① 不能再 `hidden sm:inline` —— 小屏上就没入口了；
+          ② `min-h-11` = 44px 触控目标 —— 手机上点不中就完全进不去。
+          truncate 要配 `min-w-0`：flex 子项默认不肯缩到内容以下，
+          不加的话长名字是被裁掉而不是显示省略号。 */}
       <button
         onClick={onOpenAccount}
         title={`${user.username} · 进入个人中心`}
-        className="max-w-28 truncate text-(--color-muted) underline decoration-dotted underline-offset-4 transition hover:text-(--color-brand) sm:max-w-40"
+        className="inline-flex min-h-11 max-w-32 items-center rounded-lg border border-(--color-line) px-4 py-2 font-medium transition hover:border-(--color-brand) hover:text-(--color-brand) sm:max-w-44"
       >
-        {user.username}
+        <span className="min-w-0 truncate">{user.username}</span>
       </button>
+      {/* 配额是**只读标签不是按钮**，所以有意不给它 44px —— 高度上比按钮
+          矮一档，正好把「可点」和「只是信息」区分开。 */}
       <span
-        className="rounded-full bg-(--color-brand)/12 px-2 py-0.5 text-(--color-brand)"
+        className="rounded-full bg-(--color-brand)/12 px-3 py-1.5 text-(--color-brand)"
         title={`问答每 24 小时 ${user.quota.limit} 条`}
       >
         今日剩 {user.quota.remaining}
       </span>
-      <button
-        onClick={() => void logout()}
-        className="text-(--color-muted) underline hover:text-(--color-brand)"
-      >
-        登出
-      </button>
     </div>
   )
 }
