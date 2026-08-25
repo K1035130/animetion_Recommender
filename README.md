@@ -1,4 +1,4 @@
-# animetion_Recommender
+# Anime_Recommender
 
 An anime recommendation service with a built-in question-answering assistant.
 
@@ -320,7 +320,7 @@ See [LICENSE](LICENSE).
 ---
 ---
 
-# animetion_Recommender（中文）
+# Anime_Recommender（中文）
 
 一个动画推荐服务，并内置了问答助手。
 

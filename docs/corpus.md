@@ -439,7 +439,7 @@ Template:剧透提醒  ← 模板名，只出现在 data-mw 属性里
 ```
 标题解析   50 个/请求 × 7 秒间隔，全程串行无并发
 抓取       7 秒间隔 + 服务端 ~2 秒 = 实测 8.99 秒/页
-UA         animetion-recommender/0.1 (+github 链接; 项目说明; 联系邮箱)
+UA         anime-recommender/0.1 (+github 链接; 项目说明; 联系邮箱)
 ```
 
 ⚠️ **别把 embedding 的 8 路并发和萌娘搞混** —— 那是打硅基流动的付费 API
