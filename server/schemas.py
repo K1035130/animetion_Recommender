@@ -41,6 +41,9 @@ class QuestionItem(BaseModel):
     form: str | None
     # 若该题由某部续作折叠而来，记下原始 id。前端不用管，排查问题时有用。
     replaced_from: int | None = None
+    # 卡片简介，已截断（questionnaire.SUMMARY_MAX_CHARS）。可能为 None——
+    # 589 部作品没有 summary（A.9），前端要按缺失处理，不要留白当出错。
+    summary: str | None = None
 
 
 class QuestionnaireResponse(BaseModel):
@@ -358,6 +361,72 @@ class FindHit(BaseModel):
 class FindResponse(BaseModel):
     query: str
     items: list[FindHit]
+
+
+# ── 账号系统（第 6 周）────────────────────────────────────────────
+# ⚠️ **评分同步复用上面的 `Answer`**，不另定义一套。那是 /recommend 的请求
+#    形状，也是 localStorage 里存的形状 —— 三处同形正是「游客与注册用户走
+#    同一条代码路径」这条铁律的体现。另开一套等于给自己埋一次转换 bug。
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(max_length=254)
+    # 上下限与 src/auth.py 的 PASSWORD_MIN/MAX 一致。
+    # ⚠️ 上限不是安全要求，是防「有人 POST 一个 1 MB 的密码」把 argon2 拖死。
+    password: str = Field(min_length=8, max_length=128)
+    # 游客转正：注册时把 localStorage 里已有的评分一起带上，
+    # 不让用户白答一遍问卷（设计文档「双轨会话」）。
+    guest_ratings: list[Answer] = Field(default_factory=list, max_length=2000)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(max_length=254)
+    password: str = Field(max_length=128)
+    # 登录时同样可以带上本地评分。⚠️ 合并规则是**云端为准、本地只补空缺**
+    # （ratings.merge_guest 的 DO NOTHING）—— 账号是跨设备的事实来源，
+    # 让本地覆盖云端等于用旧数据洗掉新数据，且用户看不出发生了什么。
+    guest_ratings: list[Answer] = Field(default_factory=list, max_length=2000)
+
+
+class QuotaStatus(BaseModel):
+    """问答配额（每人 24 小时 10 条）。前端据此显示「今天还能问 N 条」。"""
+
+    used: int
+    limit: int
+    remaining: int
+    # 仅在用满时有值：最早那条何时滚出 24 小时窗口。
+    # ⚠️ 没用满时恒为 null —— 那时「最早一条何时过期」对用户毫无信息量，
+    #    给了反而让人以为要等。
+    reset_at: str | None = None
+
+
+class AuthUser(BaseModel):
+    user_id: int
+    email: str
+    created_at: str
+    # 已同步到账号的评分条数，前端可用来提示「已保存 N 部」。
+    rating_count: int
+    quota: QuotaStatus
+
+
+class RatingsResponse(BaseModel):
+    """该用户已保存的评分。⚠️ 形状与 RecommendRequest.answers 一致，
+    前端拿到直接喂给 /recommend，中间不需要任何转换。"""
+
+    items: list[Answer]
+
+
+class RatingsSyncRequest(BaseModel):
+    items: list[Answer] = Field(max_length=2000)
+    # 'questionnaire' = 问卷里引导打的，'manual' = 主动搜出来打的。
+    # 两者置信度不同，设计文档 §4 为后续加权预留了这个字段。
+    source: Literal["questionnaire", "manual"] = "manual"
+
+
+class RatingsSyncResponse(BaseModel):
+    written: int
+    deleted: int          # choice='skip' 会删掉已有行（「没看过」用缺失表示）
+    total: int
 
 
 # ⚠️ AskResponse 用字符串注解引用了下面才定义的 VoiceResponse / SeasonResponse，

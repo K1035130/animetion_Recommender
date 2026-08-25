@@ -45,6 +45,18 @@ dependencies = [
     "httpx>=0.27",
     "python-dotenv>=1.0",
     "orjson>=3.10",
+    # ── 账号系统（第 6 周，2026-08-24 上线）────────────────────────
+    # ⚠️ 这两个**从 api 组挪上来**，理由与 httpx 那次一字不差：
+    #    src/auth.py 在请求路径上（注册/登录/每个鉴权请求都要用），
+    #    而 api 组不上线 —— 留在那里的话线上 import 就是
+    #    ModuleNotFoundError，且炸的是模块级 import，整个 ASGI app
+    #    构建不出来，把第 2 周就上线的推荐一起打死。
+    #    开发机装了 api 组（跑 uvicorn 要），所以本地和测试全绿 ——
+    #    又一例「本地好好的，上线就挂」。
+    # argon2id 密码哈希（设计文档 §4 已定，不用 bcrypt/sha256）
+    "argon2-cffi>=23.1",
+    # JWT 签发/校验。⚠️ decode 必须显式传 algorithms，见 src/auth.py
+    "pyjwt>=2.9",
 ]
 
 [dependency-groups]
@@ -85,8 +97,9 @@ ml = [
 # argon2/pyjwt 是第 6 周账号系统才用，先放这里。
 api = [
     "uvicorn[standard]>=0.30",
-    "argon2-cffi>=23.1",
-    "pyjwt>=2.9",
+    # 📌 argon2-cffi / pyjwt 已挪进主依赖组（2026-08-24）：账号系统上线后
+    #    它们在请求路径上，留在这个不上线的组里线上会 ModuleNotFoundError。
+    #    理由与 httpx 那次同源，详见主依赖组里那段注释。
 ]
 dev = [
     "ruff>=0.6",

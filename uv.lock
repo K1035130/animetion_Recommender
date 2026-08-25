@@ -7,6 +7,7 @@ name = "anime-recommender"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "argon2-cffi" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "jieba" },
@@ -15,13 +16,12 @@ dependencies = [
     { name = "pgvector" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
+    { name = "pyjwt" },
     { name = "python-dotenv" },
 ]
 
 [package.dev-dependencies]
 api = [
-    { name = "argon2-cffi" },
-    { name = "pyjwt" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 dev = [
@@ -40,6 +40,7 @@ ml = [
 
 [package.metadata]
 requires-dist = [
+    { name = "argon2-cffi", specifier = ">=23.1" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jieba", specifier = ">=0.42.1" },
@@ -48,15 +49,12 @@ requires-dist = [
     { name = "pgvector", specifier = ">=0.3" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "psycopg-pool", specifier = ">=3.2" },
+    { name = "pyjwt", specifier = ">=2.9" },
     { name = "python-dotenv", specifier = ">=1.0" },
 ]
 
 [package.metadata.requires-dev]
-api = [
-    { name = "argon2-cffi", specifier = ">=23.1" },
-    { name = "pyjwt", specifier = ">=2.9" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
-]
+api = [{ name = "uvicorn", extras = ["standard"], specifier = ">=0.30" }]
 dev = [
     { name = "ipykernel", specifier = ">=6.29" },
     { name = "pytest", specifier = ">=9.1.1" },

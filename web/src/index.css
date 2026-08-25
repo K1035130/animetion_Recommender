@@ -8,6 +8,13 @@
   --color-page: light-dark(#fafafa, #09090b);
   --color-line: light-dark(#e4e4e7, #27272a);
   --color-brand: light-dark(#7c3aed, #a78bfa);
+  /* 深色模式下 --color-brand 变浅（violet-400），白字在上面对比度不够——
+     这个 token 专门给「实心 brand 背景 + 文字」的组合用，不要在别处用它。 */
+  --color-on-brand: light-dark(#ffffff, #1e1033);
+  --color-warn: light-dark(#a2611b, #dba463);
+  /* 同理：red-500 在浅色背景上对比度偏低（~3.8:1，低于 AA 的 4.5:1），
+     错误提示文字用这个而不是直接写 text-red-500。 */
+  --color-danger: light-dark(#dc2626, #f87171);
 }
 
 :root {

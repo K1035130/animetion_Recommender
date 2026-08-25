@@ -23,17 +23,20 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 
 import psycopg
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from psycopg_pool import ConnectionPool
 
 from server import schemas
 from src import (
+    auth,
     db,
     embed,
     find,
     llm,
     questionnaire,
+    quota,
+    ratings,
     recommend,
     recommend_sql,
     related,
@@ -150,10 +153,71 @@ _origins = os.environ.get(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in _origins if o.strip()],
+    # ⚠️ 账号系统用 httpOnly cookie，本地开发跨源时必须带 credentials，
+    #    前端那侧也要 fetch(..., {credentials: 'include'})。
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    # PUT/DELETE 是 2026-08-24 为评分同步加的（PUT /api/ratings）。
+    # ⚠️ 只影响本地开发 —— 线上同源，这段中间件不参与。
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+
+# ── 账号系统的会话载体（2026-08-24）──────────────────────────────
+# ✅ **httpOnly cookie，不是 Authorization header**（Kevin 2026-08-24 定）。
+#    设计文档 §14 把这条挂成未决问题，理由是「前端在 Vercel、后端在 Render
+#    属跨站，cookie 要 SameSite=None; Secure 且要配 CORS credentials」——
+#    🚨 **那个前提已经不成立了**：2026-08-12 放弃 Render 之后，前端与 API
+#    同属一个 Vercel 项目、共用一个域名，线上是**同源**的；本地开发也由
+#    Vite 代理 /api → 8000，浏览器看到的同样是同源。⇒ 跨站 cookie 那整套
+#    麻烦消失，SameSite=Lax 就够。
+# ⚠️ 选 cookie 而不是 header 的实质理由：httpOnly 的 token **JS 读不到**，
+#    XSS 偷不走。放 localStorage 的 token 一次 XSS 就全丢。
+COOKIE_NAME = "anime_rec_session"
+# ⚠️ Vercel 运行时会注入 VERCEL=1。本地 http 上不能加 Secure，
+#    否则浏览器直接不存这个 cookie，表现为「登录成功但立刻又是未登录」。
+_COOKIE_SECURE = bool(os.environ.get("VERCEL"))
+
+
+def _set_session(response: Response, user_id: int) -> None:
+    response.set_cookie(
+        COOKIE_NAME,
+        auth.make_token(user_id),
+        max_age=int(auth.TOKEN_TTL.total_seconds()),
+        httponly=True,              # ⚠️ 见上，别为了「前端想读一下」去掉
+        samesite="lax",
+        secure=_COOKIE_SECURE,
+        path="/",
+    )
+
+
+def _current_user(request: Request) -> int | None:
+    """当前登录用户，未登录/token 失效返回 None。**不抛异常。**
+
+    ⚠️ 游客路径要靠它返回 None 走下去 —— 推荐/问卷/搜索对未登录用户
+       必须照常可用（设计文档：登录不是使用门槛）。
+    """
+    token = request.cookies.get(COOKIE_NAME)
+    if not token:
+        return None
+    try:
+        return auth.read_token(token)
+    except auth.AuthError:
+        return None
+
+
+def _require_user(request: Request) -> int:
+    """要求已登录，否则 401。
+
+    🚨 只用于**会花钱调模型**的端点（/ask、/find）。
+       2026-08-24 Kevin 定：零模型功能（推荐/问卷/打分/搜索）游客随便用，
+       要调 LLM 的功能需要账号 —— 这修订了设计文档那句「游客能用全部功能」，
+       理由是成本结构：问答每条至少两次模型调用（classify_intent + 生成），
+       而推荐链路全程零模型。
+    """
+    uid = _current_user(request)
+    if uid is None:
+        raise HTTPException(401, "问答功能需要登录后使用")
+    return uid
 
 
 @app.get(f"{API}/health")
@@ -222,6 +286,7 @@ def get_questionnaire(
             schemas.QuestionItem(
                 subject_id=it.subject_id, name=it.name, year=it.year,
                 done=it.done, form=it.form, replaced_from=it.replaced_from,
+                summary=it.summary,
             )
             for it in items
         ]
@@ -240,6 +305,7 @@ def get_questionnaire(
             schemas.QuestionItem(
                 subject_id=it.subject_id, name=it.name, year=it.year,
                 done=it.done, form=it.form, replaced_from=it.replaced_from,
+                summary=it.summary,
             )
             for it in fresh
         ][:n]
@@ -417,6 +483,205 @@ def anime_detail(subject_id: int) -> schemas.AnimeDetail:
     )
 
 
+# ══════════════════════════════════════════════════════════════
+# 账号系统（第 6 周，2026-08-24）
+# ══════════════════════════════════════════════════════════════
+# ⚠️ **推荐链路一行没改。** 加账号只是多了一个评分来源 —— 这正是第 2 节
+#    那条「评分随请求传入」铁律的兑现（设计文档「双轨会话」预言的就是这个）。
+#    /recommend 至今不知道评分来自 localStorage 还是 user_rating。
+
+
+def _guest_items(answers: list[schemas.Answer], source: str
+                 ) -> list[tuple[int, str, float | None, str]]:
+    """schemas.Answer → ratings 模块的元组形状。
+
+    ⚠️ **不在这里做 choice → 分数的映射。** 那个映射只属于
+       questionnaire.to_rating()，库里存的是原始选项（见 sql/010 的列注释）。
+    """
+    return [(a.subject_id, a.choice, a.score, source) for a in answers]
+
+
+def _auth_user_payload(c: psycopg.Connection, user_id: int) -> schemas.AuthUser:
+    with c.cursor() as cur:
+        cur.execute(
+            "SELECT email, created_at FROM app_user WHERE user_id = %s", (user_id,))
+        row = cur.fetchone()
+    if row is None:
+        # token 有效但账号已被删 —— 当作未登录处理，别 500。
+        raise HTTPException(401, "账号不存在")
+    email, created_at = row
+    return schemas.AuthUser(
+        user_id=user_id, email=email, created_at=created_at.isoformat(),
+        rating_count=len(ratings.rated_ids(c, user_id)),
+        quota=schemas.QuotaStatus(**quota.status(c, user_id)),
+    )
+
+
+@app.post(f"{API}/auth/register", response_model=schemas.AuthUser)
+def register(req: schemas.RegisterRequest, response: Response) -> schemas.AuthUser:
+    """注册。成功后直接种下会话 cookie —— 注册完还要再登录一次是纯粹的摩擦。
+
+    ⚠️ **邮箱先归一化再入库**（auth.normalize_email）。不归一化的话
+       `Kevin@X.com` 与 `kevin@x.com` 是两个账号，而用户认为是同一个 ——
+       数据库的 UNIQUE 约束拦的是字节相同，不是身份相同。
+    📌 MVP 不做邮箱验证（设计文档 §4 已定），所以 unique 只防重复注册，
+       不代表这个邮箱真属于注册者。已知缺口。
+    """
+    email = auth.normalize_email(req.email)
+    if not auth.valid_email(email):
+        raise HTTPException(422, "邮箱格式不正确")
+    try:
+        pw_hash = auth.hash_password(req.password)
+    except auth.AuthError as e:
+        raise HTTPException(422, str(e)) from e
+
+    with _conn() as c:
+        with c.cursor() as cur:
+            try:
+                cur.execute(
+                    "INSERT INTO app_user (email, password_hash) VALUES (%s, %s) "
+                    "RETURNING user_id",
+                    (email, pw_hash),
+                )
+            except psycopg.errors.UniqueViolation as e:
+                # ⚠️ 这里**必然会**泄露「该邮箱已注册」—— 注册接口没法不泄露，
+                #    否则用户不知道自己为什么注册不了。登录接口则相反，
+                #    必须模糊化（见 login）。
+                raise HTTPException(409, "该邮箱已注册") from e
+            user_id = cur.fetchone()[0]
+
+        # 游客转正：把 localStorage 里已有的评分带进来，不让用户白答一遍问卷。
+        if req.guest_ratings:
+            ratings.merge_guest(
+                c, user_id, _guest_items(req.guest_ratings, "questionnaire"))
+        payload = _auth_user_payload(c, user_id)
+
+    _set_session(response, user_id)
+    return payload
+
+
+@app.post(f"{API}/auth/login", response_model=schemas.AuthUser)
+def login(req: schemas.LoginRequest, response: Response) -> schemas.AuthUser:
+    """登录。
+
+    🚨 **「邮箱不存在」与「密码错误」必须报同一句话。** 分开报等于提供了
+       一个账号枚举接口：攻击者能批量试出哪些邮箱注册过本站。
+    ⚠️ 邮箱不存在时**也要做一次哈希校验**（对着一个假串），否则两条路径的
+       响应时间差几十毫秒，用时间差一样能枚举出账号 —— 消息一致但时间不一致，
+       等于没防。
+    """
+    email = auth.normalize_email(req.email)
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT user_id, password_hash FROM app_user WHERE email = %s",
+                (email,))
+            row = cur.fetchone()
+
+        if row is None:
+            # 时间侧信道对齐：走一次同样开销的校验再失败。
+            auth.verify_password(auth.DUMMY_HASH, req.password)
+            raise HTTPException(401, "邮箱或密码不正确")
+
+        user_id, pw_hash = row
+        if not auth.verify_password(pw_hash, req.password):
+            raise HTTPException(401, "邮箱或密码不正确")
+
+        with c.cursor() as cur:
+            cur.execute(
+                "UPDATE app_user SET last_login_at = now() WHERE user_id = %s",
+                (user_id,))
+            # argon2 参数升级过就顺手重算 —— 这是唯一手上有明文的时刻。
+            if auth.needs_rehash(pw_hash):
+                cur.execute(
+                    "UPDATE app_user SET password_hash = %s WHERE user_id = %s",
+                    (auth.hash_password(req.password), user_id))
+
+        # ⚠️ 合并规则是**云端为准、本地只补空缺**（DO NOTHING，不是覆盖）：
+        #    账号是跨设备的事实来源，localStorage 可能是很久以前在某台
+        #    机器上留下的，让它覆盖云端等于用旧数据洗掉新数据。
+        if req.guest_ratings:
+            ratings.merge_guest(
+                c, user_id, _guest_items(req.guest_ratings, "manual"))
+        payload = _auth_user_payload(c, user_id)
+
+    _set_session(response, user_id)
+    return payload
+
+
+@app.post(f"{API}/auth/logout")
+def logout(response: Response) -> dict:
+    """登出 = 删 cookie。
+
+    ⚠️ **服务端没有「吊销」这回事** —— JWT 是无状态的，那个 token 在过期前
+       始终有效。真要强制全体下线只有换 AUTH_SECRET 一条路（.env.example
+       记了这一点）。作品集项目上这个取舍是可接受的：加吊销名单意味着
+       每个请求多一次查库，而收益只在「token 被偷了」这个场景。
+    """
+    response.delete_cookie(COOKIE_NAME, path="/")
+    return {"ok": True}
+
+
+@app.get(f"{API}/auth/me", response_model=schemas.AuthUser | None)
+def me(request: Request) -> schemas.AuthUser | None:
+    """当前登录用户。**未登录返回 null 而不是 401。**
+
+    ⚠️ 前端每次进页面都会调它来判断登录态，未登录是**正常情况**不是错误。
+       做成 401 的话前端每次冷启动都会在控制台留一条红色报错，
+       久而久之没人再看控制台了。
+    """
+    uid = _current_user(request)
+    if uid is None:
+        return None
+    with _conn() as c:
+        return _auth_user_payload(c, uid)
+
+
+@app.get(f"{API}/ratings", response_model=schemas.RatingsResponse)
+def get_ratings(request: Request) -> schemas.RatingsResponse:
+    """该用户已保存的评分。⚠️ 形状与 /recommend 的请求体一致，前端直接转发。"""
+    uid = _current_user(request)
+    if uid is None:
+        raise HTTPException(401, "未登录")
+    with _conn() as c:
+        rows = ratings.list_for_user(c, uid)
+    return schemas.RatingsResponse(items=[
+        schemas.Answer(subject_id=r.subject_id, choice=r.choice, score=r.score)
+        for r in rows
+    ])
+
+
+@app.put(f"{API}/ratings", response_model=schemas.RatingsSyncResponse)
+def put_ratings(req: schemas.RatingsSyncRequest,
+                request: Request) -> schemas.RatingsSyncResponse:
+    """批量同步评分（前端防抖后调用，方案 B）。
+
+    ⚠️ `choice='skip'` 会**删除**已有行 —— 「没看过」用缺失表示
+       （设计文档 §4）。用户把「看过」改回「跳过」时那条旧评分必须消失，
+       留在库里就是一个错误的偏好信号。
+    """
+    uid = _current_user(request)
+    if uid is None:
+        raise HTTPException(401, "未登录")
+    with _conn() as c:
+        written, deleted = ratings.upsert_many(
+            c, uid, _guest_items(req.items, req.source))
+        total = len(ratings.rated_ids(c, uid))
+    return schemas.RatingsSyncResponse(
+        written=written, deleted=deleted, total=total)
+
+
+@app.delete(f"{API}/ratings")
+def delete_ratings(request: Request) -> dict:
+    """清空该用户的全部评分（前端「清空重答」）。"""
+    uid = _current_user(request)
+    if uid is None:
+        raise HTTPException(401, "未登录")
+    with _conn() as c:
+        n = ratings.delete_all(c, uid)
+    return {"deleted": n}
+
+
 def _off_topic_response(reason: str) -> schemas.AskResponse:
     """`llm.classify_intent()` 判"这不是动画相关的问题"时的统一回复。
 
@@ -472,7 +737,65 @@ def _find_response(route: str, reason: str, query: str,
 
 
 @app.post(f"{API}/ask", response_model=schemas.AskResponse)
-def ask(req: schemas.AskRequest) -> schemas.AskResponse:
+def ask(req: schemas.AskRequest, request: Request,
+        response: Response) -> schemas.AskResponse:
+    """流程 C 的**鉴权与配额外壳**。真正的四步管道在 `_ask_impl`。
+
+    🚨 **需要登录 + 每人 24 小时 10 条**（Kevin 2026-08-24 定）。
+       这修订了设计文档那句「游客能用全部功能」，理由是成本结构：
+       零模型的推荐链路游客随便用，而问答每条至少两次模型调用
+       （classify_intent 校验 + 生成），必须绑到账号上才能限流。
+
+    ⚠️ **为什么外壳与管道分成两个函数**：`_ask_impl` 里有十来个 return
+       分支（voice/season/find 回落、off_topic 短路、find_gate 判否…），
+       把配额记账塞进去意味着每个分支都要记得处理一次，漏一个就是
+       静默的配额错误。外壳只关心「进来扣一条、失败退一条」。
+
+    ⚠️ **扣费顺序是「先扣后退」而不是「先跑后记」。** 后者下并发发 20 条
+       能在计数之前全部跑完，配额形同虚设 —— 而那恰恰是要防的滥用。
+       代价是请求失败时会白扣，所以下面的 5xx 路径必须退还。
+    ⚠️ **只退服务端故障（5xx）。**「没认出作品」「离题被拦」都是正常业务
+       结果，照常计费 —— 否则无限问离题问题就能绕过配额。
+    """
+    user_id = _require_user(request)
+
+    # ⚠️ 独立的短事务：quota.reserve 会对 app_user 那一行加 FOR UPDATE 行锁，
+    #    而下面的管道要跑 10–45 秒。把锁攥在长事务里，同一用户的第二个请求
+    #    会干等到超时。with 块退出即 commit，锁立刻释放。
+    with _conn() as c:
+        try:
+            ask_id = quota.reserve(c, user_id, req.question)
+        except quota.QuotaExceeded as e:
+            raise HTTPException(
+                429,
+                f"24 小时内最多问 {quota.DAILY_LIMIT} 条，已用满。"
+                + (f"最早一条将在 {e.reset_at:%H:%M} 之后释放。" if e.reset_at else ""),
+            ) from e
+
+    try:
+        result = _ask_impl(req)
+    except HTTPException as e:
+        # 503（embedding / LLM 不可用）不该让用户白丢一条配额。
+        if e.status_code >= 500:
+            with _conn() as c:
+                quota.refund(c, ask_id)
+        raise
+    except Exception:
+        with _conn() as c:
+            quota.refund(c, ask_id)
+        raise
+
+    with _conn() as c:
+        # 回填实际走的分支：reserve 时还不知道会不会回落。
+        quota.set_route(c, ask_id, result.route)
+        st = quota.status(c, user_id)
+    # 让前端不用再单独查一次配额就能更新「今天还能问 N 条」。
+    response.headers["X-Quota-Remaining"] = str(st["remaining"])
+    response.headers["X-Quota-Limit"] = str(st["limit"])
+    return result
+
+
+def _ask_impl(req: schemas.AskRequest) -> schemas.AskResponse:
     """流程 C · 剧情问答。四步管道见 src/retrieve.py 的模块注释。
 
     ⚠️ **这是请求路径上第一个会调模型的端点**（前三周的推荐链路全程零模型）。
@@ -825,6 +1148,7 @@ def get_voice(
 
 @app.get(f"{API}/find", response_model=schemas.FindResponse)
 def get_find(
+    request: Request,
     q: str = Query(min_length=1, max_length=200),
     top_k: int = Query(default=find.TOP_K_DEFAULT, ge=1, le=20),
     include_nsfw: bool = False,
@@ -835,13 +1159,29 @@ def get_find(
        不调 rerank/LLM，实测延迟量级与 /search 接近（数百毫秒），不是
        /ask 的 10~45 秒。只用语义腿，不混 BM25——`scripts/eval_find.py`
        实测过 RRF 融合在转述类查询上是净负收益，见 src/find.py 的模块注释。
+
+    🚨 **同样需要登录且计入 24 小时配额**（2026-08-24）。它调模型，
+       且「找番」本来就是问答功能的一条分支（前端走的是 /ask?route=find）。
+       ⚠️ 不加限制的话这里就是绕过配额的后门：同一件事换个 URL 就免费了。
+    ⚠️ 与 /voice、/season 的区别正在于此 —— 那两条**真·零模型**（纯 SQL），
+       所以对游客照常开放。判据是「这个端点会不会花钱」，不是「它属不属于问答」。
     """
+    user_id = _require_user(request)
+    with _conn() as c:
+        try:
+            ask_id = quota.reserve(c, user_id, q, route="find")
+        except quota.QuotaExceeded as e:
+            raise HTTPException(
+                429, f"24 小时内最多问 {quota.DAILY_LIMIT} 条，已用满。") from e
+
     with _conn() as c:
         try:
             hits = find.find(c, q, top_k=top_k, include_nsfw=include_nsfw,
                              retries=retrieve.REQUEST_EMBED_RETRIES,
                              timeout=retrieve.REQUEST_EMBED_TIMEOUT)
         except embed.EmbedError as exc:
+            # 服务端故障，退还配额（与 /ask 同一条纪律）。
+            quota.refund(c, ask_id)
             raise HTTPException(503, f"向量检索不可用：{exc}") from exc
     return schemas.FindResponse(
         query=q,
