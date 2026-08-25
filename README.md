@@ -1,96 +1,129 @@
 # animetion_Recommender
 
-A preference-questionnaire-driven anime recommender, plus a grounded Q&A layer
-over a Chinese-language plot corpus. Rate what you've seen → the system learns
-your taste → it predicts how much you'll like this season's releases. Separately,
-ask about plots, voice actors or airing seasons, or describe a show you're trying
-to find.
+An anime recommendation service with a built-in question-answering assistant.
 
-Live at `https://animetion-recommender.vercel.app/` — frontend and API in one Vercel
-project, same origin.
+Users rate the shows they have already seen. From those ratings the system builds
+a profile of their taste and predicts how much they are likely to enjoy every
+other title in the library. A second, independent feature answers questions about
+plots, voice actors and broadcast seasons, or finds a show from a description —
+always citing the source text it drew on.
 
-> Design decisions, measurements and open questions live in [CLAUDE.md](CLAUDE.md) (Chinese).
-> This file is **status + how to run it**.
+**Live:** [animetion-recommender.vercel.app](https://animetion-recommender.vercel.app/)
+— the web interface and the API are served from a single Vercel project.
+
+> Design decisions, measurements and open questions are recorded in
+> [CLAUDE.md](CLAUDE.md) (Chinese). This document covers current status and setup.
 
 ---
 
-## What it does
+## Overview
+
+**Recommendation.** A short questionnaire produces a preference vector — a
+numeric summary of the user's taste — which is then compared against every title
+in the library. Three signals are combined: 308 curated genre tags, an *embedding*
+of each synopsis (a numeric representation of text, arranged so that similar
+descriptions sit close together), and staff and studio credits. No machine-learning
+model runs while a request is being served; all vectors are computed in advance,
+so a recommendation is arithmetic over stored numbers.
+
+**Question answering.** A single input box handles four kinds of question — plot,
+voice-actor filmography, broadcast season, and finding a show from a description.
+The request is dispatched by deterministic rules and then confirmed by one
+language-model call, which catches cases where the rules guessed wrong. Plot
+answers are grounded: the system retrieves passages from a Chinese-language corpus
+and instructs the model to answer only from them.
+
+**Accounts.** Sign-up uses a username rather than an email address, because the
+service has no way to send mail and therefore could not offer password recovery.
+Passwords are hashed with argon2; sessions are JSON Web Tokens held in an
+httpOnly cookie. Ratings sync to the account, and question answering is limited to
+ten questions per 24 hours.
+
+### Scale
 
 | | |
 |---|---|
-| **Recommend** | Questionnaire → preference vector → scoring over the whole library. Three signals fused: 308 genre tags, summary embeddings, staff/studio. **Zero model calls on the request path.** |
-| **Ask** | One input box, four branches — plot Q&A, voice-actor filmography, airing season, semantic show-finding. Routed by rules, then validated by one LLM call. |
-| **Accounts** | Username (no email — there is no mail capability), argon2 + JWT in an httpOnly cookie, rating sync, 10 questions per 24h. |
-
-```
-11,453 titles          candidate set, single source of truth — src/candidates.py
-132,056 chunks         plot corpus, covers 79.3% of titles / 97.3% popularity-weighted
-263,690 aliases        subject + character + person
-145,306 voice roles    8,215 voice actors
-19,381 spoiler flags   offline gating, from Moegirl's own heimu markup
-1,001 MB               Neon Postgres, paid plan
-329 tests              uv run --group etl python -m pytest tests/ -q
-```
-
-**The result the project was built to produce:** when the retrieved material
-actually contains the answer, the model answers correctly **93.8%** of the time —
-but the material contains the answer only **50.0%** of the time. The bottleneck is
-retrieval and corpus coverage, not generation. Two rounds of corpus work moved
-that second number from 30.8% to 50.0%. Full report:
-[docs/week5-eval-report.md](docs/week5-eval-report.md).
-
-It also settled the premise the project was pitched on. 142 titles had an
-all-zero tag vector — mostly Western and older Chinese animation, whose official
-genre tags are far sparser — so tag cosine could **never** retrieve them.
-Embeddings recovered **131 of them (92%)**. The nearest neighbours of *Havoc in
-Heaven* went from modern web-novel adaptations (its only tags being `玄幻` +
-`小说改`) to *The Golden Monkey Defeats the Demon*, *Journey to the West* and
-*Ginseng Fruit* — all Shanghai Animation Film Studio.
+| 11,453 | titles in the candidate set, defined in `src/candidates.py` |
+| 132,056 | corpus passages, covering 79.3% of titles (97.3% weighted by popularity) |
+| 263,690 | aliases across titles, characters and people |
+| 145,306 | voice-acting credits, covering 8,215 voice actors |
+| 19,381 | passages flagged as spoilers and filtered before retrieval |
+| 1,001 MB | Neon Postgres database |
+| 329 | automated tests |
 
 ---
 
-## What's next
+## Results
 
-Six items, none blocking the others.
+The project exists to measure a system of this kind, not merely to demonstrate
+one. The central finding separates two failure modes that are usually reported as
+a single accuracy number:
 
-| Item | Where it stands |
-|---|---|
-| **Quarterly update** | Refreshing existing titles is nearly free — the pipeline is idempotent, skips unchanged rows by md5, and already stores Moegirl's `lastrevid`. The blocker is admission: `favorite.done >= 50` keeps new shows out by construction. Measured: latest `air_date` is 2026-09-11, only 2 titles air in the future, and all 6 titles with `air_year >= 2027` have **no `air_date` at all** — so an "airs within N months" rule has to handle the NULL. Decide the admission rule (it changes the candidate set) and the tag/staff vocabulary policy first. |
-| **Information-gain question selection** | Questions are picked for diversity (MMR) today. Next is picking the question whose answer most reduces uncertainty, so ten answers buy more than they do now. |
-| **Detail page** | `GET /api/anime/{id}` has served since week 2; no frontend page calls it. |
-| **English support** | Season routing already handles English. Three gaps: voice triggers are Chinese-only; `MENTION_MAX = 16` < `fullmetalalchemist` (18); and **14 of 33 common English words collide with real aliases** (`protagonist`, `comedy`, `school`), so descriptive English resolves to some title and never reaches show-finding. The corpus is Chinese, so measure the cross-language penalty **first** — the 150-question auto-annotated eval set translated to English is a clean A/B and nearly free. |
-| **Episode synopses** | The dump carries **108,835 episode descriptions** across 10,630 titles, none of it loaded. Would answer "what happens in episode 12", which currently fails outright. |
-| **Voice actors as a recommendation feature** | `staff_vec` has directors, music and studios but **zero voice-actor credits** — they need a two-hop join through `subject-characters` + `person-characters`. The data exists (`voice_role`). Adding it changes the vocabulary size, so `sql/006`'s column width and `staffvec.DIM` move together and the library gets recomputed. |
+> When the retrieved passages contain the answer, the model answers correctly
+> **93.8%** of the time. The passages contain the answer only **50.0%** of the
+> time.
 
-| Week | Content | Status |
+The weak point is therefore retrieval and corpus coverage, not text generation.
+Two rounds of corpus work raised that second figure from 30.8% to 50.0%. The full
+evaluation is in [docs/week5-eval-report.md](docs/week5-eval-report.md).
+
+A second result confirmed the premise the project was built on. 142 titles carried
+no usable genre tags at all — predominantly Western and older Chinese animation,
+for which the source database's tags are far sparser — and tag-based similarity
+could never retrieve them. Adding synopsis embeddings recovered **131 of those 142
+(92%)**. For *Havoc in Heaven*, the nearest neighbours changed from unrelated
+modern web-novel adaptations to *The Golden Monkey Defeats the Demon*, *Journey to
+the West* and *Ginseng Fruit* — all works from the same studio and tradition.
+
+---
+
+## Status
+
+| Stage | Content | State |
 |---|---|---|
-| 1–3 | Data layer · P0 scoring · questionnaire · deploy · embeddings · P1 fusion | ✅ |
-| 4 | Moegirl corpus · character corpus · corpus → Chinese · retrieval pipeline | ✅ |
-| 5 | **Offline evaluation** | ✅ |
-| 5.5 | Parser fixes · character pages · voice-actor casting | ✅ |
-| 6 | Accounts ✅ · frontend ✅ · information-gain selection ⬜ · quarterly sync ⬜ | 🔄 |
+| 1–3 | Data layer, scoring, questionnaire, deployment, embeddings, signal fusion | Complete |
+| 4 | Corpus collection, translation to Chinese, retrieval pipeline | Complete |
+| 5 | Offline evaluation | Complete |
+| 5.5 | Parser corrections, character pages, voice-acting data | Complete |
+| 6 | Accounts and web interface complete; question selection and quarterly sync outstanding | In progress |
+
+### Planned work
+
+Six items, none of which blocks the others.
+
+| Item | Current position |
+|---|---|
+| **Quarterly update** | Refreshing existing titles is close to free: the pipeline is idempotent and skips unchanged rows. The obstacle is admission. New shows are excluded by the `favorite.done >= 50` popularity threshold that guards data quality. The library's latest broadcast date is 2026-09-11, only two titles are scheduled in the future, and all six titles listed for 2027 or later carry no broadcast date at all — so any "airing within N months" rule must handle the missing value. The admission rule and the tag vocabulary policy are decisions to settle before writing code. |
+| **Information-gain question selection** | Questions are currently selected for diversity. Selecting instead by expected information gain would make a fixed number of answers more informative. |
+| **Detail page** | The endpoint `GET /api/anime/{id}` has been available since stage 2; no page in the web interface calls it. |
+| **English-language support** | Broadcast-season queries already accept English. Three gaps remain: voice-actor phrasing is recognised only in Chinese; the maximum recognised title length is shorter than some English titles; and 14 of 33 common English words collide with genuine aliases, so an English description resolves to an unintended title. Because the corpus is Chinese, the cross-language retrieval penalty should be measured before an approach is chosen; translating the existing 150-question evaluation set provides that measurement at almost no cost. |
+| **Episode synopses** | The source archive contains 108,835 episode descriptions across 10,630 titles, none of which are loaded. They would answer per-episode questions, which currently fail. |
+| **Voice actors as a recommendation signal** | The staff vector covers directors, composers and studios but no voice actors, which require a two-step join through character records. The data is already present from the question-answering feature. Adding it changes the vocabulary size and therefore requires recomputing the library. |
 
 ---
 
-## Stack
+## Architecture
 
 | Layer | Choice |
 |---|---|
-| Data | Python 3.12 · orjson · [bgm-tv-wiki](https://github.com/bangumi/wiki-parser-py) |
-| Database | Neon Postgres 18.4 + pgvector 0.8.1 (`us-east-2`) |
-| Tokenization | jieba — Neon can't install `zhparser`, so BM25 needs pre-tokenizing in Python |
-| Embeddings | Qwen3-Embedding-0.6B · `halfvec(1024)` — **locked, never swapped** |
-| Reranking | `BAAI/bge-reranker-v2-m3` — swappable; its output is a relative ordering |
-| Generation | Qwen3-14B (answers) · Qwen3-8B (intent, voice-actor phrasing) |
-| Auth | argon2id + PyJWT in an httpOnly cookie, same origin |
-| Backend | FastAPI on Vercel serverless · Frontend: React + TS + Vite + Tailwind |
+| Data processing | Python 3.12, orjson, [bgm-tv-wiki](https://github.com/bangumi/wiki-parser-py) |
+| Database | Neon Postgres 18.4 with pgvector 0.8.1 |
+| Chinese tokenization | jieba, applied before insertion — the database cannot install a Chinese tokenizer |
+| Embeddings | Qwen3-Embedding-0.6B, stored as `halfvec(1024)` |
+| Reranking | `BAAI/bge-reranker-v2-m3`, which reorders a retrieved shortlist more accurately than the initial search |
+| Generation | Qwen3-14B for answers; Qwen3-8B for intent classification and phrasing |
+| Authentication | argon2id with JSON Web Tokens in an httpOnly cookie |
+| Backend | FastAPI on Vercel serverless functions |
+| Frontend | React, TypeScript, Vite and Tailwind |
 
-⚠️ **The embedding model is the one component that can never fall back to another
-provider.** Its output is a coordinate relative to the vectors already stored;
-mixing two encoders yields a plausible-looking, correctly sorted list of noise,
-with no error raised. The LLM and the reranker have no such constraint — their
-outputs are text and orderings, used once and discarded. If embeddings became
-unavailable, the correct degradation is BM25, not a different encoder.
+**The embedding model is fixed and cannot be substituted.** Its output is a set of
+coordinates that is only meaningful relative to the vectors already stored. If a
+second encoder were introduced, the resulting comparisons would be meaningless,
+yet the system would return a correctly sorted, entirely plausible list and raise
+no error. The language model and the reranker carry no such constraint: their
+output is text or an ordering, used once and discarded. Should the embedding
+service become unavailable, the correct fallback is keyword search, not a
+different encoder.
 
 ---
 
@@ -99,17 +132,17 @@ unavailable, the correct degradation is BM25, not a different encoder.
 ### 1. Install
 
 ```bash
-uv sync                       # runtime deps only — exactly what the deployed function needs
-uv sync --group etl           # + bgm-tv-wiki / tqdm / lxml — needed by scripts/
-uv sync --group api --group etl --group dev   # everything, for development
+uv sync                       # runtime dependencies only — what the deployed function needs
+uv sync --group etl           # adds bgm-tv-wiki, tqdm, lxml — required by scripts/
+uv sync --group api --group etl --group dev   # full development environment
 ```
 
-⚠️ **The main dependency group is the deployment manifest.** Vercel's Python
-runtime finds `pyproject.toml` + `uv.lock` and installs *that group* — a
-`requirements.txt` is ignored entirely. Anything on the request path (`httpx`,
-`argon2-cffi`, `pyjwt`) must live there or production dies at module-level import
-and takes the whole ASGI app down; anything ETL-only must stay in a group or it
-lands in the function bundle.
+The main dependency group serves as the deployment manifest. Vercel's Python
+runtime reads `pyproject.toml` and `uv.lock` and installs that group; a
+`requirements.txt` file is ignored. Any package used while serving a request must
+be in the main group, or the application fails at import time in production.
+Packages used only by data-processing scripts must stay in a named group, or they
+are bundled into the deployed function.
 
 ### 2. Configure
 
@@ -117,122 +150,135 @@ lands in the function bundle.
 cp .env.example .env
 ```
 
-- `DATABASE_URL_DIRECT` — DDL and bulk loading. Direct connection, avoiding the PgBouncer / psycopg3 prepared-statement conflict.
-- `DATABASE_URL` — the deployed app; uses the pooler. Optional locally.
-- `SILICONFLOW_API_KEY` — embeddings, reranking and generation share one key.
-- `AUTH_SECRET` — session signing, ≥32 chars. **The app refuses to start without it rather than falling back to a default**, which would let a misconfigured deploy issue normal-looking tokens signed with a publicly known key.
-- `CORS_ORIGINS` — **local development only.** Production is same-origin, so the middleware never runs.
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL_DIRECT` | Schema changes and bulk loading. Uses a direct connection, avoiding a conflict between the connection pooler and prepared statements. |
+| `DATABASE_URL` | The deployed application; uses the pooler. Optional locally. |
+| `SILICONFLOW_API_KEY` | Embeddings, reranking and generation share a single key. |
+| `AUTH_SECRET` | Session signing, minimum 32 characters. The application refuses to start without it rather than falling back to a default, which would let a misconfigured deployment issue valid-looking tokens signed with a publicly known key. |
+| `CORS_ORIGINS` | Local development only. Production is same-origin, so the middleware never runs. |
 
-⚠️ **Deploying needs exactly three: `DATABASE_URL`, `SILICONFLOW_API_KEY`,
-`AUTH_SECRET`.** Do not set `DATABASE_URL_DIRECT` in production — the pool
-resolves `DATABASE_URL or DATABASE_URL_DIRECT`, so a typo in the first silently
-falls back to a direct connection: the service starts, looks fine, and quietly
-exhausts Neon's connection limit. Each has its own check — `/api/health` returning
-`catalog_size` proves the database, registering proves `AUTH_SECRET`, asking a
-plot question proves the API key.
+Deployment requires exactly three: `DATABASE_URL`, `SILICONFLOW_API_KEY` and
+`AUTH_SECRET`. `DATABASE_URL_DIRECT` should not be set in production, because the
+connection pool resolves `DATABASE_URL or DATABASE_URL_DIRECT` — with both
+present, a typing error in the first falls back silently to a direct connection:
+the service starts, appears healthy, and gradually exhausts the database's
+connection limit. Each variable has an independent check: `/api/health` returning
+a catalogue size confirms the database, registering an account confirms
+`AUTH_SECRET`, and asking a plot question confirms the API key.
 
-### 3. Fetch the dump
+### 3. Obtain the source data
 
 ```bash
-# Latest URL comes from aux/latest.json, which includes a sha256
+# The current archive URL and its checksum come from aux/latest.json
 curl -sL https://raw.githubusercontent.com/bangumi/Archive/master/aux/latest.json
 mkdir -p data/raw && curl -L -o data/raw/dump.zip "<browser_download_url>"
-sha256sum -c <<< "<digest>  data/raw/dump.zip"    # always verify
+sha256sum -c <<< "<digest>  data/raw/dump.zip"
 python -c "import zipfile; zipfile.ZipFile('data/raw/dump.zip').extractall('data/raw/dump')"
 ```
 
-~410 MB compressed, ~1.8 GB extracted.
+Approximately 410 MB compressed and 1.8 GB extracted.
 
-### 4. Build the database, in this order
+### 4. Build the database
+
+The order matters.
 
 ```bash
 uv sync --group etl
-for f in sql/0*.sql; do psql < "$f"; done   # 001 tables … 007 corpus, 009 voice, 010 accounts
+for f in sql/0*.sql; do psql < "$f"; done   # tables, corpus, voice roles, accounts
 
-uv run python scripts/build_id_map.py        # network; downloads bangumi-data
+uv run python scripts/build_id_map.py        # network access required
 uv run python scripts/load_profiles.py
 uv run python scripts/backfill_staff.py
-uv run python scripts/backfill_anilist.py    # network; ~125 requests
+uv run python scripts/backfill_anilist.py    # network access, roughly 125 requests
 uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py
-uv run python scripts/build_embeddings.py    # needs SILICONFLOW_API_KEY; ~12 min / ¥0.19
+uv run python scripts/build_embeddings.py    # requires SILICONFLOW_API_KEY; about 12 minutes
 uv run python scripts/build_staff_vectors.py
-uv run --group ml python scripts/build_clusters.py       # mmr_rank + cluster_id
-uv run --group etl python scripts/build_voice_roles.py   # ~3 min, no API calls
+uv run --group ml python scripts/build_clusters.py
+uv run --group etl python scripts/build_voice_roles.py   # about 3 minutes, no API calls
 
-# ── corpus: the one large wall-clock cost ───────────────────────
-uv run --group etl python scripts/fetch_moegirl.py       # ~4 h (7 s/request — do not lower)
+# Corpus collection — the one substantial time cost
+uv run --group etl python scripts/fetch_moegirl.py       # about 4 hours; the 7-second
+                                                         # request interval is deliberate
 uv run --group etl python scripts/parse_moegirl.py
 uv run --group etl python scripts/build_plot_chunks.py
-uv run --group etl python scripts/build_char_chunks.py   # dump character bios, no fetching
+uv run --group etl python scripts/build_char_chunks.py
 uv run --group etl python scripts/extract_char_links.py --sizes
-uv run --group etl python scripts/fetch_char_pages.py --top 1000   # ~10 h, resumable
+uv run --group etl python scripts/fetch_char_pages.py --top 1000   # about 10 hours, resumable
 uv run --group etl python scripts/parse_moegirl.py --kind character
 uv run --group etl python scripts/build_plot_chunks.py --kind character
 
-psql -c 'VACUUM FULL anime_profile'          # reclaim MVCC bloat from the bulk UPDATEs
-uv run --group etl python -m pytest tests/ -q     # acceptance: 329 tests
+psql -c 'VACUUM FULL anime_profile'
+uv run --group etl python -m pytest tests/ -q
 ```
 
-Every script is idempotent. **The last two steps are not optional** — skipping
-`VACUUM FULL` roughly doubles the apparent database size, and skipping the tests
-means nobody notices if `tag_vec` was never populated: scoring then returns an
-empty list *silently*. `GET /health` reports `with_tag_vec` for the same reason.
+Every script is idempotent and safe to re-run. The final two steps are not
+optional. Skipping the vacuum roughly doubles the apparent size of the database,
+and skipping the tests leaves a missing tag vector undetected — in which case
+scoring returns an empty list without raising an error. The `/api/health` endpoint
+reports the same coverage figure for this reason.
 
-⚠️ **Run tests with `--group etl`.** 28 of them call `pytest.importorskip("lxml")`
-and are **skipped rather than failed** without it — a green run can mean they
-never executed. Check the summary line for `skipped`.
+Run the test suite with `--group etl`. Twenty-eight tests depend on `lxml` and are
+skipped rather than failed when it is absent, so a passing run may simply mean
+they never executed; check the summary line for skipped tests.
 
-⚠️ **Two caches, very different replacement costs.** `data/interim/embed_cache/`
-(~50 MB, not in git) costs ¥0.19 and twelve minutes to rebuild — but copying it
-from an old machine makes the rebuild free and bit-identical, which is the only
-way two machines can build the same library when the encoder is a remote API.
-`data/interim/translate_cache/` (50 MB) is the **only** copy of 43,932
-translations; losing it means re-translating for about eight hours. Back that one
-up separately.
+Two caches are kept on disk, with very different replacement costs. The embedding
+cache (`data/interim/embed_cache/`, about 50 MB, not in version control) rebuilds
+in a few minutes; copying it between machines makes that rebuild free and
+bit-for-bit identical, which is the only way two machines can produce the same
+library when the encoder is a remote service. The translation cache
+(`data/interim/translate_cache/`) is the only copy of 43,932 translations, worth
+roughly eight hours of re-translation, and should be backed up separately.
 
 ### 5. Run
 
 ```bash
-uv run uvicorn server.main:app --reload      # API, docs at /api/docs
-cd web && npm install && npm run dev         # frontend :5173, /api proxied to :8000
+uv run uvicorn server.main:app --reload      # API, documentation at /api/docs
+cd web && npm install && npm run dev         # web interface on port 5173
 uv run --group etl python -m pytest tests/ -q
 uv run ruff check src/ scripts/ server/ tests/
 cd web && npx tsc --noEmit && npm run lint
 ```
 
-> **On Windows:** prefix with `PYTHONIOENCODING=utf-8` for scripts that print Chinese.
+On Windows, prefix Python commands with `PYTHONIOENCODING=utf-8` for scripts that
+print Chinese text to the console.
 
 ---
 
 ## API
 
-Everything lives under `/api`. **The recommendation path is stateless** — ratings
-travel with the request; guests (localStorage) and signed-in users feed the same
-entry point, and the account layer sits alongside that path, not inside it.
+All routes are served under `/api`.
+
+The recommendation path is stateless: ratings are supplied with each request and
+nothing is written to the server. Anonymous visitors and signed-in users enter
+through the same code path, and the account layer sits alongside it rather than
+within it.
 
 | Endpoint | Purpose | Model calls |
 |---|---|---|
-| `GET /health` | Liveness + five backfill-coverage fields + tokenizer fingerprint | — |
-| `GET /questionnaire` | Pick questions | — |
-| `POST /recommend` | Score | — |
-| `GET /search` | Title/alias search — BM25, pg_trgm fallback for typos | — |
-| `GET /anime/{id}` | Detail | — |
+| `GET /health` | Liveness, data-coverage figures and tokenizer fingerprint | — |
+| `GET /questionnaire` | Select questions | — |
+| `POST /recommend` | Score the library against a set of ratings | — |
+| `GET /search` | Search by title or alias, with a fuzzy fallback for misspellings | — |
+| `GET /anime/{id}` | Title detail | — |
 | `GET /season` | Browse a broadcast season | — |
-| `GET /related` | Other works by the same author/director/studio | — |
-| `GET /voice` | What roles a voice actor has played | — |
-| `GET /find` | Semantic show-finding from a description | 1 embedding |
-| `POST /ask` | **Single entry point** — plot Q&A / voice / season / find | 2+ |
+| `GET /related` | Other works by the same author, director or studio | — |
+| `GET /voice` | Roles played by a given voice actor | — |
+| `GET /find` | Find a title from a free-text description | 1 embedding |
+| `POST /ask` | Single entry point; dispatches to the four question types | 2 or more |
 
-Accounts: `POST /auth/register|login|logout`, `GET /auth/me`,
-`PUT /auth/username|password`, `GET|PUT|DELETE /ratings`, `GET /ratings/detail`.
+Account routes: `POST /auth/register`, `/auth/login`, `/auth/logout`;
+`GET /auth/me`; `PUT /auth/username`, `/auth/password`;
+`GET`, `PUT`, `DELETE /ratings`; `GET /ratings/detail`.
 
-⚠️ **The line between "open to guests" and "needs an account" is whether the
-endpoint spends money, not whether it looks like Q&A.** `/voice` and `/season` are
-pure SQL and stay open; `/find` makes one embedding call and still requires an
-account, because leaving it open is a free side door around the quota.
+The boundary between anonymous and authenticated access is determined by cost,
+not by resemblance to question answering. `/voice` and `/season` are ordinary
+database queries and remain open. `/find` makes a single embedding call and
+requires an account, because leaving it open would provide a cost-free route
+around the quota.
 
-Clients send the **answer choice**, not a computed score:
+Clients submit the user's **choice**, not a computed score:
 
 ```json
 {"answers": [{"subject_id": 243916, "choice": "seen", "score": 9},
@@ -240,45 +286,44 @@ Clients send the **answer choice**, not a computed score:
  "mode": "all", "rank_by": "blend", "top_k": 10}
 ```
 
-The choice → (score, confidence) mapping lives in one place server-side; letting
-the client compute it would duplicate it into TypeScript, where drift is silent.
-The same rule is why the database stores the *choice* rather than the derived
-score.
+The mapping from choice to score and confidence is defined once, on the server.
+Computing it in the client would duplicate the mapping into TypeScript, where any
+divergence would degrade recommendations silently. The same reasoning is why the
+database stores the choice rather than the derived score.
 
 ---
 
-## Layout
+## Project layout
 
 ```
 src/
-  candidates.py    Candidate-set criteria — single source of truth
-  tag_rules.py     Tag classification + synonym map + import-time self-check
-  tagvec.py        The one implementation of the tag vector (log1p × idf × L2)
-  recommend.py     In-memory scoring — offline evaluation
-  recommend_sql.py Postgres scoring — online; must stay equivalent to the above
-  questionnaire.py Question selection + answer→rating mapping
-  textproc.py      jieba tokenization + dictionary fingerprint
-  embed.py         The only definition of the embedding model — locked, fingerprinted
-  retrieve.py      Retrieval pipeline + entity-resolution state machine. Read-only
-  rerank.py        Reranker client — swappable, unlike embed.py
-  llm.py           Generation, intent classification, prompts, config fingerprint
-  router.py        Intent dispatch — pure functions, no model, no database
-  find.py / voice.py / related.py     Show-finding · casting · related works
-  auth.py / ratings.py / quota.py     Accounts · rating sync · Q&A quota
-server/            FastAPI app — every route under /api
-web/               Vite + React + Tailwind (same Vercel project)
-  session.tsx      The single entry point for session + ratings — see below
-api/index.py       Vercel entry point — this directory must hold nothing else
+  candidates.py     Candidate-set criteria — the single source of truth
+  tag_rules.py      Tag classification, synonym mapping, import-time self-check
+  tagvec.py         The one implementation of the tag vector
+  recommend.py      In-memory scoring, used by the offline evaluation
+  recommend_sql.py  Database scoring, used online; must remain equivalent
+  questionnaire.py  Question selection and answer-to-rating mapping
+  textproc.py       Tokenization and dictionary fingerprinting
+  embed.py          The sole definition of the embedding model
+  retrieve.py       Retrieval pipeline and entity resolution; read-only
+  rerank.py         Reranker client
+  llm.py            Generation, intent classification, prompts, configuration fingerprint
+  router.py         Intent dispatch — pure functions, no model, no database access
+  find.py, voice.py, related.py    Show-finding, casting, related works
+  auth.py, ratings.py, quota.py    Accounts, rating sync, question quota
+server/             FastAPI application
+web/                React frontend
+  session.tsx       The single entry point for session state and ratings
+api/index.py        Vercel entry point; this directory must contain nothing else
 sql/ scripts/ tests/
 ```
 
-🚨 **`web/src/session.tsx` is the file to read first on the frontend.** Components
-above it don't know whether the user is signed in — they receive
-`{answers, setAnswer}`, and that module decides whether a rating lands in
-localStorage or syncs to the account. It's the frontend counterpart of the
-server-side rule that ratings travel with the request. The moment a component
-writes its own `if (user) … else …`, the rule breaks in several places at once,
-each drifting separately.
+`web/src/session.tsx` is the first file to read on the frontend. Components above
+it are unaware of whether a user is signed in; they receive a ratings object and
+a setter, and that module decides whether a rating is stored locally or synced to
+an account. It is the frontend counterpart of the server-side rule that ratings
+travel with the request. If a component begins testing for a signed-in user
+itself, the rule is broken in several places at once, each diverging separately.
 
 ---
 
@@ -286,164 +331,154 @@ each drifting separately.
 
 ```
 type == 2                                    # anime
-AND has an air year                          # falls back to infobox when date is empty
-AND meta_tags ∩ {TV, WEB, Movie, OVA} != ∅   # drops shorts and untagged doujin/MV
-AND favorite.done >= 50                      # quality floor
+AND has a broadcast year                     # falls back to the infobox when the date is empty
+AND meta_tags ∩ {TV, WEB, Movie, OVA} != ∅   # excludes shorts and untagged fan works
+AND favorite.done >= 50                      # quality threshold
 → 11,453 titles
 ```
 
-Defined in [src/candidates.py](src/candidates.py) — **to change the criteria, edit
-only that file.** `done >= 50` zeroes out three data-quality problems at once (no
-tags, no score, nobody watched it). It is also why new shows can't enter the
-library, which is the open decision behind the quarterly update above.
+Defined in [src/candidates.py](src/candidates.py); the criteria should be changed
+only in that file. The threshold of 50 completed viewings removes three
+data-quality problems simultaneously: titles with no tags, no rating, and no
+audience. It is also the reason new shows cannot enter the library, which is the
+open decision behind the quarterly update described above.
 
 ---
 
-## Why not a warm process
+## License
 
-Scoring (an 11,453 × 308 matrix, one matmul per request) wants a long-lived
-process. Serverless has none: rebuilding the matrix per request costs 2.6 MB of
-transfer and 1.31 s, against 12 ms of actual scoring. Counter-intuitively, **low
-traffic makes cold starts worse** — sparse traffic means most requests hit a cold
-container. So the cosine moved into Postgres: per request we fetch only the works
-the user rated (~70 ms, almost all round-trip) and let pgvector score 11,311 rows,
-which measures at **≈ 0 ms**.
-
-The cost is **two scoring implementations** — SQL online, NumPy for the offline
-leave-one-out evaluation. Equivalence is enforced by construction, not discipline:
-`anime_profile.tag_vec` is the only definition of the vectors (both paths read the
-same numbers, verified bit-identical), and
-[tests/test_parity.py](tests/test_parity.py) compares the two paths item by item
-across every mode and flag combination. That second check immediately caught a
-missing tie-break in the SQL recall pool: a great many titles are *exactly*
-orthogonal to a given preference vector, so the pool is one large tie — the two
-paths were recalling **different candidates** while both looked entirely
-plausible.
-
----
-
-## Gotchas
-
-**Chinese BM25 can't use Postgres `tsvector` directly.** Built-in tokenizers treat a whole Chinese sentence as one token, and Neon can't install `zhparser`. Text is pre-tokenized with jieba; indexing and querying must use the same tokenizer *and* the same dictionary or recall collapses silently, so the app verifies a dictionary fingerprint before serving.
-
-**The `alias` unique constraint needs `NULLS NOT DISTINCT`.** Either `subject_id` or `character_id` is always NULL, and Postgres treats NULLs as distinct by default — without it the constraint is dead for every row. It recurred later: voice-actor rows have *both* ids NULL, so `person_id` had to join the constraint or same-named actors would silently drop.
-
-**A serverless pool needs `check=ConnectionPool.check_connection`.** Neon reclaims idle connections and psycopg's pool can't tell; the next request gets a dead socket and 500s. `pg_terminate_backend` does **not** reproduce it — that sends a RST, visible at once — you have to let a connection idle out for real.
-
-**"The answer isn't in the material" often means the list of material is incomplete.** A title's own Bangumi summary — the most authoritative answer to "what is this about" — was never in the retrieval pool. Separately, the evaluation sheet rendered only retrieved chunks, so injected material was invisible to the grader, who scored sourced answers as hallucinations. Ask whether the list is complete before asking why the answer isn't in it.
-
-**Metrics drift out from under their own definition.** The evaluation scored "answered without a retrieval hit" as hallucination. A later prompt change deliberately turned bare refusals into grounded partial answers — the hallucination rate went 22.2% → 84.6% while, reading all 26 cases, **not one was fabricated**. Nothing about the number itself looked wrong.
-
-**Rules beat tuned thresholds when the score is noisy.** Reranker scores carry ~1e-3 of run-to-run noise and opening/ending-theme chunks legitimately score 0.003–0.028, so no absolute floor separates them from junk. Reserving a seat for the best song chunk fixed 5 of 7 failing questions at +0.09 chunks of context; lowering the floor fixed 4 and cost +3.44. **38× cheaper, and it doesn't drift.**
-
-**Widening the candidate set requires re-auditing the rules.** Extending from 2011+ to all years surfaced 50+ new leaks at once — veteran directors, older IPs, traditional-Chinese variants (`裡番`/`里番`), nostalgia meta-tags. A different era means a different vocabulary.
-
-**Anything under `api/` becomes its own Vercel function.** The application package lives in `server/`, with a single entry file in `api/`. Putting `schemas.py` there fails the build.
+See [LICENSE](LICENSE).
 
 ---
 ---
 
 # animetion_Recommender（中文）
 
-基于偏好问卷的动画推荐系统，外加一层建立在中文剧情语料之上的问答。
-给看过的番打分 → 系统学习口味 → 预测当季新番匹配度；
-另一条线是问剧情、问声优、问档期，或者描述一下想找的番。
+一个动画推荐服务，并内置了问答助手。
 
-已上线：`animetion-recommender.vercel.app` —— 前端与 API 同一个 Vercel 项目、同源。
+用户为看过的作品评分，系统据此建立口味画像，预测他对库中其余每一部作品的
+喜好程度。另一条独立的功能线负责回答剧情、声优、播出档期方面的问题，
+或根据一段描述找出对应的作品，并且始终标明依据的原文出处。
 
-> 设计决策、实测数据与未决问题见 [CLAUDE.md](CLAUDE.md)。本文档只讲**现状**和**怎么跑起来**。
+**已上线：**[animetion-recommender.vercel.app](https://animetion-recommender.vercel.app/)
+—— 网页界面与 API 由同一个 Vercel 项目提供。
+
+> 设计决策、实测数据与未决问题记录在 [CLAUDE.md](CLAUDE.md)。本文档说明当前状态与部署方式。
 
 ---
 
-## 它能做什么
+## 功能概览
+
+**推荐。** 一份简短的问卷会生成偏好向量 —— 用户口味的数值化描述 ——
+再拿它与库中每一部作品比对。三种信号被融合在一起：308 个经过清洗的题材标签、
+每部作品简介的 *embedding*（文本的数值表示，使意思相近的描述在数值上彼此靠近），
+以及制作人员与公司信息。**处理请求的过程中不运行任何模型**：
+所有向量都已预先算好，一次推荐只是对存储数值做算术。
+
+**问答。** 一个输入框处理四类问题 —— 剧情、声优配役、播出档期，
+以及根据描述找番。请求先由确定性的规则分派，再由一次语言模型调用复核，
+以拦下规则判断失误的情况。剧情类回答是有依据的：系统先从中文语料中检索段落，
+再要求模型只依据这些段落作答。
+
+**账号。** 注册使用用户名而非邮箱，因为本服务没有发信能力，也就无法提供密码找回。
+密码以 argon2 哈希存储，会话是放在 httpOnly cookie 中的 JSON Web Token。
+评分会同步到账号，问答限制为每 24 小时 10 条。
+
+### 规模
 
 | | |
 |---|---|
-| **推荐** | 问卷 → 偏好向量 → 全库打分。三路信号融合：308 个题材 tag、简介 embedding、staff/studio。**请求路径上零模型调用。** |
-| **问答** | 一个输入框，四条分支 —— 剧情问答、声优配役、档期浏览、语义找番。先按规则分派，再过一次 LLM 意图校验。 |
-| **账号** | 用户名（不收邮箱 —— 本站没有发信能力），argon2 + httpOnly cookie 里的 JWT，评分同步，24 小时 10 条问答配额。 |
-
-```
-11,453 部     候选集，唯一事实来源 —— src/candidates.py
-132,056 条    剧情语料，覆盖作品 79.3% / 热度加权 97.3%
-263,690 行    别名：作品 + 角色 + 人物
-145,306 条    声优配役，涉及 8,215 位声优
-19,381 条     剧透标注，离线门控，来自萌娘自己的 heimu 标记
-1,001 MB      Neon Postgres，付费计划
-329 项测试     uv run --group etl python -m pytest tests/ -q
-```
-
-**这个项目要产出的核心结论：资料里确实有答案时，模型答对率 93.8%；
-而资料里有答案的只有 50.0%。** 瓶颈在检索与语料覆盖，不在生成。
-两轮语料改动把后一个数字从 30.8% 提到了 50.0%。
-完整报告见 [docs/week5-eval-report.md](docs/week5-eval-report.md)。
-
-它同时验证了立项时的假设。有 142 部作品的 tag 向量**全为零** ——
-以欧美动画和国产老动画为主，官方题材标签对非日本作品明显更稀疏 ——
-它们在 tag 余弦下**永远无法被召回**。embedding 救回了其中 **131 部（92%）**。
-《大闹天宫》的最近邻从《修罗武神》《长生界》这类现代网文改（它的 tag 只有
-`玄幻` + `小说改`），变成了《金猴降妖》《西游记》《人参果》—— 全是上美影的西游题材。
+| 11,453 | 候选集中的作品数，口径定义在 `src/candidates.py` |
+| 132,056 | 语料段落，覆盖 79.3% 的作品（按热度加权为 97.3%） |
+| 263,690 | 别名，涵盖作品、角色与人物 |
+| 145,306 | 声优配役记录，涉及 8,215 位声优 |
+| 19,381 | 被标记为剧透并在检索前过滤的段落 |
+| 1,001 MB | Neon Postgres 数据库 |
+| 329 | 自动化测试 |
 
 ---
 
-## 接下来要做的
+## 评测结果
 
-六件事，互不阻塞。
+本项目的目的是**度量**这类系统，而不只是做出一个演示。核心结论把通常被合并成
+单一准确率的两种失败模式区分开：
 
-| 事项 | 卡在哪 |
-|---|---|
-| **季度更新** | 更新已有作品几乎免费 —— 管道幂等、md5 跳过未变行、萌娘 `lastrevid` 一直在存。阻塞在准入：`favorite.done >= 50` 从构造上把新番挡在门外。实测：最晚 `air_date` 是 2026-09-11、未来只有 2 部、`air_year >= 2027` 的 6 部**全都没有 `air_date`** —— 所以「未来 N 个月内开播」这条规则必须处理 NULL。先定准入规则（它会改变候选集）和 tag/staff 词表策略。 |
-| **信息增益选题** | 现在按多样性挑（MMR）。下一步是挑「答案最能降低口味不确定性」的那道题，让十道题问出更多信息。 |
-| **详情页** | `GET /api/anime/{id}` 从第 2 周就在服务，前端没有任何页面调它。 |
-| **英文支持** | 档期路由已认英文。三个缺口：声优触发词全中文；`MENTION_MAX = 16` 比 `fullmetalalchemist`（18）短；**33 个常见英文词里 14 个撞上真实别名**（`protagonist`、`comedy`、`school`），于是描述性英文句子会假命中某部作品、永远够不着找番兜底。语料是中文的，所以**跨语言惩罚要先量再定方案** —— 150 题自动标注评测集翻成英文重跑就是干净的 A/B，几乎零成本。 |
-| **单集简介** | dump 里有 **108,835 条分集简介**（涉及 10,630 部），一条都没灌。它能回答「第 12 话讲了什么」，目前完全答不了。 |
-| **声优岗位进推荐** | `staff_vec` 有导演、音乐、制作公司，但**没有任何声优字段** —— 声优要走 `subject-characters` + `person-characters` 两跳。数据已经有了（`voice_role`）。加进去会改变词表规模，`sql/006` 列宽和 `staffvec.DIM` 要一起改、全库重算。 |
+> 检索到的段落中确实包含答案时，模型答对率为 **93.8%**；
+> 而段落中包含答案的情况只占 **50.0%**。
 
-| 周 | 内容 | 状态 |
+因此系统的短板在检索与语料覆盖，不在文本生成。两轮语料工作把后一个数字
+从 30.8% 提升到 50.0%。完整评测见 [docs/week5-eval-report.md](docs/week5-eval-report.md)。
+
+第二项结果验证了立项时的假设。有 142 部作品完全没有可用的题材标签 ——
+以欧美动画和年代较早的国产动画为主，源数据库对这类作品的标签明显稀疏 ——
+基于标签的相似度**永远无法**召回它们。引入简介 embedding 后，
+其中 **131 部（92%）** 被救回。以《大闹天宫》为例，它的最近邻从毫不相关的
+现代网文改编作品，变成了《金猴降妖》《西游记》《人参果》——
+全部出自同一制作传统与制片厂。
+
+---
+
+## 当前状态
+
+| 阶段 | 内容 | 状态 |
 |---|---|---|
-| 1–3 | 数据层 · P0 打分 · 问卷 · 部署 · embedding · P1 融合 | ✅ |
-| 4 | 萌娘语料 · 角色语料 · 语料转中文 · 检索层 | ✅ |
-| 5 | **离线评测** | ✅ |
-| 5.5 | 解析器修复 · 角色页 · 声优配役 | ✅ |
-| 6 | 账号 ✅ · 前端 ✅ · 信息增益选题 ⬜ · 季度同步 ⬜ | 🔄 |
+| 1–3 | 数据层、打分、问卷、部署、embedding、信号融合 | 已完成 |
+| 4 | 语料采集、统一译为中文、检索管道 | 已完成 |
+| 5 | 离线评测 | 已完成 |
+| 5.5 | 解析器修正、角色页、声优数据 | 已完成 |
+| 6 | 账号与网页界面已完成；选题优化与季度同步尚未开始 | 进行中 |
+
+### 计划中的工作
+
+六项，互不阻塞。
+
+| 事项 | 目前进展 |
+|---|---|
+| **季度更新** | 更新已有作品的成本接近于零：管道幂等，且会跳过未变化的记录。障碍在准入。新番会被 `favorite.done >= 50` 这条保障数据质量的热度门槛排除在外。库中最晚的播出日期是 2026-09-11，未来待播的只有两部，而所有标记为 2027 年及以后的六部作品**都没有播出日期** —— 因此任何「未来 N 个月内开播」的规则都必须处理缺失值。准入规则与标签词表策略是动手之前要先定下的两个决策。 |
+| **信息增益选题** | 目前按多样性选题。改为按预期信息增益选题，可以让同样数量的作答提供更多信息。 |
+| **详情页** | `GET /api/anime/{id}` 自阶段 2 起即可用，但网页界面中没有任何页面调用它。 |
+| **英文支持** | 档期查询已支持英文。仍有三处缺口：声优类问法只能识别中文；可识别的标题长度上限短于部分英文标题；33 个常见英文词中有 14 个与真实别名冲突，导致英文描述被解析成非预期的作品。由于语料是中文的，应先度量跨语言检索的损失再选择方案 —— 把现有的 150 题评测集译成英文即可得到这一度量，成本极低。 |
+| **单集简介** | 源数据中含有 108,835 条分集简介，涉及 10,630 部作品，目前一条都未导入。它们可以回答按集提问的问题，而这类问题目前无法回答。 |
+| **声优作为推荐信号** | 制作人员向量涵盖导演、音乐与制作公司，但不含声优 —— 声优需要经由角色记录做两步关联。数据已因问答功能而具备。引入它会改变词表规模，因而需要重算全库。 |
 
 ---
 
-## 技术栈
+## 技术架构
 
 | 层 | 选型 |
 |---|---|
-| 数据处理 | Python 3.12 · orjson · [bgm-tv-wiki](https://github.com/bangumi/wiki-parser-py) |
-| 数据库 | Neon Postgres 18.4 + pgvector 0.8.1（`us-east-2`） |
-| 分词 | jieba —— Neon 装不了 `zhparser`，BM25 只能在 Python 侧预分词 |
-| Embedding | Qwen3-Embedding-0.6B · `halfvec(1024)` —— **锁死，绝不更换** |
-| 重排 | `BAAI/bge-reranker-v2-m3` —— 可以换，输出是相对排序 |
-| 生成 | Qwen3-14B（回答）· Qwen3-8B（意图分类、声优文案） |
-| 认证 | argon2id + PyJWT，放 httpOnly cookie，同源 |
-| 部署 | FastAPI on Vercel serverless · 前端 React + TS + Vite + Tailwind |
+| 数据处理 | Python 3.12、orjson、[bgm-tv-wiki](https://github.com/bangumi/wiki-parser-py) |
+| 数据库 | Neon Postgres 18.4 + pgvector 0.8.1 |
+| 中文分词 | jieba，在入库前完成 —— 该托管数据库无法安装中文分词扩展 |
+| Embedding | Qwen3-Embedding-0.6B，以 `halfvec(1024)` 存储 |
+| 重排 | `BAAI/bge-reranker-v2-m3`，对检索出的候选列表做比初检更精确的重新排序 |
+| 生成 | Qwen3-14B 负责回答；Qwen3-8B 负责意图分类与文案组织 |
+| 认证 | argon2id，JSON Web Token 存于 httpOnly cookie |
+| 后端 | FastAPI，运行于 Vercel serverless 函数 |
+| 前端 | React、TypeScript、Vite、Tailwind |
 
-⚠️ **embedding 是全项目唯一不能 fallback 到另一个厂商的组件。**
-它的输出是**相对于库里那批向量的坐标**；混用两个编码器会得到一个看起来完全正常、
-排序也像模像样的噪声列表，而且不报任何错。LLM 和 rerank 没有这个约束 ——
-它们的输出是文本和相对排序，用完即弃。真的断供了，正确的降级方向是**退回 BM25**。
+**embedding 模型是锁定的，不可替换。** 它的输出是一组坐标，
+只有相对于库中已有向量才有意义。一旦引入第二个编码器，比对结果将失去意义，
+而系统仍会返回一个排序正确、看起来完全合理的列表，并且不报任何错误。
+语言模型与重排模型没有这个约束：它们的输出是文本或排序，用完即弃。
+若 embedding 服务不可用，正确的降级方向是关键词检索，而不是换一个编码器。
 
 ---
 
 ## 快速开始
 
-### 1. 装依赖
+### 1. 安装
 
 ```bash
-uv sync                       # 只装运行时依赖 —— 线上 function 需要的就这些
-uv sync --group etl           # + bgm-tv-wiki / tqdm / lxml，scripts/ 要用
-uv sync --group api --group etl --group dev   # 开发全量
+uv sync                       # 仅运行时依赖 —— 线上函数所需的就是这一组
+uv sync --group etl           # 追加 bgm-tv-wiki、tqdm、lxml —— scripts/ 需要
+uv sync --group api --group etl --group dev   # 完整开发环境
 ```
 
-⚠️ **主依赖组就是部署清单。** Vercel 的 Python runtime 检测到 `pyproject.toml` +
-`uv.lock` 就装**这一组**，`requirements.txt` 会被完全忽略。凡是在请求路径上的包
-（`httpx`、`argon2-cffi`、`pyjwt`）都必须在里面，否则线上会**在模块级 import 就炸**、
-把整个 ASGI app 一起带走；而只在 ETL 用的包必须待在 group 里，
-否则会被打进 function bundle。
+主依赖组同时充当部署清单。Vercel 的 Python 运行时读取 `pyproject.toml`
+与 `uv.lock` 并安装该组，`requirements.txt` 会被忽略。
+凡是在处理请求时用到的包都必须放在主依赖组中，否则线上会在导入阶段直接失败；
+仅供数据处理脚本使用的包则必须留在具名分组内，否则会被打包进部署产物。
 
 ### 2. 配置
 
@@ -451,114 +486,127 @@ uv sync --group api --group etl --group dev   # 开发全量
 cp .env.example .env
 ```
 
-- `DATABASE_URL_DIRECT` —— 建表和批量灌数据。走直连，避开 PgBouncer 与 psycopg3 prepared statement 的冲突
-- `DATABASE_URL` —— 线上用，走连接池。本地可不填
-- `SILICONFLOW_API_KEY` —— embedding / rerank / 生成**共用这一个 key**
-- `AUTH_SECRET` —— 会话签名，≥32 字符。**缺失时应用直接启动失败、绝不退回默认值** —— 有默认值的话，忘配的部署会正常签发 token，而密钥是公开在源码里的
-- `CORS_ORIGINS` —— **只在本地开发有用**。线上同源，中间件根本不参与
+| 变量 | 用途 |
+|---|---|
+| `DATABASE_URL_DIRECT` | 建表与批量灌数据。走直连，以避开连接池与预编译语句之间的冲突。 |
+| `DATABASE_URL` | 线上应用使用，走连接池。本地可不填。 |
+| `SILICONFLOW_API_KEY` | embedding、重排与生成共用同一个密钥。 |
+| `AUTH_SECRET` | 会话签名，至少 32 字符。缺失时应用会拒绝启动而非退回默认值 —— 若有默认值，配置遗漏的部署会签发出看似有效、实则使用公开密钥的令牌。 |
+| `CORS_ORIGINS` | 仅本地开发使用。线上为同源，该中间件不参与。 |
 
-⚠️ **部署只需要三个：`DATABASE_URL`、`SILICONFLOW_API_KEY`、`AUTH_SECRET`。**
-不要把 `DATABASE_URL_DIRECT` 配到线上 —— 连接池写的是
-`DATABASE_URL or DATABASE_URL_DIRECT`，前者哪天拼错会**静默退回直连**：
-服务照常起来、功能看着正常，只是在悄悄耗尽 Neon 的连接数。
-三个变量各有独立验证路径：`/api/health` 回 `catalog_size` → 库通；
-注册账号 → `AUTH_SECRET` 通；问一条剧情问题 → API key 通。
+部署只需要其中三个：`DATABASE_URL`、`SILICONFLOW_API_KEY` 与 `AUTH_SECRET`。
+`DATABASE_URL_DIRECT` 不应配置到线上。连接池按
+`DATABASE_URL or DATABASE_URL_DIRECT` 的顺序取值，因此两者都配置时，
+前者一旦拼写出错就会**静默退回直连**：服务照常启动、状态看似正常，
+却在逐步耗尽数据库的连接数。三个变量各有独立的验证方式 ——
+`/api/health` 返回作品总数说明数据库连通，注册账号说明 `AUTH_SECRET` 生效，
+提出一个剧情问题说明 API 密钥可用。
 
-### 3. 拉数据
+### 3. 获取源数据
 
 ```bash
+# 当前压缩包地址与校验值来自 aux/latest.json
 curl -sL https://raw.githubusercontent.com/bangumi/Archive/master/aux/latest.json
 mkdir -p data/raw && curl -L -o data/raw/dump.zip "<browser_download_url>"
-sha256sum -c <<< "<digest>  data/raw/dump.zip"    # 务必校验
+sha256sum -c <<< "<digest>  data/raw/dump.zip"
 python -c "import zipfile; zipfile.ZipFile('data/raw/dump.zip').extractall('data/raw/dump')"
 ```
 
-压缩包约 410 MB，解压 1.8 GB。
+压缩包约 410 MB，解压后约 1.8 GB。
 
-### 4. 建库，顺序不能乱
+### 4. 建库
+
+顺序不能调换。
 
 ```bash
 uv sync --group etl
-for f in sql/0*.sql; do psql < "$f"; done   # 001 建表 … 007 语料、009 声优、010 账号
+for f in sql/0*.sql; do psql < "$f"; done   # 建表、语料、声优、账号
 
-uv run python scripts/build_id_map.py        # 需要联网，会下 bangumi-data
+uv run python scripts/build_id_map.py        # 需要联网
 uv run python scripts/load_profiles.py
 uv run python scripts/backfill_staff.py
 uv run python scripts/backfill_anilist.py    # 需要联网，约 125 次请求
 uv run python scripts/build_series_map.py
 uv run python scripts/build_tag_vectors.py
-uv run python scripts/build_embeddings.py    # 需要 SILICONFLOW_API_KEY；约 12 分钟 / ¥0.19
+uv run python scripts/build_embeddings.py    # 需要 SILICONFLOW_API_KEY；约 12 分钟
 uv run python scripts/build_staff_vectors.py
-uv run --group ml python scripts/build_clusters.py       # mmr_rank + cluster_id
+uv run --group ml python scripts/build_clusters.py
 uv run --group etl python scripts/build_voice_roles.py   # 约 3 分钟，无 API 调用
 
-# ── 语料：唯一一笔大墙钟开销 ──────────────────────────────────
-uv run --group etl python scripts/fetch_moegirl.py       # 约 4 小时（7 秒/请求，别调低）
+# 语料采集 —— 唯一一笔可观的时间开销
+uv run --group etl python scripts/fetch_moegirl.py       # 约 4 小时；7 秒的请求间隔
+                                                         # 是有意设置的，不要调低
 uv run --group etl python scripts/parse_moegirl.py
 uv run --group etl python scripts/build_plot_chunks.py
-uv run --group etl python scripts/build_char_chunks.py   # dump 角色简介，零抓取
+uv run --group etl python scripts/build_char_chunks.py
 uv run --group etl python scripts/extract_char_links.py --sizes
 uv run --group etl python scripts/fetch_char_pages.py --top 1000   # 约 10 小时，可断点续跑
 uv run --group etl python scripts/parse_moegirl.py --kind character
 uv run --group etl python scripts/build_plot_chunks.py --kind character
 
-psql -c 'VACUUM FULL anime_profile'          # 回收批量 UPDATE 的 MVCC 膨胀
-uv run --group etl python -m pytest tests/ -q     # 验收：329 项
+psql -c 'VACUUM FULL anime_profile'
+uv run --group etl python -m pytest tests/ -q
 ```
 
-脚本都幂等。**最后两步不是可选的** —— 跳过 VACUUM 会让库虚涨一倍；
-跳过 pytest 就没人发现 `tag_vec` 是否漏跑，而它没跑的话打分**静默返回空列表**，
-不报错。`GET /health` 的 `with_tag_vec` 也是为此存在。
+所有脚本均幂等，可安全重复执行。最后两步不是可选的：跳过 vacuum 会使数据库
+表观体积增加近一倍；跳过测试则会让标签向量缺失的问题无人察觉 ——
+而在那种情况下，打分会**返回空列表且不报错**。`/api/health` 输出同一项覆盖率
+数据也正是出于这个原因。
 
-⚠️ **跑测试要带 `--group etl`。** 其中 28 项调了 `pytest.importorskip("lxml")`，
-没有那一组时它们是**被跳过而不是失败** —— 「全绿」可能只是没跑。看有没有 `skipped`。
+运行测试时要带 `--group etl`。其中 28 项测试依赖 `lxml`，缺失时会被**跳过而非失败**，
+因此「全部通过」有可能只是它们从未执行；请检查结果中的 skipped 计数。
 
-⚠️ **两个缓存，重建代价完全不同。** `data/interim/embed_cache/`（约 50 MB，不入 git）
-重建要 ¥0.19 和 12 分钟 —— 但从旧机器拷过去就是零成本且 bit-identical，
-这是编码器为远程 API 时唯一能保证两台机器建出同一个库的办法。
-`data/interim/translate_cache/`（50 MB）则是 43,932 条译文的**唯一副本**，
-丢了是重翻 8 小时。这一份要单独备份。
+磁盘上保留两份缓存，其重建代价相差悬殊。embedding 缓存
+（`data/interim/embed_cache/`，约 50 MB，不纳入版本控制）重建只需数分钟 API 时间；
+而把它在机器之间拷贝，可使重建既免费又逐位一致 ——
+当编码器是远程服务时，这是让两台机器建出同一个库的唯一办法。
+翻译缓存（`data/interim/translate_cache/`，同样约 50 MB）则是 43,932 条译文的
+**唯一副本**，丢失意味着约 8 小时的重新翻译，应当单独备份。
 
-### 5. 跑起来
+### 5. 运行
 
 ```bash
-uv run uvicorn server.main:app --reload      # API，文档在 /api/docs
-cd web && npm install && npm run dev         # 前端 :5173，/api 代理到 :8000
+uv run uvicorn server.main:app --reload      # API，文档位于 /api/docs
+cd web && npm install && npm run dev         # 网页界面，端口 5173
 uv run --group etl python -m pytest tests/ -q
 uv run ruff check src/ scripts/ server/ tests/
 cd web && npx tsc --noEmit && npm run lint
 ```
 
-> **Windows 注意**：往终端打中文的脚本要加 `PYTHONIOENCODING=utf-8`。
+在 Windows 上，向控制台输出中文的脚本需加前缀 `PYTHONIOENCODING=utf-8`。
 
 ---
 
 ## 接口
 
-全部在 `/api` 下。**推荐这条链路是无状态的** —— 评分随请求传入，
-游客的 localStorage 和登录用户喂进同一个入口；账号层**并排**在它旁边，不在它里面。
+所有路由均位于 `/api` 之下。
+
+推荐链路是无状态的：评分随每次请求传入，服务端不做任何写入。
+匿名访客与登录用户走同一条代码路径，账号层**并列**于其旁而非嵌入其中。
 
 | 接口 | 用途 | 模型调用 |
 |---|---|---|
-| `GET /health` | 存活探针 + 五个回填覆盖率字段 + 分词指纹 | — |
+| `GET /health` | 存活探针、数据覆盖率与分词器指纹 | — |
 | `GET /questionnaire` | 选题 | — |
-| `POST /recommend` | 打分 | — |
-| `GET /search` | 按名/别名搜 —— BM25，拼错时退 pg_trgm | — |
-| `GET /anime/{id}` | 详情 | — |
-| `GET /season` | 按档期浏览 | — |
-| `GET /related` | 同作者 / 导演 / 公司的其他作品 | — |
-| `GET /voice` | 某声优配过哪些角色 | — |
-| `GET /find` | 按描述语义找番 | 1 次 embedding |
-| `POST /ask` | **单一入口** —— 剧情问答 / 声优 / 档期 / 找番 | 2+ |
+| `POST /recommend` | 依据一组评分对全库打分 | — |
+| `GET /search` | 按标题或别名检索，并对拼写错误提供模糊兜底 | — |
+| `GET /anime/{id}` | 作品详情 | — |
+| `GET /season` | 浏览某一播出档期 | — |
+| `GET /related` | 同一作者、导演或公司的其他作品 | — |
+| `GET /voice` | 某位声优出演过的角色 | — |
+| `GET /find` | 依据一段自由描述查找作品 | 1 次 embedding |
+| `POST /ask` | 单一入口，分派至四类问题 | 2 次及以上 |
 
-账号：`POST /auth/register|login|logout`、`GET /auth/me`、
-`PUT /auth/username|password`、`GET|PUT|DELETE /ratings`、`GET /ratings/detail`。
+账号相关：`POST /auth/register`、`/auth/login`、`/auth/logout`；
+`GET /auth/me`；`PUT /auth/username`、`/auth/password`；
+`GET`、`PUT`、`DELETE /ratings`；`GET /ratings/detail`。
 
-⚠️ **「游客能用」与「要登录」的判据是这个端点会不会花钱，不是它像不像问答。**
-`/voice`、`/season` 是纯 SQL，对游客开放；`/find` 只调一次 embedding 却仍要登录，
-因为不拦的话它就是**绕过配额的后门**。
+匿名与登录的边界由**成本**决定，而非由「是否像问答」决定。
+`/voice` 与 `/season` 是普通的数据库查询，保持开放；
+`/find` 会产生一次 embedding 调用，因而要求登录 ——
+若对其开放，它就成了绕过配额的零成本通道。
 
-前端传**作答选项**，不传算好的分数：
+前端提交用户的**作答选项**，而非算好的分数：
 
 ```json
 {"answers": [{"subject_id": 243916, "choice": "seen", "score": 9},
@@ -566,9 +614,9 @@ cd web && npx tsc --noEmit && npm run lint
  "mode": "all", "rank_by": "blend", "top_k": 10}
 ```
 
-选项 →（分数, 置信度）的映射只在服务端一处维护 —— 让前端算等于把它复制进
-TypeScript，一漂移就是静默的推荐质量下降。同一条纪律也是**库里存 choice
-而不存算好的分数**的原因。
+选项到分数与置信度的映射只在服务端定义一次。若改由前端计算，
+这份映射会被复制进 TypeScript，而一旦两处出现分歧，
+推荐质量的下降将是静默的。数据库存储作答选项而非派生分数，出于同一考虑。
 
 ---
 
@@ -576,31 +624,31 @@ TypeScript，一漂移就是静默的推荐质量下降。同一条纪律也是*
 
 ```
 src/
-  candidates.py    候选集口径 —— 唯一事实来源
-  tag_rules.py     tag 分类规则 + 同义合并 + 导入时自检
-  tagvec.py        tag 向量的唯一计算实现（log1p × idf × L2）
-  recommend.py     内存打分 —— 离线评测用
-  recommend_sql.py Postgres 打分 —— 线上用，必须与上面逐条等价
-  questionnaire.py 选题 + 作答→评分映射
-  textproc.py      jieba 分词 + 词典指纹
-  embed.py         embedding 模型的唯一定义处 —— 锁死、带指纹
-  retrieve.py      检索管道 + 实体解析状态机。只读库
-  rerank.py        重排客户端 —— 可以换模型，与 embed.py 不同
-  llm.py           生成、意图分类、prompt、配置指纹
-  router.py        意图分派 —— 纯函数，零模型、不碰库
-  find.py / voice.py / related.py     找番 · 配役 · 关联查询
-  auth.py / ratings.py / quota.py     账号 · 评分同步 · 问答配额
-server/            FastAPI 应用 —— 所有路由都在 /api 下
-web/               Vite + React + Tailwind（同一个 Vercel 项目）
-  session.tsx      会话与评分的**单一入口**，见下
-api/index.py       Vercel 入口 —— 这个目录**只能放这一个文件**
+  candidates.py     候选集口径 —— 唯一事实来源
+  tag_rules.py      标签分类、同义合并、导入时自检
+  tagvec.py         标签向量的唯一实现
+  recommend.py      内存打分，供离线评测使用
+  recommend_sql.py  数据库打分，线上使用；必须与上者保持等价
+  questionnaire.py  选题与作答到评分的映射
+  textproc.py       分词与词典指纹
+  embed.py          embedding 模型的唯一定义处
+  retrieve.py       检索管道与实体解析；只读
+  rerank.py         重排客户端
+  llm.py            生成、意图分类、提示词、配置指纹
+  router.py         意图分派 —— 纯函数，不调模型、不访问数据库
+  find.py、voice.py、related.py    找番、配役、关联查询
+  auth.py、ratings.py、quota.py    账号、评分同步、问答配额
+server/             FastAPI 应用
+web/                React 前端
+  session.tsx       会话状态与评分的单一入口
+api/index.py        Vercel 入口；该目录不得放置其他文件
 sql/ scripts/ tests/
 ```
 
-🚨 **`web/src/session.tsx` 是前端最该先读的文件。** 上层组件**不知道用户登没登录** ——
-它们拿到的永远是 `{answers, setAnswer}`，数据存 localStorage 还是同步到账号由它决定。
-这是服务端那条「评分随请求传入」铁律在前端的对应物。一旦让某个组件自己写
-`if (user) … else …`，这条铁律就会在多处同时破掉、各自漂移。
+`web/src/session.tsx` 是前端首先应当阅读的文件。它上层的组件并不知道用户是否已登录，
+它们拿到的只是评分对象与写入函数，而由该模块决定评分是存于本地还是同步到账号。
+这是服务端「评分随请求传入」这条规则在前端的对应物。
+一旦某个组件自行判断登录状态，这条规则就会在多处同时被打破，且各自独立地漂移。
 
 ---
 
@@ -608,56 +656,18 @@ sql/ scripts/ tests/
 
 ```
 type == 2                                    # 动画
-AND 有放送年份                                # date 为空时回退到 infobox
-AND meta_tags ∩ {TV, WEB, 剧场版, OVA} != ∅   # 排除短片和无形态标签的同人/MV
+AND 有播出年份                                # 日期为空时回退至 infobox
+AND meta_tags ∩ {TV, WEB, 剧场版, OVA} != ∅   # 排除短片与无形态标签的同人作品
 AND favorite.done >= 50                      # 质量门槛
 → 11,453 部
 ```
 
-口径定义在 [src/candidates.py](src/candidates.py)，**改口径只改这一个文件**。
-`done >= 50` 一次清零了三个数据质量问题 —— 无 tag、无评分、无人看过。
-它同时也是新番进不来的原因，正是上面「季度更新」那条待决策的点。
-
----
-
-## 为什么不用常驻进程
-
-打分（11,453 × 308 矩阵，每请求一次矩阵乘法）本来需要一个长命进程。
-serverless 没有：每请求重建矩阵要传 2.6 MB、耗 1.31 s，而打分本身只要 12 ms。
-反直觉的是，**低流量会让冷启动更糟** —— 访问零星意味着大部分请求都撞上冷容器。
-于是把余弦推进了 Postgres：每请求只拉用户评过的那几十部（约 70 ms，几乎全是往返），
-11,311 行的暴力余弦由 pgvector 算，实测**成本 ≈ 0 ms**。
-
-代价是**两套打分实现** —— 线上 SQL，离线 leave-one-out 评测用 numpy。
-一致性靠构造保证而非纪律：`anime_profile.tag_vec` 是向量的唯一定义处
-（两条路径读同一批数字，实测逐位相同），
-[tests/test_parity.py](tests/test_parity.py) 在所有模式与开关组合下逐条比对。
-第二条立刻抓出了 SQL 召回池少写的一个次级排序键：由于大量作品与偏好向量
-**精确正交**，候选池是一大片并列 —— 两条路径召回的**根本不是同一批候选**，
-而两边看上去都完全合理。
-
----
-
-## 已知的坑
-
-**中文 BM25 不能直接用 Postgres tsvector。** 内置分词器把整句中文当一个 token，而 Neon 装不了 `zhparser`。必须用 jieba 预分词后入库；**建库与查询必须用同一分词器 + 同一词典**，否则召回直接崩且是静默的，所以应用启动时会校验词典指纹。
-
-**`alias` 的唯一约束必须写 `NULLS NOT DISTINCT`。** `subject_id` 和 `character_id` 必有一个是 NULL，而 Postgres 默认把 NULL 视为互不相等 —— 不加这句约束对每一行都失效。后来换个位置复发了一次：声优行**两个 id 都是 NULL**，所以 `person_id` 必须也加进约束，否则同名声优会被静默丢掉。
-
-**serverless 的连接池必须配 `check=ConnectionPool.check_connection`。** Neon 会回收空闲连接而 psycopg 的池不知道，下一个请求拿到死连接就 500。⚠️ `pg_terminate_backend` **复现不出**（它发 RST，socket 层立刻可见），必须真晾满空闲窗口。
-
-**「资料里没有」往往只是你看不见它。** 作品自己的 Bangumi 简介 —— 问「讲了什么故事」时最权威的那份文本 —— **从来不在检索池里**。而打分表只渲染检索到的 chunk，别处注入的资料对打分的人不可见，于是有出处的回答被判成了幻觉。**问「答案为什么不在资料里」之前，先问「资料清单是不是完整的」。**
-
-**指标会从自己的定义下面漂走。** 评测把「未命中却给了答案」判为幻觉。后来一次 prompt 改动**有意**把干巴巴的拒答变成有据的部分回答 —— 幻觉率从 22.2% 涨到 84.6%，而把那 26 道逐条读完，**没有一道是编造的**。数字本身看起来完全正常。
-
-**分数有噪声时，规则完胜调阈值。** rerank 分的批间噪声约 1e-3，而 OP/ED 类 chunk 本身就只有 0.003–0.028，任何绝对地板都分不开它和垃圾。给最佳歌曲 chunk **占一个席位**，7 道失败题修好 5 道，代价是每题上下文 +0.09 条；把地板降到 0 只修好 4 道却要 +3.44 条。**便宜 38 倍，而且不会漂。**
-
-**扩大候选集必须重跑规则审查。** 从 2011+ 扩到全年份后一次性冒出 50+ 个新漏网条目：老一辈监督、老 IP、繁体变体（`裡番`/`里番`）、怀旧元评价。换个年代就是换一套词汇。
-
-**`api/` 下的任何文件都会变成一个独立的 Vercel function。** 所以应用包放在 `server/`，`api/` 只留一个入口文件。把 `schemas.py` 放进去会导致构建失败。
+口径定义在 [src/candidates.py](src/candidates.py)，**修改口径只应改动该文件**。
+「看过人数不少于 50」这一门槛同时消除了三类数据质量问题：无标签、无评分、无观众。
+它也是新番无法进入库中的原因，正是上文季度更新所对应的待决问题。
 
 ---
 
 ## License
 
-See [LICENSE](LICENSE).
+参见 [LICENSE](LICENSE)。
