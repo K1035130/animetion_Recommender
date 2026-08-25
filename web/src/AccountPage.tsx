@@ -146,17 +146,19 @@ function SecuritySection() {
         ⚠️ 没有找回密码的途径（本站不收邮箱、也发不了信），改之前请记好新密码。
       </p>
 
-      <div className="flex flex-wrap gap-2">
+      <div className="flex flex-wrap gap-3">
         <button
           onClick={() => setOpen(open === 'username' ? 'none' : 'username')}
-          className="rounded-lg border border-(--color-line) px-3 py-1.5 text-sm transition hover:border-(--color-brand) hover:text-(--color-brand)"
+          className={secondaryBtn}
         >
+          <PencilIcon />
           修改用户名
         </button>
         <button
           onClick={() => setOpen(open === 'password' ? 'none' : 'password')}
-          className="rounded-lg border border-(--color-line) px-3 py-1.5 text-sm transition hover:border-(--color-brand) hover:text-(--color-brand)"
+          className={secondaryBtn}
         >
+          <LockIcon />
           修改密码
         </button>
       </div>
@@ -164,6 +166,52 @@ function SecuritySection() {
       {open === 'username' && <UsernameForm onDone={() => setOpen('none')} />}
       {open === 'password' && <PasswordForm onDone={() => setOpen('none')} />}
     </section>
+  )
+}
+
+/**
+ * ⚠️ `min-h-11` = 44px，是**触控目标下限**不是装饰 —— 手机上点不中比不好看
+ *    严重得多。padding 撑不到 44px 的地方（text-sm 那几处）都靠它兜底，
+ *    所以改 padding/字号时别顺手把它删了。
+ */
+const secondaryBtn =
+  'inline-flex min-h-11 items-center justify-center gap-2 rounded-lg border border-(--color-line) px-5 py-3 text-base font-medium transition hover:border-(--color-brand) hover:text-(--color-brand)'
+
+// 图标用 inline SVG：项目没有图标库，不为两个图标加依赖；currentColor 让它
+// 跟着按钮文字变色（含 hover 与深色模式），aria-hidden 让读屏跳过。
+function PencilIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden
+      className="h-4 w-4"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4Z" />
+    </svg>
+  )
+}
+
+function LockIcon() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      aria-hidden
+      className="h-4 w-4"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.8}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <rect x="3" y="11" width="18" height="11" rx="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </svg>
   )
 }
 
@@ -335,18 +383,18 @@ function FormFooter({
           {okText}
         </div>
       )}
-      <div className="flex gap-2">
+      <div className="flex gap-3">
         <button
           type="submit"
           disabled={busy}
-          className="rounded-lg bg-(--color-brand) px-4 py-2 text-sm font-medium text-(--color-on-brand) disabled:opacity-40"
+          className="inline-flex min-h-11 items-center justify-center rounded-lg bg-(--color-brand) px-6 py-3 text-base font-medium text-(--color-on-brand) transition disabled:opacity-40"
         >
           {busy ? '保存中…' : '保存'}
         </button>
         <button
           type="button"
           onClick={onCancel}
-          className="rounded-lg border border-(--color-line) px-4 py-2 text-sm text-(--color-muted)"
+          className="inline-flex min-h-11 items-center justify-center rounded-lg border border-(--color-line) px-6 py-3 text-base text-(--color-muted) transition hover:border-(--color-brand) hover:text-(--color-brand)"
         >
           取消
         </button>
@@ -471,12 +519,12 @@ function RatedList() {
               value={q}
               onChange={(e) => setQ(e.target.value)}
               placeholder="在已打分里搜…"
-              className="min-w-40 flex-1 rounded-lg border border-(--color-line) bg-(--color-page) px-3 py-1.5 text-sm outline-none focus:border-(--color-brand)"
+              className="min-h-11 min-w-40 flex-1 rounded-lg border border-(--color-line) bg-(--color-page) px-3 py-2.5 text-sm outline-none focus:border-(--color-brand)"
             />
             <select
               value={filter}
               onChange={(e) => setFilter(e.target.value as Filter)}
-              className="rounded-lg border border-(--color-line) bg-(--color-page) px-2 py-1.5 text-sm"
+              className="min-h-11 rounded-lg border border-(--color-line) bg-(--color-page) px-3 py-2.5 text-sm"
             >
               <option value="all">全部</option>
               <option value="seen">看过</option>
@@ -486,7 +534,7 @@ function RatedList() {
             <select
               value={sortBy}
               onChange={(e) => setSortBy(e.target.value as SortBy)}
-              className="rounded-lg border border-(--color-line) bg-(--color-page) px-2 py-1.5 text-sm"
+              className="min-h-11 rounded-lg border border-(--color-line) bg-(--color-page) px-3 py-2.5 text-sm"
             >
               {SORTS.map(([v, label]) => (
                 <option key={v} value={v}>
@@ -577,17 +625,20 @@ function RatedRow({
           </button>
         </div>
       ) : (
-        <div className="mt-2 flex flex-wrap items-center gap-1.5">
+        <div className="mt-2 flex flex-wrap items-center gap-2">
           {CHOICES.map(([c, label]) => (
             <button
               key={c}
               onClick={() =>
                 onAnswer(item.subject_id, c, c === 'seen' ? score : undefined)
               }
-              className={`rounded-md border px-2 py-1 text-xs transition ${
+              // ⚠️ 未选中态给了 bg-(--color-page)：卡片是 --color-surface，两者
+              //    有一档色差 ⇒ 不 hover 也看得出这是个可点的按钮。只留边框的话
+              //    在浅色模式下几乎与卡片同色，用户会以为是纯文字标签。
+              className={`inline-flex min-h-11 items-center justify-center rounded-lg border px-4 py-2 text-sm transition ${
                 choice === c
-                  ? 'border-(--color-brand) bg-(--color-brand) text-(--color-on-brand)'
-                  : 'border-(--color-line) hover:border-(--color-brand)'
+                  ? 'border-(--color-brand) bg-(--color-brand) font-medium text-(--color-on-brand)'
+                  : 'border-(--color-line) bg-(--color-page) hover:border-(--color-brand) hover:text-(--color-brand)'
               }`}
             >
               {label}
@@ -605,16 +656,16 @@ function RatedRow({
                 onChange={(e) =>
                   onAnswer(item.subject_id, 'seen', Number(e.target.value))
                 }
-                className="w-28 accent-(--color-brand)"
+                className="h-11 w-40 accent-(--color-brand)"
               />
-              <span className="w-8 tabular-nums font-medium">{score}</span>
+              <span className="w-10 text-base font-semibold tabular-nums">{score}</span>
             </label>
           )}
 
           <button
             // 'skip' 会让服务端删掉这一行（「没看过」用缺失表示）。
             onClick={() => onAnswer(item.subject_id, 'skip')}
-            className="ml-auto text-xs text-(--color-muted) underline hover:text-(--color-danger)"
+            className="ml-auto inline-flex min-h-11 items-center justify-center rounded-lg border border-(--color-danger)/40 px-4 py-2 text-sm text-(--color-danger) transition hover:border-(--color-danger) hover:bg-(--color-danger)/10"
           >
             移除
           </button>
