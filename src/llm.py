@@ -52,6 +52,12 @@ TEMPERATURE = 0.0
 MAX_TOKENS_HYDE = 400
 MAX_TOKENS_ANSWER = 800
 MAX_TOKENS_FIND_GATE = 5   # 只要一个 y/n token，见 find_gate()
+# 比 ANSWER 少得多：配役表是结构化清单，回答该是"挑几条讲清楚"而不是长篇分析。
+# 🚨 **这个数直接决定延迟。** 首版给 600，实测模型把整张表抄成编号清单、
+#    输出 350 字、单次 34~41 秒 —— voice 从 0.3 秒直接掉进流程 C 那一档。
+#    收紧 prompt（不许列清单）+ 压 max_tokens 是同一件事的两半：
+#    **给的余量越大，模型越倾向于把资料复述完**。
+MAX_TOKENS_VOICE = 400     # 声优配役的自然语言回答，见 voice_answer()
 MAX_TOKENS_INTENT = 8      # 只要一个英文单词，见 classify_intent()
 
 
@@ -171,13 +177,23 @@ def chain(allow_fallback: bool = True) -> list[Provider]:
 
 
 def prompt_digest() -> str:
-    """三条 system prompt 的联合摘要。改任何一条的任何一个字符它都会变。"""
+    """四条 system prompt 的联合摘要。改任何一条的任何一个字符它都会变。
+
+    ⚠️ 新增一条 prompt 就要在这里加一行 —— 否则指纹会声称改动前后同源
+       而实际不是（2026-08-19 补 prompt 进指纹时的原始理由）。
+       ⚠️ **加了这一行，指纹就必然变**，历史评测数字随之标记为不同源：
+          这是设计如此，不是副作用。VOICE_SYSTEM 只影响 voice 分支，
+          60 题剧情问答的回答本身一字未动 —— 但指纹**不该**替人做这个
+          判断，它只负责如实说"不是同一套配置"。
+    """
     h = hashlib.sha256()
     h.update(HYDE_SYSTEM.encode())
     h.update(b"\x00")                    # 分隔符：防止跨条拼接出同一串字节
     h.update(ANSWER_SYSTEM.encode())
     h.update(b"\x00")
     h.update(FIND_GATE_SYSTEM.encode())
+    h.update(b"\x00")
+    h.update(VOICE_SYSTEM.encode())
     return h.hexdigest()[:16]
 
 
@@ -197,9 +213,10 @@ def descriptor(served_by: Provider) -> dict:
     payload = json.dumps(
         {"provider": served_by.name, "model": served_by.model,
          "temperature": TEMPERATURE,
-         "max_tokens": [MAX_TOKENS_HYDE, MAX_TOKENS_ANSWER, MAX_TOKENS_FIND_GATE],
+         "max_tokens": [MAX_TOKENS_HYDE, MAX_TOKENS_ANSWER,
+                        MAX_TOKENS_FIND_GATE, MAX_TOKENS_VOICE],
          "hyde_system": HYDE_SYSTEM, "answer_system": ANSWER_SYSTEM,
-         "find_gate_system": FIND_GATE_SYSTEM},
+         "find_gate_system": FIND_GATE_SYSTEM, "voice_system": VOICE_SYSTEM},
         sort_keys=True, ensure_ascii=False,
     )
     return {
@@ -608,5 +625,73 @@ def answer(
     return complete(
         msgs,
         max_tokens=MAX_TOKENS_ANSWER,
+        allow_fallback=allow_fallback,
+    )
+
+
+# ============================================================
+# 声优配役的自然语言回答（2026-08-25 加，Kevin 提出）
+# ============================================================
+# 起因：voice 分支此前**零模型**，`answer` 直接就是 voice.as_context() 拼出来
+# 的那张表（「角色 —— 《作品》（年）　主角」逐行罗列）。Kevin 的原话是
+# 「粗暴的返回名单」——它答不了「花泽香菜**最近**配过什么角色」这类带限定的
+# 问法：表本身没错，但没人替用户挑出他要的那几条。
+#
+# 🚨 **不复用 ANSWER_SYSTEM。** 那条 prompt 整个是为剧情问答写的：
+#    「已知剧情推进到」「不要丢掉限定词」「资料只是罗列时不要猜归属」——
+#    拿它去讲一张配役表，模型会开始声明「资料里没有写到结局」这类完全跑题
+#    的话。两者的资料形态与失败模式都不同，各自一条 prompt。
+#
+# ⚠️ **结构化的 items 仍然照常返回，LLM 不是唯一出口。** 生成难免丢条目
+#    （20 条压成 6 条讲），前端要展示完整列表就还得有原始数据 ——
+#    与「打分表看不见 aux」那次同源：**别让某一层成为信息的唯一通道**。
+VOICE_SYSTEM = (
+    "你是动画声优资料助手。用户在问某位声优的配役情况，"
+    "给你的资料是**数据库里的结构化配役记录**（不是剧情语料），准确可信。\n"
+    "要求：\n"
+    "1. **只使用资料里出现的角色名与作品名，一个都不要自己添加** —— "
+    "哪怕你知道这位声优还配过别的角色，这次也不要提。\n"
+    "2. 资料开头写明了「库内共有 N 条」和「下面是其中 M 条」。"
+    "**这是两个数，不要混为一谈**，更不要因为只列了 M 条就说这位声优"
+    "作品不多、产量不高。\n"
+    "3. 按用户**实际问的**来组织，不要千篇一律：\n"
+    "   问「最近／近期配了什么」→ 讲年份最新的那几部，并说清最新的是哪一年；"
+    "若最新年份已经不算近，就如实说资料里最新只到那一年。\n"
+    "   问「配过哪些角色／代表作」→ 挑最有代表性的讲（热门作品的主角役优先）。\n"
+    "   问某部作品、某个类型或某段时间 → 只讲资料里对得上的，"
+    "一条都对不上就直说没有。\n"
+    "4. 写成**连贯的段落**，2~4 句话，**不要用编号列表、项目符号或换行分条**。"
+    "点到 5~8 个角色就够，写法像「她近几年的主角役有《A》的甲、《B》的乙…」"
+    "这样把角色名、作品名和年份揉进句子里。\n"
+    "   🚨 **不要把资料原样抄一遍** —— 抄成 1./2./3. 的清单是最常见的错误"
+    "写法，用户已经能看到那张表了，他要的是你**读完之后的话**。\n"
+    "   全文控制在 150 字上下，宁可少说几个也不要拖长。\n"
+    "5. 资料里写着「（角色名缺失）」的，是库里没有存这个角色的名字。"
+    "**不要猜一个名字填上去** —— 跳过它，或者如实说明这条记录缺角色名。\n"
+    "6. 不要复述「以下按…排列」这类关于资料本身的说明，直接讲内容。\n"
+    "7. 不要写开场白和结尾套话，直接开始回答。"
+)
+
+
+def voice_answer(question: str, context: tuple[str, str], *,
+                 allow_fallback: bool = True) -> tuple[str, Provider]:
+    """把 voice.as_context() 的配役表讲成一段自然语言回答。
+
+    context: voice.as_context() 的返回值 (section, text)。
+
+    ⚠️ **只传 text，不把 section 拼进 user 消息。** section 是
+       「声优配役（来自数据库的结构化字段，非剧情语料）」这句元信息，
+       VOICE_SYSTEM 第一句已经说过 —— 重复给会让模型把它当成要复述的
+       内容（规则 6 正是为此写的）。
+
+    ⚠️ 调用方**必须**为失败准备回落：配役表本身就是一个完整可用的答案，
+       LLM 挂了退回去展示它即可，不要 503。这与 I.6「LLM 挂 503」不冲突 ——
+       那条说的是流程 C，那里没有 LLM 就真的没有回答。
+    """
+    _section, text = context
+    return complete(
+        [{"role": "system", "content": VOICE_SYSTEM},
+         {"role": "user", "content": f"资料：\n{text}\n\n问题：{question}"}],
+        max_tokens=MAX_TOKENS_VOICE,
         allow_fallback=allow_fallback,
     )

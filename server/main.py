@@ -751,7 +751,8 @@ def _find_response(route: str, reason: str, query: str,
                 "不保证真的是你要找的）：" + NL_.join([""] + lines)),
         series_root=None, title=None, chunks=[], candidates=[],
         # ⚠️ 不写 zero_model —— 这条分支调了一次 embedding，
-        #    与 voice/season 那两条**真正**零模型的分支不是一回事。
+        #    与 season 那条**真正**零模型的分支不是一回事。
+        #    （voice 也不再是了：2026-08-25 起它会调一次生成。）
         meta={"embed_only": True},
         find=schemas.FindResponse(
             query=query,
@@ -834,7 +835,11 @@ def _ask_impl(req: schemas.AskRequest) -> schemas.AskResponse:
            LLM 生成 371 字               15.54 s   78.4%   ← 瓶颈
        ⇒ **检索层一共才 4.3 秒，优化它没有意义**；要快只能上流式输出。
        ⇒ 与 /recommend 的 235 ms 不是一个量级，前端必须给 loading 态。
-    📌 voice / season 两条分支**不调模型**，实测 0.3–0.4 秒。
+    📌 season 分支**不调生成模型**（只有那道意图校验），实测 0.3–1.1 秒。
+    📌 **voice 分支 2026-08-25 起会调一次生成**（把配役表讲成一段话，
+       见 llm.voice_answer）—— 它此前也在这一档，现在不是了。
+       ⚠️ 但**资料仍然是零模型来的**（一条 SQL），LLM 只负责组织语言 ⇒
+          生成失败时退回展示配役表，不像流程 C 那样必须 503。
 
     ⚠️ **四种状态都返回 200，不要把它们做成 4xx。** 它们是正常的业务结果
        （反问 / 没语料 / 没认出），不是错误：G.4 明确要求「认出来但没语料」时
@@ -901,13 +906,39 @@ def _ask_impl(req: schemas.AskRequest) -> schemas.AskResponse:
                       else [])
             if people:
                 person = people[0]
-                items = voice.roles_of(c, person.person_id, limit=req.top_k * 2)
-                ctx = voice.as_context(person, items)
+                # ⚠️ 排序口径由问句决定，判据只有 voice.wants_recent 一处 ——
+                #    「最近配过什么」要的是年份序，拿热度序去答就是答非所问。
+                order = (voice.ORDER_RECENT if voice.wants_recent(req.question)
+                         else voice.ORDER_POPULAR)
+                items = voice.roles_of(c, person.person_id,
+                                       limit=req.top_k * 2, order=order)
+                # ⚠️ 给 LLM 的资料**截得比返回给前端的短**（见 CONTEXT_ROLES）：
+                #    前端要完整明细，模型只需要够它挑几个来讲。
+                ctx = voice.as_context(person, items[:voice.CONTEXT_ROLES],
+                                       order=order)
+                # 🚨 **LLM 只负责"讲"，不负责"有没有"。** 资料已经在 ctx 里了，
+                #    所以生成失败要退回展示配役表本身（一个完整可用的答案），
+                #    而不是 503 —— 与流程 C「LLM 挂 503」不同，那里没有模型
+                #    就真的没有回答，这里有。
+                meta: dict = {"zero_model": False, "voice_order": order}
+                answer_text = ctx[1] if ctx else None
+                if ctx:
+                    try:
+                        answer_text, served = llm.voice_answer(req.question, ctx)
+                        meta["llm"] = llm.descriptor(served)
+                    except llm.LLMError as e:
+                        # ⚠️ 不退配额：用户拿到了可用的回答（结构化名单），
+                        #    这不是「服务端故障导致白扣」的那一类。
+                        meta["llm_error"] = type(e).__name__
+                        answer_text = ctx[1]
                 return schemas.AskResponse(
                     route="voice", route_reason=reason, state="ok",
-                    answer=ctx[1] if ctx else None,
+                    answer=answer_text,
                     series_root=None, title=None, chunks=[], candidates=[],
-                    meta={"zero_model": True},
+                    meta=meta,
+                    # ⚠️ **items 照常返回完整列表**，不因为有了自然语言回答
+                    #    就省掉 —— 生成必然会丢条目（20 条压成几条讲），
+                    #    前端要展示全表就得有原始数据。别让 LLM 成为唯一出口。
                     voice=schemas.VoiceResponse(
                         person_id=person.person_id, name=person.name,
                         name_cn=person.name_cn, n_roles=person.n_roles,
@@ -1141,8 +1172,19 @@ def get_related(
 def get_voice(
     name: str = Query(..., min_length=2, description="声优名，中日文均可"),
     limit: int = Query(20, ge=1, le=100),
+    order: str = Query(
+        voice.ORDER_POPULAR,
+        pattern=f"^({voice.ORDER_POPULAR}|{voice.ORDER_RECENT})$",
+        description="popular=按作品热度降序（默认）；recent=按播出年份从新到旧"),
 ) -> schemas.VoiceResponse:
     """某位声优配过哪些角色。**零模型调用。**
+
+    🚨 **这条仍然是零模型，只有 `POST /api/ask` 的 voice 分支会调 LLM**
+       （2026-08-25 加的 llm.voice_answer，把配役表讲成一段话）。
+       两者故意不一样：本端点返回**结构化列表**给前端自己渲染，游客也能用；
+       /ask 那条是对话式的，要花钱、要登录、要占配额。
+       ⇒ 想加自然语言回答的话请去改 /ask 那边，别把 LLM 放进这里 ——
+         这会让一个游客可用的纯 SQL 端点变成收费路径。
 
     ⚠️ **这条路径存在的理由与 /related 相同：/ask 答不了，而且答不了是对的。**
        流程 C 的召回写死了 `WHERE series_root = X`，天生看不到跨作品的事实；
@@ -1157,13 +1199,17 @@ def get_voice(
     ⚠️ 结果按 **character_id** 折叠而不是 series_root：问的是「配过哪些角色」，
        同一角色出现在续作/OVA 里只算一次。选代表作时 role_type 优先于热度 ——
        否则「神乐」会被《齐木楠雄》的客串役顶掉《银魂》的主角役（见 voice.py）。
+
+    📌 `order` 是显式参数而**不是**像 /ask 那样从问句里判 —— 这里的入参是
+       一个纯人名，没有可判的语境。「最近配了什么」那条判据只属于 /ask
+       （voice.wants_recent），两边共用同一套排序实现即可。
     """
     with _conn() as c:
         people = voice.find_person(c, name)
         if not people:
             raise HTTPException(404, f"没有找到声优「{name}」")
         p = people[0]
-        items = voice.roles_of(c, p.person_id, limit=limit)
+        items = voice.roles_of(c, p.person_id, limit=limit, order=order)
 
     return schemas.VoiceResponse(
         person_id=p.person_id, name=p.name, name_cn=p.name_cn,

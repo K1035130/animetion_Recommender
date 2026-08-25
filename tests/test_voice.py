@@ -12,7 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server.main import API, app
-from src import voice
+from src import llm, voice
 
 
 @pytest.fixture(scope="module")
@@ -118,3 +118,154 @@ def test_role_type_is_not_a_filter(client):
     必须远大于 limit，否则说明哪里悄悄把配角滤掉了。"""
     d = client.get(f"{API}/voice", params={"name": "樱井孝宏", "limit": 10}).json()
     assert d["n_roles"] > 100
+
+
+# ============================================================
+# 排序口径（2026-08-25）
+# ============================================================
+
+@pytest.mark.parametrize("q", [
+    "花泽香菜最近配过什么角色",
+    "钉宫理惠近期有哪些作品",
+    "他今年配了谁",
+    "这几年她配过什么",
+])
+def test_wants_recent_true(q):
+    assert voice.wants_recent(q)
+
+
+@pytest.mark.parametrize("q", [
+    "花泽香菜配过哪些角色",
+    "钉宫理惠的代表作有哪些",
+    "银魂里神乐是谁配的",
+    # ⚠️ 有意不收「新番」——「她在新番里配了谁」问的是具体作品不是时间段。
+    "她在新番里配了谁",
+])
+def test_wants_recent_false(q):
+    assert not voice.wants_recent(q)
+
+
+def test_weighted_heat_keeps_lead_over_hot_cameo():
+    """🚨 纯热度排序会让客串役屠榜 —— 这条把加权口径钉死。
+
+    2026-08-25 实测：改成纯 `fav_done` 降序后，钉宫理惠的「神乐」从第 3 掉到
+    第 21，前 12 条里 9 条是配角/客串。根因是热门作品的角色**总数**远多于
+    冷门作品，纯热度等价于"按作品热度列角色"，而用户问的是配过哪些**角色**。
+    """
+    cameo = voice.Role(character_id=1, character_name="甲", series_root=1,
+                       title="超热门番", air_year=2020, role_type=3,
+                       fav_done=100_000)
+    lead = voice.Role(character_id=2, character_name="乙", series_root=2,
+                      title="中等热度番", air_year=2020, role_type=1,
+                      fav_done=20_000)
+    assert voice._weighted_heat(lead) > voice._weighted_heat(cameo)
+
+
+def test_recent_order_is_year_desc(client):
+    """order=recent 必须是年份降序 —— 这是「最近配了什么」的全部依据。"""
+    items = client.get(f"{API}/voice",
+                       params={"name": "花泽香菜", "limit": 15,
+                               "order": "recent"}).json()["items"]
+    years = [it["air_year"] for it in items if it["air_year"] is not None]
+    assert years == sorted(years, reverse=True)
+    # 年份未知的必须垫底，不能因为 `or 0` 写反而冒到最前
+    seen_none = False
+    for it in items:
+        if it["air_year"] is None:
+            seen_none = True
+        elif seen_none:
+            pytest.fail("air_year 为 None 的记录排到了有年份的记录前面")
+
+
+def test_recent_and_popular_differ(client):
+    """两种排序必须给出不同的列表，否则 order 参数根本没接上去。"""
+    def ids(order):
+        return [it["character_id"] for it in client.get(
+            f"{API}/voice",
+            params={"name": "花泽香菜", "limit": 15, "order": order},
+        ).json()["items"]]
+    assert ids("popular") != ids("recent")
+
+
+def test_bad_order_is_rejected(client):
+    r = client.get(f"{API}/voice",
+                   params={"name": "花泽香菜", "order": "heat"})
+    assert r.status_code == 422
+
+
+def test_context_states_total_and_listed_counts():
+    """⚠️ 资料必须同时写明「库内共 N 条」和「下面是 M 条」。
+
+    只写一个数的话模型会把"列了 M 条"当成"总共就 M 条"，进而说出
+    「这位声优作品不多」这类与 n_roles 直接矛盾的话。
+    """
+    p = voice.Person(person_id=1, name="X", name_cn=None, n_roles=478)
+    roles = [voice.Role(character_id=1, character_name="甲", series_root=1,
+                        title="作品", air_year=2020, role_type=1,
+                        fav_done=100)]
+    _sec, text = voice.as_context(p, roles)
+    assert "478" in text
+    assert "1 条" in text
+
+
+# ============================================================
+# /ask 的 voice 分支：LLM 组织回答 + 失败回落（2026-08-25）
+# ============================================================
+
+def _no_intent_call(monkeypatch):
+    """把意图校验钉成 voice，避免用例打真实 LLM 接口。"""
+    monkeypatch.setattr(llm, "classify_intent",
+                        lambda q: ("voice", llm.INTENT_PROVIDER))
+
+
+def test_ask_voice_answer_comes_from_llm(client, monkeypatch):
+    _no_intent_call(monkeypatch)
+    monkeypatch.setattr(
+        llm, "voice_answer",
+        lambda q, ctx, **kw: ("这是 LLM 写的回答", llm.INTENT_PROVIDER))
+
+    d = client.post(f"{API}/ask", json={
+        "question": "花泽香菜配过哪些角色", "route": "voice"}).json()
+
+    assert d["route"] == "voice"
+    assert d["answer"] == "这是 LLM 写的回答"
+    assert d["meta"]["llm"]
+    assert d["meta"]["zero_model"] is False
+    # 🚨 **结构化列表必须照常返回** —— 生成会丢条目，别让 LLM 成为唯一出口。
+    assert len(d["voice"]["items"]) > 3
+
+
+def test_ask_voice_falls_back_to_table_when_llm_fails(client, monkeypatch):
+    """🚨 LLM 挂了要退回配役表并返回 200，**不是 503**。
+
+    与流程 C 不同：那里没有模型就真的没有回答，而这里资料已经拿到了，
+    LLM 只负责组织语言。
+    """
+    _no_intent_call(monkeypatch)
+
+    def boom(q, ctx, **kw):
+        raise llm.LLMError("生成挂了")
+    monkeypatch.setattr(llm, "voice_answer", boom)
+
+    r = client.post(f"{API}/ask", json={
+        "question": "花泽香菜配过哪些角色", "route": "voice"})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["route"] == "voice"
+    assert "在库内共有" in d["answer"]        # 回落成了配役表本身
+    assert d["meta"]["llm_error"] == "LLMError"
+    assert len(d["voice"]["items"]) > 3
+
+
+def test_ask_voice_recent_switches_order(client, monkeypatch):
+    """「最近」要真的切到年份序 —— 判据是 meta，不是靠肉眼看列表。"""
+    _no_intent_call(monkeypatch)
+    monkeypatch.setattr(llm, "voice_answer",
+                        lambda q, ctx, **kw: ("ok", llm.INTENT_PROVIDER))
+
+    def order_of(question):
+        return client.post(f"{API}/ask", json={
+            "question": question, "route": "voice"}).json()["meta"]["voice_order"]
+
+    assert order_of("花泽香菜最近配过什么角色") == voice.ORDER_RECENT
+    assert order_of("花泽香菜配过哪些角色") == voice.ORDER_POPULAR

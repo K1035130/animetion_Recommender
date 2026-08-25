@@ -13,7 +13,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from server.main import API, app
-from src import router
+from src import llm, router
 
 # 2026-08-21 属于 2026 年 7 月番（Q3）
 TODAY = datetime.date(2026, 8, 21)
@@ -98,13 +98,33 @@ def test_known_limitation_person_plus_cour():
 # ============================================================
 # 端点
 # ============================================================
+@pytest.fixture(autouse=True)
+def _stub_voice_llm(monkeypatch):
+    """⚠️ voice 分支 2026-08-25 起会调一次生成，**本文件不该真的等它**。
+
+    这里测的是「路由选对了没有」，而真实生成实测单次 26~37 秒 —— 三条
+    voice 用例就是一分半，且引入了模型行为漂移。与 test_ask_intent.py
+    同一条纪律：把 llm.* 全部换成替身，只留路由逻辑真跑。
+    📌 生成本身的 wiring（成功用 LLM 的话 / 失败回落成表格）由
+       tests/test_voice.py 覆盖。
+    """
+    monkeypatch.setattr(
+        llm, "voice_answer",
+        lambda q, ctx, **kw: ("（测试替身：LLM 组织的回答）", llm.INTENT_PROVIDER))
+
+
 def test_ask_returns_route(client):
     d = client.post(f"{API}/ask", json={"question": "花泽香菜配过哪些角色",
                                         "top_k": 3}).json()
     assert d["route"] == "voice"
     assert d["route_reason"]
     assert d["voice"] is not None and d["season"] is None
-    assert d["meta"].get("zero_model") is True
+    # ⚠️ 2026-08-25 起 voice 不再是零模型分支（会调一次 llm.voice_answer
+    #    把配役表讲成一段话），此处断言随之从 True 改为 False。
+    #    **资料仍然是零模型来的**（一条 SQL），改变的只是"讲"的那一步。
+    assert d["meta"].get("zero_model") is False
+    assert d["meta"].get("llm")
+    assert d["meta"].get("voice_order") == "popular"
 
 
 def test_ask_route_forced(client):

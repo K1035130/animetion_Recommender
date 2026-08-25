@@ -379,9 +379,16 @@ function ResponseView({
   onPickCandidate: (originalQuestion: string, c: AskCandidate) => void
 }) {
   const displayRoute = ROUTE_DISPLAY[res.route] ?? res.route
-  // voice/season/find 成功时，answer 是同一份数据的文本复述——
-  // 有结构化视图就不重复展示纯文本，避免同一条信息出现两遍。
-  const hasStructured = Boolean(res.voice || res.season || res.find)
+  // season/find 成功时，answer 是同一份数据的文本复述——有结构化视图就不
+  // 重复展示纯文本，避免同一条信息出现两遍。
+  //
+  // 🚨 **voice 是例外（2026-08-25 起）。** 它的 answer 不再是列表的复述，
+  //    而是 LLM 针对问题写的回答（「最近配过什么」会挑年份最新的几部讲），
+  //    藏起来等于把这次改动整个白做。判据用 meta.llm 在不在：LLM 挂掉时
+  //    后端会回落成名单文本，那种情况下它**确实**是复述，仍然该藏。
+  const voiceHasProse = Boolean(res.voice) && Boolean(res.meta?.llm)
+  const hasStructured =
+    Boolean(res.season || res.find) || (Boolean(res.voice) && !voiceHasProse)
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-(--color-muted)">
