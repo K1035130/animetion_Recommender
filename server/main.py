@@ -708,6 +708,127 @@ def delete_ratings(request: Request) -> dict:
     return {"deleted": n}
 
 
+# ══════════════════════════════════════════════════════════════
+# 个人页（2026-08-24）：评分明细 + 改用户名 / 改密码
+# ══════════════════════════════════════════════════════════════
+# ⚠️ **两个改账号的接口用 PUT 而不是 PATCH。** 语义上都说得通，选 PUT 的
+#    实际理由是上面那段 CORS 中间件的 `allow_methods` 里没有 PATCH ——
+#    线上同源不受影响，但**本地开发是 5173 → 8000 跨源**，PATCH 会被预检
+#    拦掉，表现为「线上好好的，本地就挂」（平时那句话的反面）。
+#    要改成 PATCH 的话记得同步那一行，别只改这里。
+
+
+@app.get(f"{API}/ratings/detail", response_model=schemas.RatedListResponse)
+def get_ratings_detail(request: Request) -> schemas.RatedListResponse:
+    """个人页的评分列表：评分 + 作品名/年份/热度。
+
+    ⚠️ **与 `GET /ratings` 有意分成两个端点，不要合并成 `?detail=1`。**
+       那个端点的返回形状被前端直接转发给 `/recommend`（schema 注释写着
+       这一点），给它加一个会改变形状的开关，等于让同一个 URL 有两种契约 ——
+       调用方少传一个参数就静默拿到另一种东西。
+    """
+    uid = _current_user(request)
+    if uid is None:
+        raise HTTPException(401, "未登录")
+    with _conn() as c:
+        rows = ratings.list_detailed(c, uid)
+    return schemas.RatedListResponse(
+        items=[schemas.RatedItem(**vars(r)) for r in rows], total=len(rows))
+
+
+@app.put(f"{API}/auth/username", response_model=schemas.AuthUser)
+def change_username(req: schemas.ChangeUsernameRequest,
+                    request: Request) -> schemas.AuthUser:
+    """改用户名。**要求当前密码**（理由见 schemas.ChangeUsernameRequest）。
+
+    ⚠️ 判重与登录一样走 `username_norm` —— 不归一化的话，改成全角
+       `Ｋｅｖｉｎ` 就能在界面上冒充另一个人，而 UNIQUE 约束完全看不出
+       问题（它拦的是字节相同，不是身份相同）。
+    📌 **只改大小写是允许的**（`kevin` → `Kevin`）：那时 norm 不变，
+       UPDATE 的是自己这一行，不会撞唯一约束。
+    """
+    display = req.username.strip()
+    ok, why = auth.valid_username(display)
+    if not ok:
+        raise HTTPException(422, why)
+    norm = auth.normalize_username(display)
+
+    uid = _current_user(request)
+    if uid is None:
+        raise HTTPException(401, "未登录")
+
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT password_hash FROM app_user WHERE user_id = %s", (uid,))
+            row = cur.fetchone()
+        if row is None:
+            raise HTTPException(401, "账号不存在")
+        # ⚠️ 这里**不需要**登录接口那套时间侧信道对齐：调用方已经登录，
+        #    「这个账号存不存在」对他不是秘密。
+        if not auth.verify_password(row[0], req.password):
+            raise HTTPException(401, "密码不正确")
+
+        with c.cursor() as cur:
+            try:
+                cur.execute(
+                    "UPDATE app_user SET username = %s, username_norm = %s "
+                    "WHERE user_id = %s",
+                    (display, norm, uid))
+            except psycopg.errors.UniqueViolation as e:
+                raise HTTPException(409, "该用户名已被占用") from e
+        payload = _auth_user_payload(c, uid)
+    return payload
+
+
+@app.put(f"{API}/auth/password", response_model=schemas.AuthUser)
+def change_password(req: schemas.ChangePasswordRequest, request: Request,
+                    response: Response) -> schemas.AuthUser:
+    """改密码。旧密码必填。
+
+    🚨 **已知缺口：这不会让别处已登录的会话失效。** JWT 是无状态的，
+       签发出去的 token 在过期（30 天）前始终有效，改密码也一样 ——
+       与 `/auth/logout` 那条「服务端没有吊销这回事」同一个根因。
+       ⚠️ 这条对改密码格外要紧：用户改密码时**通常正是怀疑账号被盗**，
+          而他会理所当然地以为「改完对方就被踢下线了」。
+       ⇒ 真要修，唯一的办法是给 app_user 加一列 token_version（或
+         password_changed_at），签发时写进 token、校验时比对 —— 代价是
+         `_current_user()` 从「纯解码、零查库」变成**每个请求多一次查库**。
+         那是架构取舍，需要 Kevin 拍板，不在本次改动范围内。
+       📌 现状与 CLAUDE.md 已记的「token 吊销做不到 ⇒ 换 AUTH_SECRET 是
+          唯一手段」一致，不是本次新引入的缺口。
+
+    ⚠️ 成功后**重新种一次 cookie**：不换的话当前会话的 30 天有效期还是按
+       上次登录算的，而用户刚刚证明了自己知道密码，续期是合理的。
+    """
+    uid = _current_user(request)
+    if uid is None:
+        raise HTTPException(401, "未登录")
+
+    try:
+        new_hash = auth.hash_password(req.new_password)
+    except auth.AuthError as e:
+        raise HTTPException(422, str(e)) from e
+
+    with _conn() as c:
+        with c.cursor() as cur:
+            cur.execute(
+                "SELECT password_hash FROM app_user WHERE user_id = %s", (uid,))
+            row = cur.fetchone()
+        if row is None:
+            raise HTTPException(401, "账号不存在")
+        if not auth.verify_password(row[0], req.current_password):
+            raise HTTPException(401, "当前密码不正确")
+
+        with c.cursor() as cur:
+            cur.execute("UPDATE app_user SET password_hash = %s WHERE user_id = %s",
+                        (new_hash, uid))
+        payload = _auth_user_payload(c, uid)
+
+    _set_session(response, request, uid)
+    return payload
+
+
 def _off_topic_response(reason: str) -> schemas.AskResponse:
     """`llm.classify_intent()` 判"这不是动画相关的问题"时的统一回复。
 

@@ -1,10 +1,17 @@
 import { useState } from 'react'
+import AccountPage from './AccountPage'
 import AskPanel from './AskPanel'
 import AuthDialog from './AuthDialog'
 import RecommendHub from './RecommendHub'
 import { useSession } from './session-context'
 
-type View = 'home' | 'recommend' | 'ask'
+type View = 'home' | 'recommend' | 'ask' | 'account'
+
+const VIEW_TITLE: Record<Exclude<View, 'home'>, string> = {
+  recommend: '动漫推荐',
+  ask: '动漫问答',
+  account: '个人中心',
+}
 
 export default function App() {
   const [view, setView] = useState<View>('home')
@@ -30,13 +37,14 @@ export default function App() {
                 <span aria-hidden>←</span> 首页
               </button>
               <span className="text-base text-(--color-line)">/</span>
-              <span className="text-lg font-semibold">
-                {view === 'recommend' ? '动漫推荐' : '动漫问答'}
-              </span>
+              <span className="text-lg font-semibold">{VIEW_TITLE[view]}</span>
             </>
           )}
           <div className="ml-auto">
-            <AccountMenu onOpenAuth={() => setAuthOpen(true)} />
+            <AccountMenu
+              onOpenAuth={() => setAuthOpen(true)}
+              onOpenAccount={() => setView('account')}
+            />
           </div>
         </div>
       </nav>
@@ -47,6 +55,7 @@ export default function App() {
         {view === 'home' && <Home onEnter={setView} />}
         {view === 'recommend' && <RecommendHub />}
         {view === 'ask' && <AskPanel onOpenAuth={() => setAuthOpen(true)} />}
+        {view === 'account' && <AccountPage onOpenAuth={() => setAuthOpen(true)} />}
       </main>
 
       {authOpen && <AuthDialog onClose={() => setAuthOpen(false)} />}
@@ -54,7 +63,13 @@ export default function App() {
   )
 }
 
-function AccountMenu({ onOpenAuth }: { onOpenAuth: () => void }) {
+function AccountMenu({
+  onOpenAuth,
+  onOpenAccount,
+}: {
+  onOpenAuth: () => void
+  onOpenAccount: () => void
+}) {
   const { user, loading, logout } = useSession()
 
   // ⚠️ 冷启动查登录态时不要渲染「登录」按钮 —— 已登录用户会看到它闪一下
@@ -74,9 +89,15 @@ function AccountMenu({ onOpenAuth }: { onOpenAuth: () => void }) {
 
   return (
     <div className="flex items-center gap-2.5 text-xs">
-      <span className="hidden text-(--color-muted) sm:inline" title={user.username}>
+      {/* ⚠️ 用户名现在是**进个人中心的入口**，所以不能再 `hidden sm:inline`
+          —— 那样小屏上就完全没有入口了。改成始终显示 + 长名字截断。 */}
+      <button
+        onClick={onOpenAccount}
+        title={`${user.username} · 进入个人中心`}
+        className="max-w-28 truncate text-(--color-muted) underline decoration-dotted underline-offset-4 transition hover:text-(--color-brand) sm:max-w-40"
+      >
         {user.username}
-      </span>
+      </button>
       <span
         className="rounded-full bg-(--color-brand)/12 px-2 py-0.5 text-(--color-brand)"
         title={`问答每 24 小时 ${user.quota.limit} 条`}

@@ -434,6 +434,58 @@ class RatingsSyncResponse(BaseModel):
     total: int
 
 
+class RatedItem(BaseModel):
+    """个人页的一行：评分 + 那部作品的展示字段。
+
+    ⚠️ **与 `Answer` 是两个类型，不要合并。** `Answer` 是打分链路的输入形状
+       （只有 subject_id/choice/score），本类型多带的全是展示用的元信息。
+       合成一个的话，前端很容易把整个对象直接 POST 给 /recommend，
+       而那条链路只认前三个字段 —— 多出来的会被静默忽略，
+       等哪天服务端加了同名字段就变成难查的错。
+    """
+
+    subject_id: int
+    choice: str
+    score: float | None = None       # 仅 choice='seen' 有值
+    source: str
+    updated_at: str
+    name: str
+    name_cn: str | None = None
+    air_year: int | None = None
+    form: str | None = None
+    # 收藏「看过」的人数，用来给列表提供一个热度感知（与搜索结果同口径）。
+    fav_done: int | None = None
+    bgm_score: float | None = None
+
+
+class RatedListResponse(BaseModel):
+    items: list[RatedItem]
+    total: int
+
+
+class ChangeUsernameRequest(BaseModel):
+    """改用户名。
+
+    🚨 **必须带当前密码。** 会话是 httpOnly cookie，XSS 偷不走 token，
+       但 XSS 能直接用它发请求 —— 不验密码的话，一次 XSS 就能把账号改名
+       （配合改密码即完成接管）。要求密码等于要求「攻击者还得知道密码」。
+    """
+
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(max_length=128)
+
+
+class ChangePasswordRequest(BaseModel):
+    """改密码。旧密码必填，理由同上（且这是接管账号最直接的一步）。
+
+    ⚠️ 长度上下限与 src/auth.py 的 PASSWORD_MIN/MAX 一致；上限不是安全
+       要求，是防「POST 一个 1 MB 的密码」把 argon2 拖死。
+    """
+
+    current_password: str = Field(max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
 # ⚠️ AskResponse 用字符串注解引用了下面才定义的 VoiceResponse / SeasonResponse，
 #    必须在两者都定义完之后重建，否则 FastAPI 生成 schema 时会炸。
 AskResponse.model_rebuild()

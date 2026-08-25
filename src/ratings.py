@@ -133,3 +133,68 @@ def merge_guest(conn: psycopg.Connection, user_id: int,
         # ⚠️ executemany 的 rowcount 在 psycopg3 里是各批之和，可信；
         #    但为了不依赖驱动细节，这里直接回「尝试写入的条数」的实际生效数。
         return cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
+
+
+@dataclass
+class RatedDetail:
+    """一条评分 + 它指向的那部作品的展示字段（个人页列表用）。
+
+    ⚠️ 与 `Rating` **有意分成两个类型，不要把展示字段并进 `Rating`**：
+       后者的形状要与 `/recommend` 的请求体保持一致（打分链路只认
+       subject_id/choice/score），多带几列会诱使调用方把它整个转发出去，
+       而那正是「评分随请求传入，推荐链路不知道评分从哪来」要避免的耦合。
+    """
+
+    subject_id: int
+    choice: str
+    score: float | None
+    source: str
+    updated_at: str
+    name: str
+    name_cn: str | None
+    air_year: int | None
+    form: str | None
+    fav_done: int | None
+    bgm_score: float | None
+
+
+def list_detailed(conn: psycopg.Connection, user_id: int) -> list[RatedDetail]:
+    """该用户的评分 + 作品展示字段，按最近修改倒序。
+
+    ⚠️ **INNER JOIN 是安全的**：`user_rating.subject_id` 有指向
+       `anime_profile` 的外键（sql/010），孤儿行在库层面就不可能存在。
+       📌 那条外键是 `ON DELETE CASCADE`，所以季度更新若真的删掉某部作品，
+          相关评分会跟着消失 —— 设计如此（评分指向一部不存在的作品没有意义），
+          记在这里免得将来查「用户的评分怎么少了几条」。
+
+    📌 **不分页**：一个用户的评分量级是几十~几百（与 `list_for_user` 同一条
+       判断），前端一次拿全再本地筛选，比翻页交互简单得多。
+
+    ⚠️ 排序键带 `subject_id` 兜底：`updated_at` 会大量并列（一次问卷里
+       连答几十题落在同一批 UPDATE 上），只按它排的话 Postgres 对并列给
+       任意顺序，用户每次刷新看到的列表顺序都不一样。
+       📌 与 `recommend_sql` 那条「ORDER BY 必须带次级键 subject_id」同源。
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT r.subject_id, r.choice, r.score, r.source, r.updated_at,
+                   a.name, a.name_cn, a.air_year, a.form, a.fav_done,
+                   a.score AS bgm_score
+              FROM user_rating r
+              JOIN anime_profile a USING (subject_id)
+             WHERE r.user_id = %s
+             ORDER BY r.updated_at DESC, r.subject_id
+            """,
+            (user_id,),
+        )
+        return [
+            RatedDetail(
+                subject_id=sid, choice=ch, score=sc, source=src,
+                updated_at=upd.isoformat(),
+                name=name, name_cn=name_cn, air_year=year, form=form,
+                fav_done=done, bgm_score=bgm,
+            )
+            for (sid, ch, sc, src, upd, name, name_cn, year, form, done, bgm)
+            in cur.fetchall()
+        ]

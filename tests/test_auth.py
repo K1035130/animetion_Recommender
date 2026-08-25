@@ -391,3 +391,235 @@ def test_ratings_require_login(client):
     assert client.get(f"{API}/ratings").status_code == 401
     assert client.put(f"{API}/ratings", json={"items": []}).status_code == 401
     assert client.delete(f"{API}/ratings").status_code == 401
+
+
+# ============================================================
+# 个人页（2026-08-24）：评分明细 + 改用户名 / 改密码
+# ============================================================
+
+@pytest.mark.real_auth
+def test_ratings_detail_carries_display_fields(client, account):
+    """明细端点要带作品名 —— 没有它个人页只能显示一串 subject_id。
+
+    ⚠️ 同时验证它与 `/ratings` **行数一致**：两个端点读的是同一批行，
+       只是形状不同。不一致就说明 JOIN 丢了行（外键本该保证不会）。
+    """
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        client.put(f"{API}/ratings", json={"items": [
+            {"subject_id": 328609, "choice": "seen", "score": 9.0},
+            {"subject_id": 10380, "choice": "wish"},
+        ], "source": "questionnaire"})
+
+        r = client.get(f"{API}/ratings/detail")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["total"] == 2 == len(body["items"])
+        assert len(client.get(f"{API}/ratings").json()["items"]) == body["total"]
+
+        by_id = {it["subject_id"]: it for it in body["items"]}
+        assert by_id[328609]["choice"] == "seen" and by_id[328609]["score"] == 9.0
+        assert by_id[328609]["name"]                      # 作品名非空
+        assert by_id[328609]["source"] == "questionnaire"
+        # wish 不该带分数（库里的 CHECK 也保证了这一点）
+        assert by_id[10380]["score"] is None
+    finally:
+        client.delete(f"{API}/ratings")
+        client.cookies.clear()
+
+
+@pytest.mark.real_auth
+def test_ratings_detail_requires_login(client):
+    assert client.get(f"{API}/ratings/detail").status_code == 401
+
+
+@pytest.mark.real_auth
+def test_ratings_detail_most_recent_first(client, account):
+    """列表按最近修改倒序 —— 用户刚改过的那部应该在最上面。"""
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        client.put(f"{API}/ratings",
+                   json={"items": [{"subject_id": 328609, "choice": "wish"}]})
+        client.put(f"{API}/ratings",
+                   json={"items": [{"subject_id": 10380, "choice": "wish"}]})
+        # 再改一次最早那条，它应该重新回到最前
+        client.put(f"{API}/ratings",
+                   json={"items": [{"subject_id": 328609, "choice": "pass"}]})
+
+        ids = [it["subject_id"] for it in client.get(f"{API}/ratings/detail").json()["items"]]
+        assert ids[0] == 328609
+    finally:
+        client.delete(f"{API}/ratings")
+        client.cookies.clear()
+
+
+# ── 改用户名 ──────────────────────────────────────────────────
+
+@pytest.mark.real_auth
+def test_change_username_success(client, account):
+    """改完之后：/auth/me 是新名，**旧名登不上、新名能登上**。
+
+    ⚠️ 只断言 /auth/me 是不够的 —— 那只证明展示列改了。登录走的是
+       `username_norm`，两列必须一起更新，漏掉后者就是「显示已改名、
+       但只能用旧名登录」这种自相矛盾的状态。
+    """
+    new_name = f"renamed-{uuid.uuid4().hex[:8]}"
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        r = client.put(f"{API}/auth/username",
+                       json={"username": new_name, "password": account["password"]})
+        assert r.status_code == 200
+        assert r.json()["username"] == new_name
+        assert client.get(f"{API}/auth/me").json()["username"] == new_name
+    finally:
+        client.cookies.clear()
+
+    old = client.post(f"{API}/auth/login", json={
+        "username": account["username"], "password": account["password"]})
+    assert old.status_code == 401                      # 旧名已经不存在了
+    new = client.post(f"{API}/auth/login", json={
+        "username": new_name, "password": account["password"]})
+    assert new.status_code == 200
+    client.cookies.clear()
+
+
+@pytest.mark.real_auth
+def test_change_username_wrong_password_has_no_effect(client, account):
+    """🚨 密码不对不仅要 401，**还必须没有任何副作用**。
+
+    校验与 UPDATE 写反顺序的话（先改再验），名字已经改掉了才返回 401 ——
+    而调用方看到 401 会以为什么都没发生。
+    """
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        r = client.put(f"{API}/auth/username",
+                       json={"username": f"hacked-{uuid.uuid4().hex[:6]}",
+                             "password": "definitely-wrong"})
+        assert r.status_code == 401
+        assert client.get(f"{API}/auth/me").json()["username"] == account["username"]
+    finally:
+        client.cookies.clear()
+
+
+@pytest.mark.real_auth
+def test_change_username_rejects_taken_name(client, account):
+    """判重走 username_norm，所以**大小写不同也算重复**。"""
+    other = f"pytest-{uuid.uuid4().hex[:10]}"
+    conn = db.connect()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO app_user (username, username_norm, password_hash) "
+            "VALUES (%s,%s,%s)",
+            (other, auth.normalize_username(other), auth.hash_password("x" * 12)))
+    conn.commit()
+
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        r = client.put(f"{API}/auth/username",
+                       json={"username": other.upper(),
+                             "password": account["password"]})
+        assert r.status_code == 409
+        assert client.get(f"{API}/auth/me").json()["username"] == account["username"]
+    finally:
+        client.cookies.clear()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM app_user WHERE username_norm = %s",
+                        (auth.normalize_username(other),))
+        conn.commit()
+        conn.close()
+
+
+@pytest.mark.real_auth
+@pytest.mark.parametrize("bad", ["k", "has space", "admin", "ＡＤＭＩＮ"])
+def test_change_username_rejects_invalid(client, account, bad):
+    """⚠️ 全角 `ＡＤＭＩＮ` 也要挡住：判据是**归一化之后**的形式，
+    NFKC 会把它折成 admin。不折的话保留名清单一绕就过。"""
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        r = client.put(f"{API}/auth/username",
+                       json={"username": bad, "password": account["password"]})
+        assert r.status_code == 422
+    finally:
+        client.cookies.clear()
+
+
+@pytest.mark.real_auth
+def test_change_username_case_only_is_allowed(client, account):
+    """📌 只改大小写要能成功：norm 没变，UPDATE 的是自己那一行，
+    不该被唯一约束拦成 409（那是「用户名被自己占用了」的荒谬状态）。"""
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        upper = account["username"].upper()
+        r = client.put(f"{API}/auth/username",
+                       json={"username": upper, "password": account["password"]})
+        assert r.status_code == 200
+        assert r.json()["username"] == upper
+    finally:
+        client.cookies.clear()
+
+
+@pytest.mark.real_auth
+def test_change_username_requires_login(client):
+    assert client.put(f"{API}/auth/username",
+                      json={"username": "whoever", "password": "x"}).status_code == 401
+
+
+# ── 改密码 ────────────────────────────────────────────────────
+
+@pytest.mark.real_auth
+def test_change_password_success(client, account):
+    """改完：旧密码登不上、新密码能登上，且**当前会话仍然有效**
+    （成功后重新种了一次 cookie）。"""
+    new_pw = "a-brand-new-password"
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        r = client.put(f"{API}/auth/password", json={
+            "current_password": account["password"], "new_password": new_pw})
+        assert r.status_code == 200
+        # 会话没被踢掉：改完还能继续用
+        assert client.get(f"{API}/auth/me").json()["user_id"] == account["user_id"]
+    finally:
+        client.cookies.clear()
+
+    assert client.post(f"{API}/auth/login", json={
+        "username": account["username"],
+        "password": account["password"]}).status_code == 401
+    assert client.post(f"{API}/auth/login", json={
+        "username": account["username"], "password": new_pw}).status_code == 200
+    client.cookies.clear()
+
+
+@pytest.mark.real_auth
+def test_change_password_wrong_current_has_no_effect(client, account):
+    """🚨 同 test_change_username_wrong_password_has_no_effect：
+    401 之后旧密码必须**依然可用**，否则就是「报错了但其实改了」。"""
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        r = client.put(f"{API}/auth/password", json={
+            "current_password": "not-the-password", "new_password": "x" * 12})
+        assert r.status_code == 401
+    finally:
+        client.cookies.clear()
+
+    assert client.post(f"{API}/auth/login", json={
+        "username": account["username"],
+        "password": account["password"]}).status_code == 200
+    client.cookies.clear()
+
+
+@pytest.mark.real_auth
+def test_change_password_rejects_short_new_password(client, account):
+    """长度下限由 pydantic 的 min_length=8 挡在进 argon2 之前。"""
+    client.cookies.set("anime_rec_session", auth.make_token(account["user_id"]))
+    try:
+        r = client.put(f"{API}/auth/password", json={
+            "current_password": account["password"], "new_password": "short"})
+        assert r.status_code == 422
+    finally:
+        client.cookies.clear()
+
+
+@pytest.mark.real_auth
+def test_change_password_requires_login(client):
+    assert client.put(f"{API}/auth/password", json={
+        "current_password": "x", "new_password": "y" * 12}).status_code == 401

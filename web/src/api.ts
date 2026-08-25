@@ -81,6 +81,32 @@ export interface AuthUser {
   quota: QuotaStatus
 }
 
+/**
+ * 个人页列表的一行：评分 + 作品展示字段。
+ *
+ * ⚠️ **不要把它当 `Answer` 用**（比如直接塞进 /recommend 的 answers）——
+ *    那条链路只认 subject_id/choice/score，多出来的字段会被静默忽略。
+ *    要转换的话显式挑那三个字段出来。
+ */
+export interface RatedItem {
+  subject_id: number
+  choice: Choice
+  score: number | null
+  source: 'questionnaire' | 'manual'
+  updated_at: string
+  name: string
+  name_cn: string | null
+  air_year: number | null
+  form: string | null
+  fav_done: number | null
+  bgm_score: number | null
+}
+
+export interface RatedListResponse {
+  items: RatedItem[]
+  total: number
+}
+
 /** 未登录时访问需要登录的接口。调用方据此弹登录框，而不是当成普通报错。 */
 export class UnauthorizedError extends Error {}
 
@@ -293,4 +319,28 @@ export const api = {
     }),
 
   clearRatings: () => req<{ deleted: number }>('/ratings', { method: 'DELETE' }),
+
+  // ── 个人页 ──────────────────────────────────────────────────
+  // ⚠️ 与 getRatings() 是**两个端点**，不是一个带开关的端点：那个的返回
+  //    形状要能直接喂给 /recommend，加开关等于让同一个 URL 有两种契约。
+  ratingsDetail: () => req<RatedListResponse>('/ratings/detail'),
+
+  // ⚠️ 两个都要当前密码：会话是 httpOnly cookie，XSS 偷不走 token 但能
+  //    直接拿它发请求 —— 不验密码的话一次 XSS 就能改名 + 改密接管账号。
+  // ⚠️ 方法是 PUT 不是 PATCH（后端 CORS 的 allow_methods 里没有 PATCH，
+  //    线上同源无所谓，但本地 5173→8000 跨源会被预检拦掉）。
+  changeUsername: (username: string, password: string) =>
+    req<AuthUser>('/auth/username', {
+      method: 'PUT',
+      body: JSON.stringify({ username, password }),
+    }),
+
+  changePassword: (currentPassword: string, newPassword: string) =>
+    req<AuthUser>('/auth/password', {
+      method: 'PUT',
+      body: JSON.stringify({
+        current_password: currentPassword,
+        new_password: newPassword,
+      }),
+    }),
 }
