@@ -53,30 +53,6 @@ ten questions per 24 hours.
 
 ---
 
-## Results
-
-The project exists to measure a system of this kind, not merely to demonstrate
-one. The central finding separates two failure modes that are usually reported as
-a single accuracy number:
-
-> When the retrieved passages contain the answer, the model answers correctly
-> **93.8%** of the time. The passages contain the answer only **50.0%** of the
-> time.
-
-The weak point is therefore retrieval and corpus coverage, not text generation.
-Two rounds of corpus work raised that second figure from 30.8% to 50.0%. The full
-evaluation is in [docs/week5-eval-report.md](docs/week5-eval-report.md).
-
-A second result confirmed the premise the project was built on. 142 titles carried
-no usable genre tags at all — predominantly Western and older Chinese animation,
-for which the source database's tags are far sparser — and tag-based similarity
-could never retrieve them. Adding synopsis embeddings recovered **131 of those 142
-(92%)**. For *Havoc in Heaven*, the nearest neighbours changed from unrelated
-modern web-novel adaptations to *The Golden Monkey Defeats the Demon*, *Journey to
-the West* and *Ginseng Fruit* — all works from the same studio and tradition.
-
----
-
 ## Status
 
 | Stage | Content | State |
@@ -222,14 +198,6 @@ reports the same coverage figure for this reason.
 Run the test suite with `--group etl`. Twenty-eight tests depend on `lxml` and are
 skipped rather than failed when it is absent, so a passing run may simply mean
 they never executed; check the summary line for skipped tests.
-
-Two caches are kept on disk, with very different replacement costs. The embedding
-cache (`data/interim/embed_cache/`, about 50 MB, not in version control) rebuilds
-in a few minutes; copying it between machines makes that rebuild free and
-bit-for-bit identical, which is the only way two machines can produce the same
-library when the encoder is a remote service. The translation cache
-(`data/interim/translate_cache/`) is the only copy of 43,932 translations, worth
-roughly eight hours of re-translation, and should be backed up separately.
 
 ### 5. Run
 
@@ -398,26 +366,6 @@ See [LICENSE](LICENSE).
 
 ---
 
-## 评测结果
-
-本项目的目的是**度量**这类系统，而不只是做出一个演示。核心结论把通常被合并成
-单一准确率的两种失败模式区分开：
-
-> 检索到的段落中确实包含答案时，模型答对率为 **93.8%**；
-> 而段落中包含答案的情况只占 **50.0%**。
-
-因此系统的短板在检索与语料覆盖，不在文本生成。两轮语料工作把后一个数字
-从 30.8% 提升到 50.0%。完整评测见 [docs/week5-eval-report.md](docs/week5-eval-report.md)。
-
-第二项结果验证了立项时的假设。有 142 部作品完全没有可用的题材标签 ——
-以欧美动画和年代较早的国产动画为主，源数据库对这类作品的标签明显稀疏 ——
-基于标签的相似度**永远无法**召回它们。引入简介 embedding 后，
-其中 **131 部（92%）** 被救回。以《大闹天宫》为例，它的最近邻从毫不相关的
-现代网文改编作品，变成了《金猴降妖》《西游记》《人参果》——
-全部出自同一制作传统与制片厂。
-
----
-
 ## 当前状态
 
 | 阶段 | 内容 | 状态 |
@@ -555,13 +503,6 @@ uv run --group etl python -m pytest tests/ -q
 
 运行测试时要带 `--group etl`。其中 28 项测试依赖 `lxml`，缺失时会被**跳过而非失败**，
 因此「全部通过」有可能只是它们从未执行；请检查结果中的 skipped 计数。
-
-磁盘上保留两份缓存，其重建代价相差悬殊。embedding 缓存
-（`data/interim/embed_cache/`，约 50 MB，不纳入版本控制）重建只需数分钟 API 时间；
-而把它在机器之间拷贝，可使重建既免费又逐位一致 ——
-当编码器是远程服务时，这是让两台机器建出同一个库的唯一办法。
-翻译缓存（`data/interim/translate_cache/`，同样约 50 MB）则是 43,932 条译文的
-**唯一副本**，丢失意味着约 8 小时的重新翻译，应当单独备份。
 
 ### 5. 运行
 
